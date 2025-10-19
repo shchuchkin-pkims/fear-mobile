@@ -1,5 +1,6 @@
 # Built application files
 *.apk
+!release/*.apk
 *.ap_
 *.aab
 
@@ -13,7 +14,9 @@
 bin/
 gen/
 out/
-release/
+release/*
+!release/*.apk
+!release/*README.txt
 
 # Gradle files
 .gradle/
