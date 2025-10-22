@@ -12,7 +12,7 @@
 ## Возможности
 
 - ✅ **Зашифрованные аудиозвонки** - AES-GCM шифрование для всех аудиопакетов
-- ✅ **Высокое качество звука** - Opus codec (48kHz, mono, 24kbps)
+- ✅ **Высокое качество звука** - Opus codec (48kHz, mono, 128kbps)
 - ✅ **Низкая задержка** - Оптимизирован для real-time коммуникации
 - ✅ **Работа в фоне** - Foreground Service для непрерывной связи даже при заблокированном экране
 - ✅ **Кроссплатформенность** - Совместимость с PC версией (Windows/Linux/macOS)
@@ -29,7 +29,7 @@
 - **Codec**: Opus 1.3.1
 - **Sample Rate**: 48000 Hz
 - **Channels**: Mono
-- **Bitrate**: 24 kbps
+- **Bitrate**: 128 kbps
 - **Frame Size**: 960 samples (~20ms)
 - **Latency**: < 100ms (зависит от сети)
 
@@ -55,7 +55,7 @@
 ### Установка готового APK
 
 1. Скачайте последний релиз APK:
-   - [F.E.A.R.Messenger-v0.3.1-release.apk](release/F.E.A.R.Messenger-v0.3.1-release.apk) (7.1 MB)
+   - [F.E.A.R.Messenger-v0.3.0-release.apk](release/F.E.A.R.Messenger-v0.3.0-release.apk)
    - Или из [Releases](https://github.com/shchuchkin-pkims/fear-mobile/releases)
 2. Установите APK на устройство
 3. Предоставьте необходимые разрешения
