@@ -2,13 +2,13 @@ package com.fear
 
 /**
  * OpusCodec wrapper для Android с использованием JNI
- * Совместим с ПК-версией (48kHz, 1 channel, 960 samples/frame, 24kbps)
+ * Совместим с ПК-версией (48kHz, 1 channel, 960 samples/frame, 128kbps)
  */
 object OpusCodec {
     const val SAMPLE_RATE = 48000
     const val CHANNELS = 1
     const val FRAME_SIZE = 960 // 20ms at 48kHz
-    const val BITRATE = 24000
+    const val BITRATE = 128000
 
     // Application type for Opus encoder
     private const val APPLICATION_VOIP = 2048

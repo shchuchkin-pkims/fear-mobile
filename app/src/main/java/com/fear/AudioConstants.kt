@@ -10,7 +10,7 @@ object AudioConstants {
     const val AUDIO_PCM_BYTES_PER_FRAME = AUDIO_FRAME_SAMPLES * 2 // 16-bit PCM = 2 bytes per sample
     
     // Opus codec
-    const val AC_OPUS_BITRATE = 24000 // 24 kbps
+    const val AC_OPUS_BITRATE = 128000 // 128 kbps
     const val AUDIO_MAX_OPUS_BYTES = 400 // Maximum Opus packet size
     
     // Network
