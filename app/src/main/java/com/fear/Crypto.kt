@@ -67,7 +67,7 @@ object Crypto {
             val plaintext = cipher.doFinal(ciphertext)
             plaintext
         } catch (e: Exception) {
-            // Silently ignore decryption errors - they happen when wrong key or corrupted packet
+            // Decryption failed (wrong key or corrupted packet)
             null
         }
     }

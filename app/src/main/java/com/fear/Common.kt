@@ -12,11 +12,22 @@ object Common {
     const val FILE_CHUNK_SIZE: Long = 8192L
     const val DEFAULT_PORT = 8888
 
-    // Message types matching C version
+    // Message types matching C version (v0.4.1)
     const val MSG_TYPE_TEXT: Byte = 0
     const val MSG_TYPE_FILE_START: Byte = 1
     const val MSG_TYPE_FILE_CHUNK: Byte = 2
     const val MSG_TYPE_FILE_END: Byte = 3
+    const val MSG_TYPE_USER_LIST: Byte = 4
+    const val MSG_TYPE_SIGNED_TEXT: Byte = 5
+    const val MSG_TYPE_SIGNED_FILE_START: Byte = 6
+    const val MSG_TYPE_SIGNED_FILE_CHUNK: Byte = 7
+    const val MSG_TYPE_SIGNED_FILE_END: Byte = 8
+    const val MSG_TYPE_IDENTITY_ANNOUNCE: Byte = 9
+
+    // Identity constants (Ed25519)
+    const val IDENTITY_PK_BYTES = 32
+    const val IDENTITY_SK_BYTES = 64
+    const val IDENTITY_SIG_BYTES = 64
 
     // Crypto constants for AES-256-GCM
     const val CRYPTO_AEAD_AES256GCM_KEYBYTES = 32
@@ -38,9 +49,23 @@ object Common {
     const val AUDIO_PCM_BYTES_PER_FRAME = (AUDIO_FRAME_SAMPLES * 2 * AUDIO_CHANNELS) // int16_t * samples * channels
     const val AC_OPUS_BITRATE = AUDIO_OPUS_BITRATE // Alias for consistency
 
-    // Audio protocol packet types
+    // Audio/video protocol packet types
     const val PKT_VER_AUDIO: Byte = 0x01
+    const val PKT_TYPE_VIDEO_FRAG: Byte = 0x02
+    const val PKT_TYPE_STATS: Byte = 0x04
     const val PKT_VER_HELLO: Byte = 0x7F
+
+    // Video HELLO flags
+    const val HELLO_FLAG_VIDEO: Byte = 0x01
+    const val HELLO_FLAG_AUDIO: Byte = 0x02
+    const val HELLO_FLAG_IDENTITY: Byte = 0x04
+
+    // Video fragment constants
+    const val FRAG_MAX_PAYLOAD = 1200
+    const val FRAG_HEADER_SIZE = 12
+    const val FRAG_MAX_PER_FRAME = 128
+    const val FRAG_TIMEOUT_MS = 500L
+    const val FRAG_MAX_PENDING = 8
 
     // Audio call nonce configuration (AES-GCM)
     const val AUDIO_NONCE_PREFIX_LEN = 4
@@ -103,12 +128,12 @@ object Common {
     }
 
     fun base64Encode(data: ByteArray): String {
-        return Base64.encodeToString(data, Base64.URL_SAFE or Base64.NO_PADDING)
+        return Base64.encodeToString(data, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
     }
 
     fun base64Decode(data: String): ByteArray? {
         return try {
-            Base64.decode(data, Base64.URL_SAFE or Base64.NO_PADDING)
+            Base64.decode(data, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
         } catch (e: Exception) {
             null
         }

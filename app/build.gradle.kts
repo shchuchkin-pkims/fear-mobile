@@ -11,8 +11,8 @@ android {
         applicationId = "com.fear"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.3.0"
+        versionCode = 41
+        versionName = "0.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -65,15 +65,15 @@ dependencies {
     implementation("commons-codec:commons-codec:1.16.0")
     implementation("com.google.oboe:oboe:1.7.0")
 
-    // ВАРИАНТ 1: LiveKit WebRTC (реально работает)
-    //implementation("io.livekit:webrtc-android:1.0.1")
+    // Lazysodium for Ed25519 identity + BLAKE2b KDF
+    implementation("com.goterl:lazysodium-android:5.1.0@aar")
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
 
-    // ВАРИАНТ 2: Используйте стандартный WebRTC через Google
-    implementation("com.google.oboe:oboe:1.7.0") // у вас уже есть
-
-    // ВАРИАНТ 3: Если нужен именно аудио кодек Opus - используйте отдельную библиотеку
-    // TODO: Добавить реальную библиотеку Opus (пока используется pass-through для тестирования)
-    //implementation("com.github.louisyonge:opus_android:master-SNAPSHOT")
+    // CameraX for video calls
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

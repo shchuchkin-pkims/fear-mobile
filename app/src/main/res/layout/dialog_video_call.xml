@@ -12,7 +12,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Audio Call Settings"
+            android:text="Video Call Settings"
             android:textSize="18sp"
             android:textStyle="bold"
             android:layout_marginBottom="16dp" />
@@ -25,11 +25,10 @@
             android:layout_marginBottom="4dp" />
 
         <EditText
-            android:id="@+id/serverIpEditText"
+            android:id="@+id/videoServerIpEditText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="Server IP address"
-            android:text="192.168.0.108"
             android:inputType="text"
             android:layout_marginBottom="12dp" />
 
@@ -41,27 +40,11 @@
             android:layout_marginBottom="4dp" />
 
         <EditText
-            android:id="@+id/serverPortEditText"
+            android:id="@+id/videoServerPortEditText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="Remote port"
             android:text="50000"
-            android:inputType="number"
-            android:layout_marginBottom="12dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Local Port (optional, leave empty for auto):"
-            android:textSize="14sp"
-            android:layout_marginBottom="4dp" />
-
-        <EditText
-            android:id="@+id/localPortEditText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Leave empty for automatic port selection"
-            android:text=""
             android:inputType="number"
             android:layout_marginBottom="12dp" />
 
@@ -73,15 +56,26 @@
             android:layout_marginBottom="4dp" />
 
         <EditText
-            android:id="@+id/encryptionKeyEditText"
+            android:id="@+id/videoEncryptionKeyEditText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="32-byte key in hex (64 characters)"
-            android:text="55ff7c8c2cb0512518e482bf0b0daea2e2058cbc8e2e1472b5cc9e2e564ccd07"
+            android:hint="32-byte key in hex"
             android:inputType="text"
             android:maxLines="2"
+            android:layout_marginBottom="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Quality:"
+            android:textSize="14sp"
+            android:layout_marginBottom="4dp" />
+
+        <Spinner
+            android:id="@+id/videoQualitySpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:layout_marginBottom="8dp" />
 
     </LinearLayout>
-
 </ScrollView>

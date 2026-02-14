@@ -1,71 +1,171 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="16dp">
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="F.E.A.R. Messenger"
-        android:textSize="24sp"
-        android:textStyle="bold"
-        android:gravity="center"
-        android:layout_marginBottom="16dp" />
+    android:background="#1a1a2e">
 
     <!-- Connection Layout -->
     <LinearLayout
         android:id="@+id/connectionLayout"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical">
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="24dp">
 
-        <EditText
-            android:id="@+id/hostEditText"
+        <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Server Host"
-            android:inputType="text"
-            android:layout_marginBottom="8dp" />
+            android:text="F.E.A.R."
+            android:textSize="36sp"
+            android:textStyle="bold"
+            android:textColor="#e94560"
+            android:gravity="center"
+            android:fontFamily="monospace" />
 
-        <EditText
-            android:id="@+id/portEditText"
+        <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Port"
-            android:inputType="number"
-            android:layout_marginBottom="8dp" />
+            android:text="Encrypted Messenger v0.4.1"
+            android:textSize="14sp"
+            android:textColor="#8888aa"
+            android:gravity="center"
+            android:layout_marginBottom="32dp" />
 
-        <EditText
-            android:id="@+id/roomEditText"
+        <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Room"
-            android:inputType="text"
-            android:layout_marginBottom="8dp" />
+            android:layout_marginBottom="8dp"
+            app:boxStrokeColor="#e94560"
+            app:hintTextColor="#e94560"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
 
-        <EditText
-            android:id="@+id/nameEditText"
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/hostEditText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Server host"
+                android:inputType="text"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#666688" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Your Name"
-            android:inputType="text"
-            android:layout_marginBottom="8dp" />
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
 
-        <EditText
-            android:id="@+id/keyEditText"
+            <com.google.android.material.textfield.TextInputLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                app:boxStrokeColor="#e94560"
+                app:hintTextColor="#e94560"
+                style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/portEditText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="Port"
+                    android:inputType="number"
+                    android:textColor="#FFFFFF" />
+            </com.google.android.material.textfield.TextInputLayout>
+
+            <com.google.android.material.textfield.TextInputLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="4dp"
+                app:boxStrokeColor="#e94560"
+                app:hintTextColor="#e94560"
+                style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/roomEditText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="Room"
+                    android:inputType="text"
+                    android:textColor="#FFFFFF" />
+            </com.google.android.material.textfield.TextInputLayout>
+        </LinearLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Room Key (Base64)"
-            android:inputType="text"
-            android:layout_marginBottom="16dp" />
+            android:layout_marginBottom="8dp"
+            app:boxStrokeColor="#e94560"
+            app:hintTextColor="#e94560"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/nameEditText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Your name"
+                android:inputType="text"
+                android:textColor="#FFFFFF" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp"
+            app:boxStrokeColor="#e94560"
+            app:hintTextColor="#e94560"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/keyEditText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Room key (Base64URL)"
+                android:inputType="text"
+                android:textColor="#FFFFFF" />
+        </com.google.android.material.textfield.TextInputLayout>
 
         <Button
             android:id="@+id/connectButton"
             android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="Connect"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#e94560" />
+
+        <Button
+            android:id="@+id/hostRoomButton"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="8dp"
+            android:text="Host Room"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#16213e" />
+
+        <!-- Identity info -->
+        <TextView
+            android:id="@+id/identityInfoTextView"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Connect" />
+            android:textColor="#8888aa"
+            android:textSize="12sp"
+            android:gravity="center"
+            android:layout_marginTop="16dp" />
+
+        <Button
+            android:id="@+id/generateKeyButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Generate Identity Key"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#16213e"
+            android:layout_gravity="center"
+            android:layout_marginTop="8dp"
+            android:visibility="gone" />
 
     </LinearLayout>
 
@@ -77,49 +177,108 @@
         android:orientation="vertical"
         android:visibility="gone">
 
-        <TextView
-            android:id="@+id/statusTextView"
+        <!-- Top bar: status + online users -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Status"
-            android:textSize="14sp"
-            android:layout_marginBottom="8dp" />
+            android:orientation="vertical"
+            android:background="#16213e"
+            android:padding="12dp">
 
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:id="@+id/statusTextView"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Connected"
+                    android:textColor="#2ecc71"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <Button
+                    android:id="@+id/clearChatButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="28dp"
+                    android:text="Clear"
+                    android:textSize="11sp"
+                    android:backgroundTint="#95a5a6"
+                    android:minWidth="0dp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/onlineUsersTextView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#8888aa"
+                android:textSize="12sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/serverStatusTextView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#f39c12"
+                android:textSize="12sp"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- Messages -->
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/messagesRecyclerView"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:layout_marginBottom="8dp" />
+            android:background="#0f3460"
+            android:padding="8dp"
+            android:clipToPadding="false" />
 
+        <!-- Input bar -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal">
+            android:orientation="horizontal"
+            android:background="#16213e"
+            android:padding="8dp">
 
             <EditText
                 android:id="@+id/messageEditText"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="Type a message or /sendfile filename"
-                android:inputType="text" />
+                android:hint="Message..."
+                android:textColorHint="#666688"
+                android:textColor="#FFFFFF"
+                android:background="#1a1a2e"
+                android:padding="12dp"
+                android:inputType="text"
+                android:layout_marginEnd="8dp" />
 
             <Button
                 android:id="@+id/sendButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Send" />
-
+                android:text="Send"
+                android:backgroundTint="#e94560" />
         </LinearLayout>
 
+        <!-- Call controls -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center"
-            android:layout_marginTop="8dp"
-            android:layout_marginBottom="8dp">
+            android:background="#16213e"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:paddingBottom="8dp">
 
             <Button
                 android:id="@+id/callButton"
@@ -127,7 +286,19 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="Audio Call"
-                android:layout_marginEnd="4dp" />
+                android:backgroundTint="#2ecc71"
+                android:layout_marginEnd="4dp"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/videoCallButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Video Call"
+                android:backgroundTint="#3498db"
+                android:layout_marginEnd="4dp"
+                android:textSize="12sp" />
 
             <Button
                 android:id="@+id/endCallButton"
@@ -135,8 +306,28 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="End Call"
-                android:layout_marginStart="4dp" />
+                android:backgroundTint="#e74c3c"
+                android:layout_marginEnd="4dp"
+                android:textSize="12sp" />
 
+            <Button
+                android:id="@+id/trustedKeysButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Keys"
+                android:backgroundTint="#9b59b6"
+                android:layout_marginEnd="4dp"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/disconnectButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Disconnect"
+                android:backgroundTint="#95a5a6"
+                android:textSize="12sp" />
         </LinearLayout>
 
         <TextView
@@ -146,15 +337,10 @@
             android:text="Call in progress..."
             android:gravity="center"
             android:textStyle="bold"
-            android:visibility="gone"
-            android:layout_marginBottom="8dp" />
-
-        <Button
-            android:id="@+id/disconnectButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Disconnect"
-            android:layout_marginTop="8dp" />
+            android:textColor="#e94560"
+            android:background="#16213e"
+            android:padding="8dp"
+            android:visibility="gone" />
 
     </LinearLayout>
 </LinearLayout>

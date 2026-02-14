@@ -1,6 +1,7 @@
 package com.fear
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -13,8 +14,10 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.*
+
 
 class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
@@ -31,22 +34,32 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
     private lateinit var sendButton: Button
     private lateinit var messagesRecyclerView: RecyclerView
     private lateinit var statusTextView: TextView
+    private lateinit var onlineUsersTextView: TextView
+
+    private lateinit var callButton: Button
+    private lateinit var videoCallButton: Button
+    private lateinit var endCallButton: Button
+    private lateinit var callStatusTextView: TextView
+
+    private lateinit var identityInfoTextView: TextView
+    private lateinit var generateKeyButton: Button
+    private lateinit var hostRoomButton: Button
+    private lateinit var serverStatusTextView: TextView
 
     private lateinit var fearClient: FearClient
     private lateinit var messagesAdapter: MessagesAdapter
     private val messages = mutableListOf<Message>()
 
-    private lateinit var callButton: Button
-
-    private lateinit var endCallButton: Button
-
-    private lateinit var callStatusTextView: TextView
-
     private var currentCallTarget: String = ""
     private var pendingCallParams: CallParams? = null
+    private var identityManager: IdentityManager? = null
+    private var fearServer: FearServer? = null
+    private var isHosting = false
 
     companion object {
         private const val PERMISSION_REQUEST_CODE = 100
+        @Volatile
+        private var sharedClient: FearClient? = null
     }
 
     data class CallParams(
@@ -60,58 +73,98 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        println("FEAR_DEBUG: Application starting...")
-
-        // Простая проверка крипто
-        try {
-            val testNonce = Crypto.generateNonce()
-            println("CRYPTO_TEST: Nonce generation works: ${testNonce.size} bytes")
-        } catch (e: Exception) {
-            println("CRYPTO_TEST: Crypto test failed: ${e.message}")
-        }
-
         initializeViews()
         setupRecyclerView()
         initializeCallViews()
-        fearClient = FearClient(this, this)
+        setupIdentity()
+
+        // Reuse existing client to survive activity recreation / minimization
+        val existing = sharedClient
+        if (existing != null) {
+            fearClient = existing
+            fearClient.setListener(this)
+            if (fearClient.isConnected()) {
+                showChatLayout()
+                statusTextView.text = "Connected"
+                connectButton.isEnabled = false
+                disconnectButton.isEnabled = true
+            }
+        } else {
+            fearClient = FearClient(applicationContext, this)
+            sharedClient = fearClient
+        }
+    }
+
+    private fun setupIdentity() {
+        identityManager = IdentityManager(this)
+        updateIdentityUI()
+
+        generateKeyButton.setOnClickListener {
+            val im = identityManager ?: return@setOnClickListener
+            if (im.hasIdentity()) {
+                AlertDialog.Builder(this)
+                    .setTitle("Regenerate Key")
+                    .setMessage("This will replace your current identity key. Other users will see a key change warning. Continue?")
+                    .setPositiveButton("Regenerate") { _, _ -> doGenerateIdentity(im) }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            } else {
+                doGenerateIdentity(im)
+            }
+        }
+    }
+
+    private fun doGenerateIdentity(im: IdentityManager) {
+        if (im.generateIdentity()) {
+            Toast.makeText(this, "Identity key generated", Toast.LENGTH_SHORT).show()
+            updateIdentityUI()
+            fearClient.refreshIdentity()
+        } else {
+            Toast.makeText(this, "Failed to generate key", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun updateIdentityUI() {
+        val im = identityManager ?: return
+        if (im.hasIdentity()) {
+            val pk = im.getPublicKey()!!
+            val fp = im.fingerprint(pk)
+            identityInfoTextView.text = "Identity: $fp"
+            generateKeyButton.text = "Regenerate Key"
+            generateKeyButton.visibility = View.VISIBLE
+        } else {
+            identityInfoTextView.text = "No identity key"
+            generateKeyButton.text = "Generate Identity Key"
+            generateKeyButton.visibility = View.VISIBLE
+        }
     }
 
     private fun initializeCallViews() {
         callButton = findViewById(R.id.callButton)
+        videoCallButton = findViewById(R.id.videoCallButton)
         endCallButton = findViewById(R.id.endCallButton)
         callStatusTextView = findViewById(R.id.callStatusTextView)
 
         callButton.setOnClickListener { requestAudioPermissionAndShowDialog() }
+        videoCallButton.setOnClickListener { showVideoCallDialog() }
         endCallButton.setOnClickListener { endCurrentCall() }
+
+        findViewById<Button>(R.id.trustedKeysButton).setOnClickListener {
+            startActivity(Intent(this, TrustedKeysActivity::class.java))
+        }
 
         updateCallUI(false)
     }
 
     private fun requestAudioPermissionAndShowDialog() {
-        println("PERMISSION_DEBUG: requestAudioPermissionAndShowDialog called")
-        println("PERMISSION_DEBUG: SDK_INT = ${Build.VERSION.SDK_INT}")
-
-        // Check for audio permission first
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val hasPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            println("PERMISSION_DEBUG: Permission status = $hasPermission (GRANTED=${PackageManager.PERMISSION_GRANTED})")
-
-            if (hasPermission != PackageManager.PERMISSION_GRANTED) {
-                println("PERMISSION_DEBUG: Requesting permission...")
-                // Request permission - dialog will be shown after permission is granted
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.RECORD_AUDIO),
-                    PERMISSION_REQUEST_CODE
-                )
+                    this, arrayOf(Manifest.permission.RECORD_AUDIO), PERMISSION_REQUEST_CODE)
                 return
-            } else {
-                println("PERMISSION_DEBUG: Permission already granted")
             }
         }
-
-        // Permission already granted, show dialog
-        println("PERMISSION_DEBUG: Showing call dialog")
         showCallDialog()
     }
 
@@ -136,79 +189,94 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     Toast.makeText(this, "Please enter server IP", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-
-                if (encryptionKey.isEmpty() || encryptionKey.length != 64) {
-                    Toast.makeText(this, "Encryption key must be 64 hex characters", Toast.LENGTH_SHORT).show()
+                if (encryptionKey.length != 64) {
+                    Toast.makeText(this, "Key must be 64 hex characters", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-
                 startAudioCall(serverIp, serverPort, localPort, encryptionKey)
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun startAudioCall(serverIp: String, serverPort: Int, localPort: Int, encryptionKey: String) {
-        println("CALL_DEBUG: startAudioCall called")
-        println("CALL_DEBUG: serverIp=$serverIp, serverPort=$serverPort, localPort=$localPort")
-        println("CALL_DEBUG: encryptionKey length=${encryptionKey.length}")
+    private fun showVideoCallDialog() {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_video_call, null)
+        val serverIpEditText = dialogView.findViewById<EditText>(R.id.videoServerIpEditText)
+        val serverPortEditText = dialogView.findViewById<EditText>(R.id.videoServerPortEditText)
+        val encryptionKeyEditText = dialogView.findViewById<EditText>(R.id.videoEncryptionKeyEditText)
+        val qualitySpinner = dialogView.findViewById<Spinner>(R.id.videoQualitySpinner)
 
+        // Debug defaults
+        serverIpEditText.setText("192.168.0.108")
+        serverPortEditText.setText("50000")
+        encryptionKeyEditText.setText("34d7379ac3058444eeaab182abfb7c1557fca40d0e5436d75942459fd1e79426")
+
+        val qualities = arrayOf("Low (320x240)", "Medium (640x480)", "High (1280x720)")
+        qualitySpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, qualities)
+        qualitySpinner.setSelection(1) // Medium default
+
+        AlertDialog.Builder(this)
+            .setTitle("Start Video Call")
+            .setView(dialogView)
+            .setPositiveButton("Call") { _, _ ->
+                val serverIp = serverIpEditText.text.toString().trim()
+                val serverPort = serverPortEditText.text.toString().toIntOrNull() ?: 50000
+                val encryptionKey = encryptionKeyEditText.text.toString().trim()
+                val quality = when (qualitySpinner.selectedItemPosition) {
+                    0 -> "low"
+                    2 -> "high"
+                    else -> "medium"
+                }
+
+                if (serverIp.isEmpty()) {
+                    Toast.makeText(this, "Please enter server IP", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                if (encryptionKey.length != 64) {
+                    Toast.makeText(this, "Key must be 64 hex characters", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                val intent = Intent(this, VideoCallActivity::class.java).apply {
+                    putExtra(VideoCallActivity.EXTRA_REMOTE_IP, serverIp)
+                    putExtra(VideoCallActivity.EXTRA_REMOTE_PORT, serverPort)
+                    putExtra(VideoCallActivity.EXTRA_LOCAL_PORT, 0)
+                    putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, encryptionKey)
+                    putExtra(VideoCallActivity.EXTRA_QUALITY, quality)
+                }
+                startActivity(intent)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun startAudioCall(serverIp: String, serverPort: Int, localPort: Int, encryptionKey: String) {
         try {
-            // Convert hex key to byte array
             if (encryptionKey.length != 64) {
                 throw IllegalArgumentException("Key must be 64 hex characters (32 bytes)")
             }
-
-            println("CALL_DEBUG: Converting hex key to bytes...")
             val keyBytes = ByteArray(32)
             for (i in 0 until 32) {
-                val index = i * 2
-                val hex = encryptionKey.substring(index, index + 2)
-                keyBytes[i] = hex.toInt(16).toByte()
+                keyBytes[i] = encryptionKey.substring(i * 2, i * 2 + 2).toInt(16).toByte()
             }
-
-            println("CALL_DEBUG: Calling fearClient.startAudioCallDirect...")
             fearClient.startAudioCallDirect(serverIp, serverPort, localPort, keyBytes)
-
-            println("CALL_DEBUG: Updating UI...")
             currentCallTarget = "$serverIp:$serverPort"
             callStatusTextView.text = "Calling $serverIp:$serverPort..."
             updateCallUI(true)
-            println("CALL_DEBUG: startAudioCall completed successfully")
         } catch (e: Exception) {
-            println("CALL_DEBUG: Exception in startAudioCall: ${e.message}")
-            e.printStackTrace()
             Toast.makeText(this, "Error starting call: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-
-        println("PERMISSION_DEBUG: onRequestPermissionsResult called")
-        println("PERMISSION_DEBUG: requestCode = $requestCode, expected = $PERMISSION_REQUEST_CODE")
-        println("PERMISSION_DEBUG: grantResults = ${grantResults.toList()}")
-
         if (requestCode == PERMISSION_REQUEST_CODE) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                println("PERMISSION_DEBUG: Permission granted!")
-                // Permission granted
                 pendingCallParams?.let { params ->
-                    println("PERMISSION_DEBUG: Have pending params, starting call")
-                    // If we have pending call params, start the call
                     startAudioCall(params.serverIp, params.serverPort, params.localPort, params.encryptionKey)
                     pendingCallParams = null
-                } ?: run {
-                    println("PERMISSION_DEBUG: No pending params, showing dialog")
-                    // No pending params, show the dialog
-                    showCallDialog()
-                }
+                } ?: showCallDialog()
             } else {
-                println("PERMISSION_DEBUG: Permission denied!")
                 Toast.makeText(this, "Audio permission is required for calls", Toast.LENGTH_LONG).show()
                 pendingCallParams = null
             }
@@ -223,11 +291,11 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
     private fun updateCallUI(inCall: Boolean) {
         callButton.isEnabled = !inCall
+        videoCallButton.isEnabled = !inCall
         endCallButton.isEnabled = inCall
         callStatusTextView.visibility = if (inCall) View.VISIBLE else View.GONE
     }
 
-    // FearClientListener implementations
     override fun onCallRequestReceived(fromUser: String) {
         runOnUiThread {
             AlertDialog.Builder(this)
@@ -250,7 +318,6 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         runOnUiThread {
             callStatusTextView.text = "In call with $remoteUser"
             updateCallUI(true)
-            Toast.makeText(this, "Audio call started with $remoteUser", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -258,7 +325,6 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         runOnUiThread {
             updateCallUI(false)
             callStatusTextView.text = "Call ended"
-            Toast.makeText(this, "Audio call ended", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -276,17 +342,28 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         sendButton = findViewById(R.id.sendButton)
         messagesRecyclerView = findViewById(R.id.messagesRecyclerView)
         statusTextView = findViewById(R.id.statusTextView)
+        onlineUsersTextView = findViewById(R.id.onlineUsersTextView)
 
-        // Set default values
-        hostEditText.setText("77.221.145.132") // Change to your server IP
+        identityInfoTextView = findViewById(R.id.identityInfoTextView)
+        generateKeyButton = findViewById(R.id.generateKeyButton)
+        hostRoomButton = findViewById(R.id.hostRoomButton)
+        serverStatusTextView = findViewById(R.id.serverStatusTextView)
+
+        hostRoomButton.setOnClickListener { hostRoom() }
+
+        hostEditText.setText("192.168.0.108")
         portEditText.setText("8888")
-//        portEditText.setText(Common.DEFAULT_PORT.toString())
         roomEditText.setText("testroom")
         nameEditText.setText("Android-user")
+        keyEditText.setText("kgjsuBVlm6ziabdPVROSZsoCpM8LkVI9HjIksx3lMX0")
 
         connectButton.setOnClickListener { connect() }
         disconnectButton.setOnClickListener { disconnect() }
         sendButton.setOnClickListener { sendMessage() }
+        findViewById<Button>(R.id.clearChatButton).setOnClickListener {
+            messages.clear()
+            messagesAdapter.notifyDataSetChanged()
+        }
 
         showConnectionLayout()
     }
@@ -316,20 +393,93 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
     private fun disconnect() {
         fearClient.disconnect()
+        if (isHosting) {
+            fearServer?.stop()
+            fearServer = null
+            isHosting = false
+            ServerService.stop(this)
+            serverStatusTextView.visibility = View.GONE
+        }
+    }
+
+    private fun hostRoom() {
+        val port = portEditText.text.toString().toIntOrNull() ?: Common.DEFAULT_PORT
+        val room = roomEditText.text.toString().trim()
+        val name = nameEditText.text.toString().trim()
+        val key = keyEditText.text.toString().trim()
+
+        if (room.isEmpty() || name.isEmpty() || key.isEmpty()) {
+            Toast.makeText(this, "Please fill room, name, and key", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        hostRoomButton.isEnabled = false
+        connectButton.isEnabled = false
+
+        val localIp = getLocalIpAddress() ?: "unknown"
+
+        val server = FearServer(port, object : FearServer.ServerListener {
+            override fun onServerStarted(port: Int) {
+                runOnUiThread {
+                    isHosting = true
+                    ServerService.start(this@MainActivity)
+                    serverStatusTextView.text = "Server: $localIp:$port"
+                    serverStatusTextView.visibility = View.VISIBLE
+                }
+                // Connect to our own server as a client
+                fearClient.connect("127.0.0.1", port, room, name, key)
+            }
+
+            override fun onServerStopped() {
+                runOnUiThread {
+                    serverStatusTextView.visibility = View.GONE
+                    hostRoomButton.isEnabled = true
+                }
+            }
+
+            override fun onServerError(error: String) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Server error: $error", Toast.LENGTH_LONG).show()
+                    hostRoomButton.isEnabled = true
+                    connectButton.isEnabled = true
+                }
+            }
+
+            override fun onClientConnected(name: String, room: String) {
+                runOnUiThread {
+                    serverStatusTextView.text = "Server: $localIp:$port — room '$room'"
+                }
+            }
+
+            override fun onClientDisconnected(name: String, room: String) {
+                runOnUiThread {
+                    serverStatusTextView.text = "Server: $localIp:$port — room '$room'"
+                }
+            }
+        })
+
+        fearServer = server
+        server.start()
+    }
+
+    private fun getLocalIpAddress(): String? {
+        try {
+            for (intf in NetworkInterface.getNetworkInterfaces()) {
+                for (addr in intf.inetAddresses) {
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        return addr.hostAddress
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
     }
 
     private fun sendMessage() {
         val text = messageEditText.text.toString().trim()
         if (text.isNotEmpty()) {
-            println("UI_DEBUG: Sending message: $text")
-            try {
-                fearClient.sendMessage(text)
-                messageEditText.text.clear()
-            } catch (e: Exception) {
-                println("UI_DEBUG: Exception in sendMessage: ${e.message}")
-                e.printStackTrace()
-                Toast.makeText(this, "Send error: ${e.message}", Toast.LENGTH_LONG).show()
-            }
+            fearClient.sendMessage(text)
+            messageEditText.text.clear()
         }
     }
 
@@ -343,14 +493,16 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         chatLayout.visibility = View.VISIBLE
     }
 
-    // FearClientListener implementations
+    // --- FearClientListener ---
+
     override fun onConnected() {
         runOnUiThread {
             showChatLayout()
             statusTextView.text = "Connected"
             connectButton.isEnabled = false
             disconnectButton.isEnabled = true
-            Toast.makeText(this, "Connected successfully", Toast.LENGTH_SHORT).show()
+            // Start foreground service to keep connection alive in background
+            ChatService.start(this)
         }
     }
 
@@ -362,6 +514,8 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             disconnectButton.isEnabled = false
             messages.clear()
             messagesAdapter.notifyDataSetChanged()
+            // Stop foreground service
+            ChatService.stop(this)
         }
     }
 
@@ -382,14 +536,12 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
     override fun onFileTransferComplete(filename: String) {
         runOnUiThread {
             statusTextView.text = "File received: $filename"
-            Toast.makeText(this, "File received: $filename", Toast.LENGTH_LONG).show()
         }
     }
 
     override fun onFileTransferError(filename: String, error: String) {
         runOnUiThread {
             statusTextView.text = "File error: $error"
-            Toast.makeText(this, "File error: $error", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -400,9 +552,20 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         }
     }
 
+    override fun onContactsUpdated(contacts: List<String>) {
+        runOnUiThread {
+            if (contacts.isNotEmpty()) {
+                onlineUsersTextView.visibility = View.VISIBLE
+                onlineUsersTextView.text = "Online: ${contacts.joinToString(", ")}"
+            } else {
+                onlineUsersTextView.visibility = View.GONE
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        fearClient.disconnect()
+        // Don't disconnect — keep chat session alive when minimized/recreated
     }
 }
 
@@ -416,9 +579,8 @@ class MessagesAdapter(private val messages: List<Message>) :
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MessageViewHolder {
-        val view = androidx.appcompat.view.ContextThemeWrapper(parent.context, R.style.Theme_FEAR).let { context ->
-            android.view.LayoutInflater.from(context).inflate(R.layout.item_message, parent, false)
-        }
+        val view = android.view.LayoutInflater.from(parent.context)
+            .inflate(R.layout.item_message, parent, false)
         return MessageViewHolder(view)
     }
 
@@ -431,7 +593,5 @@ class MessagesAdapter(private val messages: List<Message>) :
         holder.timeTextView.text = dateFormat.format(Date(message.timestamp))
     }
 
-    override fun getItemCount(): Int {
-        return messages.size
-    }
+    override fun getItemCount(): Int = messages.size
 }
