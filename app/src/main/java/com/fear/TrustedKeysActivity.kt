@@ -20,6 +20,7 @@ class TrustedKeysActivity : AppCompatActivity() {
     private val keys = mutableListOf<IdentityManager.KnownKey>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        ThemeManager.applyTheme(ThemeManager.getTheme(this))
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_trusted_keys)
 

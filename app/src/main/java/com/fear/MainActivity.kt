@@ -1,6 +1,9 @@
 package com.fear
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -8,6 +11,7 @@ import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import androidx.appcompat.widget.PopupMenu
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -23,7 +27,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
     private lateinit var connectionLayout: LinearLayout
     private lateinit var chatLayout: LinearLayout
-    private lateinit var hostEditText: EditText
+    private lateinit var hostEditText: AutoCompleteTextView
     private lateinit var portEditText: EditText
     private lateinit var roomEditText: EditText
     private lateinit var nameEditText: EditText
@@ -43,12 +47,16 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
     private lateinit var identityInfoTextView: TextView
     private lateinit var generateKeyButton: Button
+    private lateinit var createRoomButton: Button
     private lateinit var hostRoomButton: Button
     private lateinit var serverStatusTextView: TextView
 
     private lateinit var fearClient: FearClient
     private lateinit var messagesAdapter: MessagesAdapter
-    private val messages = mutableListOf<Message>()
+    private val messages get() = sharedMessages
+
+    private val recentHosts = mutableListOf<String>()
+    private lateinit var hostsAdapter: ArrayAdapter<String>
 
     private var currentCallTarget: String = ""
     private var pendingCallParams: CallParams? = null
@@ -60,6 +68,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         private const val PERMISSION_REQUEST_CODE = 100
         @Volatile
         private var sharedClient: FearClient? = null
+        private val sharedMessages = mutableListOf<Message>()
     }
 
     data class CallParams(
@@ -70,9 +79,11 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        ThemeManager.applyTheme(ThemeManager.getTheme(this))
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        MessageNotifier.createChannel(this)
         initializeViews()
         setupRecyclerView()
         initializeCallViews()
@@ -93,6 +104,20 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             fearClient = FearClient(applicationContext, this)
             sharedClient = fearClient
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        fearClient.isInForeground = true
+        if (fearClient.isConnected() && chatLayout.visibility != View.VISIBLE) {
+            showChatLayout()
+            statusTextView.text = "Connected"
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        fearClient.isInForeground = false
     }
 
     private fun setupIdentity() {
@@ -149,8 +174,29 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         videoCallButton.setOnClickListener { showVideoCallDialog() }
         endCallButton.setOnClickListener { endCurrentCall() }
 
-        findViewById<Button>(R.id.trustedKeysButton).setOnClickListener {
-            startActivity(Intent(this, TrustedKeysActivity::class.java))
+        findViewById<Button>(R.id.menuButton).setOnClickListener { view ->
+            val popup = PopupMenu(this, view)
+            popup.menu.add("Trusted Keys")
+            val themeLabel = if (ThemeManager.isDark(this)) "Light Theme" else "Dark Theme"
+            popup.menu.add(themeLabel)
+            popup.setOnMenuItemClickListener { item ->
+                when (item.title) {
+                    "Trusted Keys" -> {
+                        startActivity(Intent(this, TrustedKeysActivity::class.java))
+                        true
+                    }
+                    "Light Theme" -> {
+                        ThemeManager.setTheme(this, ThemeManager.THEME_LIGHT)
+                        true
+                    }
+                    "Dark Theme" -> {
+                        ThemeManager.setTheme(this, ThemeManager.THEME_DARK)
+                        true
+                    }
+                    else -> false
+                }
+            }
+            popup.show()
         }
 
         updateCallUI(false)
@@ -175,8 +221,17 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         val localPortEditText = dialogView.findViewById<EditText>(R.id.localPortEditText)
         val encryptionKeyEditText = dialogView.findViewById<EditText>(R.id.encryptionKeyEditText)
 
+        // Pre-fill with connected host and room key
+        serverIpEditText.setText(hostEditText.text.toString().trim())
+        val roomKeyHex = fearClient.getRoomKeyHex()
+        if (roomKeyHex.isNotEmpty()) {
+            encryptionKeyEditText.setText(roomKeyHex)
+            encryptionKeyEditText.visibility = View.GONE
+            dialogView.findViewById<View>(R.id.encryptionKeyLabel).visibility = View.GONE
+        }
+
         AlertDialog.Builder(this)
-            .setTitle("Start Audio Call")
+            .setTitle("Audio Call")
             .setView(dialogView)
             .setPositiveButton("Call") { _, _ ->
                 val serverIp = serverIpEditText.text.toString().trim()
@@ -195,6 +250,17 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                 }
                 startAudioCall(serverIp, serverPort, localPort, encryptionKey)
             }
+            .setNeutralButton("Listen") { _, _ ->
+                val localPortText = localPortEditText.text.toString().trim()
+                val localPort = if (localPortText.isEmpty()) 50000 else localPortText.toIntOrNull() ?: 50000
+                val encryptionKey = encryptionKeyEditText.text.toString().trim()
+
+                if (encryptionKey.length != 64) {
+                    Toast.makeText(this, "Key must be 64 hex characters", Toast.LENGTH_SHORT).show()
+                    return@setNeutralButton
+                }
+                startAudioListen(localPort, encryptionKey)
+            }
             .setNegativeButton("Cancel", null)
             .show()
     }
@@ -206,17 +272,23 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         val encryptionKeyEditText = dialogView.findViewById<EditText>(R.id.videoEncryptionKeyEditText)
         val qualitySpinner = dialogView.findViewById<Spinner>(R.id.videoQualitySpinner)
 
-        // Debug defaults
-        serverIpEditText.setText("192.168.0.108")
-        serverPortEditText.setText("50000")
-        encryptionKeyEditText.setText("34d7379ac3058444eeaab182abfb7c1557fca40d0e5436d75942459fd1e79426")
+        // Pre-fill with connected host and room key
+        serverIpEditText.setText(hostEditText.text.toString().trim())
+        val roomKeyHex = fearClient.getRoomKeyHex()
+        if (roomKeyHex.isNotEmpty()) {
+            encryptionKeyEditText.setText(roomKeyHex)
+            encryptionKeyEditText.visibility = View.GONE
+            dialogView.findViewById<View>(R.id.videoEncryptionKeyLabel).visibility = View.GONE
+        }
 
         val qualities = arrayOf("Low (320x240)", "Medium (640x480)", "High (1280x720)")
         qualitySpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, qualities)
         qualitySpinner.setSelection(1) // Medium default
 
+        val localPortEditText = dialogView.findViewById<EditText>(R.id.videoLocalPortEditText)
+
         AlertDialog.Builder(this)
-            .setTitle("Start Video Call")
+            .setTitle("Video Call")
             .setView(dialogView)
             .setPositiveButton("Call") { _, _ ->
                 val serverIp = serverIpEditText.text.toString().trim()
@@ -246,6 +318,31 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                 }
                 startActivity(intent)
             }
+            .setNeutralButton("Listen") { _, _ ->
+                val localPortText = localPortEditText.text.toString().trim()
+                val localPort = if (localPortText.isEmpty()) 50000 else localPortText.toIntOrNull() ?: 50000
+                val encryptionKey = encryptionKeyEditText.text.toString().trim()
+                val quality = when (qualitySpinner.selectedItemPosition) {
+                    0 -> "low"
+                    2 -> "high"
+                    else -> "medium"
+                }
+
+                if (encryptionKey.length != 64) {
+                    Toast.makeText(this, "Key must be 64 hex characters", Toast.LENGTH_SHORT).show()
+                    return@setNeutralButton
+                }
+
+                val intent = Intent(this, VideoCallActivity::class.java).apply {
+                    putExtra(VideoCallActivity.EXTRA_REMOTE_IP, "")
+                    putExtra(VideoCallActivity.EXTRA_REMOTE_PORT, 0)
+                    putExtra(VideoCallActivity.EXTRA_LOCAL_PORT, localPort)
+                    putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, encryptionKey)
+                    putExtra(VideoCallActivity.EXTRA_QUALITY, quality)
+                    putExtra(VideoCallActivity.EXTRA_IS_LISTENING, true)
+                }
+                startActivity(intent)
+            }
             .setNegativeButton("Cancel", null)
             .show()
     }
@@ -265,6 +362,24 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             updateCallUI(true)
         } catch (e: Exception) {
             Toast.makeText(this, "Error starting call: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startAudioListen(localPort: Int, encryptionKey: String) {
+        try {
+            if (encryptionKey.length != 64) {
+                throw IllegalArgumentException("Key must be 64 hex characters (32 bytes)")
+            }
+            val keyBytes = ByteArray(32)
+            for (i in 0 until 32) {
+                keyBytes[i] = encryptionKey.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+            fearClient.startAudioListenDirect(localPort, keyBytes)
+            currentCallTarget = "Listening on :$localPort"
+            callStatusTextView.text = "Listening on port $localPort..."
+            updateCallUI(true)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Error starting listen: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -346,16 +461,22 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
         identityInfoTextView = findViewById(R.id.identityInfoTextView)
         generateKeyButton = findViewById(R.id.generateKeyButton)
+        createRoomButton = findViewById(R.id.createRoomButton)
         hostRoomButton = findViewById(R.id.hostRoomButton)
         serverStatusTextView = findViewById(R.id.serverStatusTextView)
 
+        createRoomButton.setOnClickListener { createRoom() }
         hostRoomButton.setOnClickListener { hostRoom() }
 
-        hostEditText.setText("192.168.0.108")
+        recentHosts.addAll(loadRecentHosts())
+        hostsAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, recentHosts)
+        hostEditText.setAdapter(hostsAdapter)
+
+        hostEditText.setText("77.221.145.132")
         portEditText.setText("8888")
         roomEditText.setText("testroom")
         nameEditText.setText("Android-user")
-        keyEditText.setText("kgjsuBVlm6ziabdPVROSZsoCpM8LkVI9HjIksx3lMX0")
+        keyEditText.setText("")
 
         connectButton.setOnClickListener { connect() }
         disconnectButton.setOnClickListener { disconnect() }
@@ -381,13 +502,43 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         val name = nameEditText.text.toString().trim()
         val key = keyEditText.text.toString().trim()
 
-        if (host.isEmpty() || room.isEmpty() || name.isEmpty() || key.isEmpty()) {
-            Toast.makeText(this, "Please fill all fields", Toast.LENGTH_SHORT).show()
+        if (host.isEmpty() || room.isEmpty() || name.isEmpty()) {
+            Toast.makeText(this, "Please fill host, room, and name", Toast.LENGTH_SHORT).show()
             return
         }
 
-        fearClient.connect(host, port, room, name, key)
-        statusTextView.text = "Connecting..."
+        saveRecentHost(host)
+
+        val mode = if (key.isEmpty()) {
+            FearClient.ConnectMode.JOIN_ROOM
+        } else {
+            FearClient.ConnectMode.MANUAL_KEY
+        }
+
+        fearClient.connect(host, port, room, name, key, mode)
+        statusTextView.text = if (mode == FearClient.ConnectMode.JOIN_ROOM) {
+            "Joining room (key exchange)..."
+        } else {
+            "Connecting..."
+        }
+        connectButton.isEnabled = false
+    }
+
+    private fun createRoom() {
+        val host = hostEditText.text.toString().trim()
+        val port = portEditText.text.toString().toIntOrNull() ?: Common.DEFAULT_PORT
+        val room = roomEditText.text.toString().trim()
+        val name = nameEditText.text.toString().trim()
+
+        if (host.isEmpty() || room.isEmpty() || name.isEmpty()) {
+            Toast.makeText(this, "Please fill host, room, and name", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        saveRecentHost(host)
+
+        fearClient.connect(host, port, room, name, "", FearClient.ConnectMode.CREATE_ROOM)
+        statusTextView.text = "Creating room..."
         connectButton.isEnabled = false
     }
 
@@ -408,9 +559,16 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         val name = nameEditText.text.toString().trim()
         val key = keyEditText.text.toString().trim()
 
-        if (room.isEmpty() || name.isEmpty() || key.isEmpty()) {
-            Toast.makeText(this, "Please fill room, name, and key", Toast.LENGTH_SHORT).show()
+        if (room.isEmpty() || name.isEmpty()) {
+            Toast.makeText(this, "Please fill room and name", Toast.LENGTH_SHORT).show()
             return
+        }
+
+        // Determine mode: if key is empty, auto-generate (CREATE_ROOM)
+        val connectMode = if (key.isEmpty()) {
+            FearClient.ConnectMode.CREATE_ROOM
+        } else {
+            FearClient.ConnectMode.MANUAL_KEY
         }
 
         hostRoomButton.isEnabled = false
@@ -427,7 +585,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     serverStatusTextView.visibility = View.VISIBLE
                 }
                 // Connect to our own server as a client
-                fearClient.connect("127.0.0.1", port, room, name, key)
+                fearClient.connect("127.0.0.1", port, room, name, key, connectMode)
             }
 
             override fun onServerStopped() {
@@ -460,6 +618,24 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
         fearServer = server
         server.start()
+    }
+
+    private fun loadRecentHosts(): List<String> {
+        val file = java.io.File(filesDir, ".fear/recent_hosts")
+        if (!file.exists()) return emptyList()
+        return file.readLines().filter { it.isNotBlank() }.take(10)
+    }
+
+    private fun saveRecentHost(host: String) {
+        if (host.isBlank()) return
+        recentHosts.remove(host)
+        recentHosts.add(0, host)
+        if (recentHosts.size > 10) recentHosts.subList(10, recentHosts.size).clear()
+        hostsAdapter.notifyDataSetChanged()
+
+        val dir = java.io.File(filesDir, ".fear")
+        if (!dir.exists()) dir.mkdirs()
+        java.io.File(dir, "recent_hosts").writeText(recentHosts.joinToString("\n"))
     }
 
     private fun getLocalIpAddress(): String? {
@@ -591,6 +767,13 @@ class MessagesAdapter(private val messages: List<Message>) :
         holder.senderTextView.text = message.sender
         holder.contentTextView.text = message.content
         holder.timeTextView.text = dateFormat.format(Date(message.timestamp))
+
+        holder.itemView.setOnLongClickListener {
+            val clipboard = it.context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("message", message.content))
+            Toast.makeText(it.context, "Message copied", Toast.LENGTH_SHORT).show()
+            true
+        }
     }
 
     override fun getItemCount(): Int = messages.size

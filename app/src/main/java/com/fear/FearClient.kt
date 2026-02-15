@@ -4,11 +4,15 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.goterl.lazysodium.LazySodiumAndroid
+import com.goterl.lazysodium.SodiumAndroid
 import kotlinx.coroutines.*
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.security.SecureRandom
 import java.util.*
 
 class FearClient(
@@ -32,6 +36,7 @@ class FearClient(
     private var socket: Socket? = null
     private var receiveJob: Job? = null
     @Volatile private var isConnected = false
+    @Volatile var isInForeground = true
 
     fun setListener(newListener: FearClientListener) {
         listener = newListener
@@ -42,8 +47,15 @@ class FearClient(
     private var clientName = ""
     private var roomKey = ByteArray(0)
 
+    fun getRoomKeyHex(): String {
+        if (roomKey.isEmpty()) return ""
+        return roomKey.joinToString("") { "%02x".format(it) }
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private var currentFileTransfer: FileTransfer? = null
+
+    enum class ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM }
 
     private var audioCallManager: AudioCallManager? = null
     private var pendingCallRequest: AudioCallRequest? = null
@@ -72,18 +84,35 @@ class FearClient(
         return audioCallManager!!
     }
 
-    fun connect(host: String, port: Int, room: String, name: String, keyBase64: String) {
+    fun connect(host: String, port: Int, room: String, name: String,
+                keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val key = Common.base64Decode(keyBase64)
-                if (key == null || key.size != Common.CRYPTO_AEAD_AES256GCM_KEYBYTES) {
-                    notifyError("Invalid key")
-                    return@launch
-                }
-
-                roomKey = key
                 currentRoom = room
                 clientName = name
+
+                when (mode) {
+                    ConnectMode.MANUAL_KEY -> {
+                        val key = Common.base64Decode(keyBase64)
+                        if (key == null || key.size != Common.CRYPTO_AEAD_AES256GCM_KEYBYTES) {
+                            notifyError("Invalid key")
+                            return@launch
+                        }
+                        roomKey = key
+                    }
+                    ConnectMode.CREATE_ROOM -> {
+                        roomKey = ByteArray(Common.CRYPTO_AEAD_AES256GCM_KEYBYTES)
+                        SecureRandom().nextBytes(roomKey)
+                        val b64 = Common.base64Encode(roomKey)
+                        if (BuildConfig.DEBUG) Log.i("FearClient", "[create] Room key generated: $b64")
+                        notifyMessageReceived(Message(room, "system",
+                            "[create] Room key generated", System.currentTimeMillis()))
+                    }
+                    ConnectMode.JOIN_ROOM -> {
+                        // Key will be obtained via ECDH exchange after socket connection
+                        roomKey = ByteArray(0)
+                    }
+                }
 
                 socket = Socket(host, port)
                 isConnected = true
@@ -97,10 +126,28 @@ class FearClient(
                     Log.d("FearClient", "Identity fingerprint: $fp")
                 }
 
+                val s = socket ?: return@launch
+
+                // If join mode, perform ECDH key exchange before proceeding
+                if (mode == ConnectMode.JOIN_ROOM) {
+                    notifyMessageReceived(Message(room, "system",
+                        "[join] Requesting room key via ECDH exchange...", System.currentTimeMillis()))
+                    val receivedKey = ecdhJoinRoom(s)
+                    if (receivedKey == null) {
+                        notifyError("Key exchange failed: no response (timeout)")
+                        socket?.close()
+                        socket = null
+                        isConnected = false
+                        return@launch
+                    }
+                    roomKey = receivedKey
+                    notifyMessageReceived(Message(room, "system",
+                        "[join] Room key received!", System.currentTimeMillis()))
+                }
+
                 notifyConnected()
 
                 // Send registration message (empty text) so server registers us
-                val s = socket ?: return@launch
                 sendRegistrationMessage(s)
 
                 // Send identity announce if we have a key
@@ -278,6 +325,247 @@ class FearClient(
                 notifyError("Failed to start direct audio call: ${e.message}")
             }
         }
+    }
+
+    fun startAudioListenDirect(localPort: Int, encryptionKey: ByteArray) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                if (encryptionKey.size != 32) {
+                    notifyError("Invalid encryption key size: ${encryptionKey.size}, expected 32 bytes")
+                    return@launch
+                }
+                val manager = getOrCreateAudioCallManager()
+                manager.initialize(encryptionKey)
+                manager.startListenDirect(localPort, encryptionKey)
+                notifyCallStarted("Listening on :$localPort", false)
+            } catch (e: Exception) {
+                notifyError("Failed to start audio listening: ${e.message}")
+            }
+        }
+    }
+
+    // --- ECDH Key Exchange ---
+
+    /**
+     * Send a zero-nonce service frame (unencrypted payload).
+     * Used for KEY_REQUEST and KEY_RESPONSE.
+     */
+    private fun sendServiceFrame(socket: Socket, type: Byte, payload: ByteArray) {
+        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = clientName.toByteArray(Charsets.UTF_8)
+        val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val frame = buildFrame(roomBytes, nameBytes, zeroNonce, type, payload)
+        Common.sendAll(socket, frame)
+    }
+
+    /**
+     * Perform ECDH key exchange as joiner: send KEY_REQUEST, wait for KEY_RESPONSE.
+     * Returns the room key on success, null on failure/timeout.
+     */
+    private fun ecdhJoinRoom(socket: Socket): ByteArray? {
+        val ls = LazySodiumAndroid(SodiumAndroid())
+        val myPk = ByteArray(Common.CRYPTO_BOX_PUBLICKEYBYTES)
+        val mySk = ByteArray(Common.CRYPTO_BOX_SECRETKEYBYTES)
+        ls.cryptoBoxKeypair(myPk, mySk)
+
+        // Send KEY_REQUEST with our ephemeral public key
+        sendServiceFrame(socket, Common.MSG_TYPE_KEY_REQUEST, myPk)
+        Log.i("FearClient", "[join] Sent KEY_REQUEST, waiting for response...")
+
+        // Set socket timeout to 30 seconds
+        val oldTimeout = socket.soTimeout
+        socket.soTimeout = 30000
+
+        try {
+            while (true) {
+                // Read frame header
+                val roomLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, roomLenBuf, 2)) return null
+                val roomLen = Common.readUInt16(roomLenBuf, 0)
+                if (roomLen > Common.MAX_ROOM) return null
+
+                val roomBuf = ByteArray(roomLen)
+                if (!Common.recvAll(socket, roomBuf, roomLen)) return null
+                val room = String(roomBuf, Charsets.UTF_8)
+
+                val nameLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, nameLenBuf, 2)) return null
+                val nameLen = Common.readUInt16(nameLenBuf, 0)
+                if (nameLen > Common.MAX_NAME) return null
+
+                val nameBuf = ByteArray(nameLen)
+                if (!Common.recvAll(socket, nameBuf, nameLen)) return null
+                val senderName = String(nameBuf, Charsets.UTF_8)
+
+                val nonceLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, nonceLenBuf, 2)) return null
+                val nonceLen = Common.readUInt16(nonceLenBuf, 0)
+                if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) return null
+
+                val nonce = ByteArray(nonceLen)
+                if (!Common.recvAll(socket, nonce, nonceLen)) return null
+
+                val typeBuf = ByteArray(1)
+                if (!Common.recvAll(socket, typeBuf, 1)) return null
+
+                val clenBuf = ByteArray(4)
+                if (!Common.recvAll(socket, clenBuf, 4)) return null
+                val clen = Common.readUInt32(clenBuf, 0).toInt()
+                if (clen > Common.MAX_FRAME) return null
+
+                val payload = ByteArray(clen)
+                if (!Common.recvAll(socket, payload, clen)) return null
+
+                // Check if this is a KEY_RESPONSE service message
+                val isZeroNonce = nonce.all { it == 0.toByte() }
+                if (typeBuf[0] != Common.MSG_TYPE_KEY_RESPONSE || !isZeroNonce || room != currentRoom) {
+                    continue
+                }
+
+                // Parse: [target_name_len(2)][target_name][responder_pk(32)][box_nonce(24)][box_cipher(48)]
+                val minLen = 2 + Common.CRYPTO_BOX_PUBLICKEYBYTES +
+                        Common.CRYPTO_BOX_NONCEBYTES + 32 + Common.CRYPTO_BOX_MACBYTES
+                if (clen < minLen) continue
+
+                var off = 0
+                val targetLen = Common.readUInt16(payload, off); off += 2
+                if (off + targetLen + Common.CRYPTO_BOX_PUBLICKEYBYTES +
+                    Common.CRYPTO_BOX_NONCEBYTES + 32 + Common.CRYPTO_BOX_MACBYTES > clen) continue
+
+                val targetName = String(payload, off, targetLen, Charsets.UTF_8); off += targetLen
+                if (targetName != clientName) continue
+
+                val responderPk = payload.copyOfRange(off, off + Common.CRYPTO_BOX_PUBLICKEYBYTES)
+                off += Common.CRYPTO_BOX_PUBLICKEYBYTES
+                val boxNonce = payload.copyOfRange(off, off + Common.CRYPTO_BOX_NONCEBYTES)
+                off += Common.CRYPTO_BOX_NONCEBYTES
+                val boxCipher = payload.copyOfRange(off, off + 32 + Common.CRYPTO_BOX_MACBYTES)
+                off += 32 + Common.CRYPTO_BOX_MACBYTES
+
+                // Check for identity signature (anti-MITM)
+                val remaining = clen - off
+                var sigVerified = false
+                if (remaining >= Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
+                    val idPk = payload.copyOfRange(off, off + Common.IDENTITY_PK_BYTES)
+                    val sig = payload.copyOfRange(off + Common.IDENTITY_PK_BYTES,
+                        off + Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES)
+                    val im = identityManager
+                    if (im != null && im.verify(responderPk, sig, idPk)) {
+                        sigVerified = true
+                        val tofu = im.checkPeerKey(senderName, idPk)
+                        val fp = im.fingerprint(idPk)
+                        when (tofu) {
+                            "verified", "trusted" -> {
+                                notifyMessageReceived(Message(currentRoom, "system",
+                                    "[join] Key exchange verified: $senderName [$fp]",
+                                    System.currentTimeMillis()))
+                            }
+                            "new" -> {
+                                notifyMessageReceived(Message(currentRoom, "system",
+                                    "[join] New identity for '$senderName': $fp (trusted on first use)",
+                                    System.currentTimeMillis()))
+                            }
+                            "changed" -> {
+                                notifyMessageReceived(Message(currentRoom, "system",
+                                    "*** WARNING: Identity key for '$senderName' has CHANGED! ***\n" +
+                                    "*** This could indicate a MITM attack! ***\n" +
+                                    "*** Fingerprint: $fp ***",
+                                    System.currentTimeMillis()))
+                            }
+                        }
+                    } else {
+                        notifyMessageReceived(Message(currentRoom, "system",
+                            "[join] WARNING: Signature verification FAILED for '$senderName'!",
+                            System.currentTimeMillis()))
+                    }
+                }
+
+                // Decrypt room key using crypto_box_open_easy
+                val decrypted = ByteArray(32)
+                val ok = ls.cryptoBoxOpenEasy(
+                    decrypted, boxCipher, boxCipher.size.toLong(),
+                    boxNonce, responderPk, mySk
+                )
+
+                // Zero secret key
+                java.util.Arrays.fill(mySk, 0.toByte())
+
+                if (ok) {
+                    val verStr = if (sigVerified) " (identity verified)" else " (unsigned)"
+                    if (BuildConfig.DEBUG) Log.i("FearClient", "[join] Room key received from '$senderName'$verStr")
+                    notifyMessageReceived(Message(currentRoom, "system",
+                        "[join] Room key received from '$senderName'$verStr",
+                        System.currentTimeMillis()))
+                    return decrypted
+                } else {
+                    Log.e("FearClient", "[join] Failed to decrypt room key")
+                    return null
+                }
+            }
+        } catch (e: SocketTimeoutException) {
+            Log.e("FearClient", "[join] Key exchange timeout (30s)")
+            java.util.Arrays.fill(mySk, 0.toByte())
+            return null
+        } finally {
+            socket.soTimeout = oldTimeout
+        }
+    }
+
+    /**
+     * Handle incoming KEY_REQUEST: encrypt and send the room key to the joiner.
+     */
+    private fun sendKeyResponse(socket: Socket, joinerName: String, joinerPk: ByteArray) {
+        if (roomKey.isEmpty()) return
+
+        val ls = LazySodiumAndroid(SodiumAndroid())
+        val myPk = ByteArray(Common.CRYPTO_BOX_PUBLICKEYBYTES)
+        val mySk = ByteArray(Common.CRYPTO_BOX_SECRETKEYBYTES)
+        ls.cryptoBoxKeypair(myPk, mySk)
+
+        val boxNonce = ByteArray(Common.CRYPTO_BOX_NONCEBYTES)
+        SecureRandom().nextBytes(boxNonce)
+
+        val boxCipher = ByteArray(32 + Common.CRYPTO_BOX_MACBYTES)
+        val ok = ls.cryptoBoxEasy(
+            boxCipher, roomKey, roomKey.size.toLong(),
+            boxNonce, joinerPk, mySk
+        )
+
+        java.util.Arrays.fill(mySk, 0.toByte())
+
+        if (!ok) {
+            Log.e("FearClient", "[key-exchange] crypto_box_easy failed")
+            return
+        }
+
+        // Build payload: [name_len(2)][name][pk(32)][nonce(24)][cipher(48)]
+        // If we have identity: append [id_pk(32)][sig(64)] (anti-MITM)
+        val nameBytes = joinerName.toByteArray(Charsets.UTF_8)
+        val im = identityManager
+        val idPk = im?.getPublicKey()
+        val sig = if (idPk != null) im?.sign(myPk) else null
+        val sigExtra = if (idPk != null && sig != null) (Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) else 0
+
+        val payloadSize = 2 + nameBytes.size + Common.CRYPTO_BOX_PUBLICKEYBYTES +
+                Common.CRYPTO_BOX_NONCEBYTES + boxCipher.size + sigExtra
+        val payload = ByteArray(payloadSize)
+        var off = 0
+        Common.writeUInt16(payload, off, nameBytes.size); off += 2
+        System.arraycopy(nameBytes, 0, payload, off, nameBytes.size); off += nameBytes.size
+        System.arraycopy(myPk, 0, payload, off, Common.CRYPTO_BOX_PUBLICKEYBYTES); off += Common.CRYPTO_BOX_PUBLICKEYBYTES
+        System.arraycopy(boxNonce, 0, payload, off, Common.CRYPTO_BOX_NONCEBYTES); off += Common.CRYPTO_BOX_NONCEBYTES
+        System.arraycopy(boxCipher, 0, payload, off, boxCipher.size); off += boxCipher.size
+
+        if (idPk != null && sig != null) {
+            System.arraycopy(idPk, 0, payload, off, Common.IDENTITY_PK_BYTES); off += Common.IDENTITY_PK_BYTES
+            System.arraycopy(sig, 0, payload, off, Common.IDENTITY_SIG_BYTES)
+        }
+
+        sendServiceFrame(socket, Common.MSG_TYPE_KEY_RESPONSE, payload)
+        val signedStr = if (sigExtra > 0) " (signed)" else ""
+        if (BuildConfig.DEBUG) Log.i("FearClient", "[key-exchange] Sent room key to '$joinerName'$signedStr")
+        notifyMessageReceived(Message(currentRoom, "system",
+            "[key-exchange] Sent room key to '$joinerName'$signedStr", System.currentTimeMillis()))
     }
 
     // --- Send helpers ---
@@ -564,6 +852,20 @@ class FearClient(
             // Handle USER_LIST (service message, not encrypted)
             if (isServiceMessage && msgType == Common.MSG_TYPE_USER_LIST) {
                 handleUserList(ciphertext)
+                return true
+            }
+
+            // Handle KEY_REQUEST (service message, not encrypted)
+            if (isServiceMessage && msgType == Common.MSG_TYPE_KEY_REQUEST) {
+                if (ciphertext.size == Common.CRYPTO_BOX_PUBLICKEYBYTES &&
+                    roomKey.isNotEmpty() && senderName != clientName) {
+                    sendKeyResponse(socket, senderName, ciphertext)
+                }
+                return true
+            }
+
+            // Handle KEY_RESPONSE (ignore in normal recv loop, handled by ecdhJoinRoom)
+            if (isServiceMessage && msgType == Common.MSG_TYPE_KEY_RESPONSE) {
                 return true
             }
 
@@ -890,6 +1192,9 @@ class FearClient(
 
     private fun notifyMessageReceived(message: Message) {
         handler.post { listener.onMessageReceived(message) }
+        if (!isInForeground && message.sender != "system" && message.sender != clientName) {
+            MessageNotifier.show(context, message.sender, message.content)
+        }
     }
 
     private fun notifyCallRequestReceived(fromUser: String) {

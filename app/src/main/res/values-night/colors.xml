@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark theme colors -->
+
+    <!-- Backgrounds -->
+    <color name="fear_bg_primary">#1a1a2e</color>
+    <color name="fear_bg_secondary">#16213e</color>
+    <color name="fear_bg_tertiary">#0f3460</color>
+    <color name="fear_bg_input">#1a1a2e</color>
+
+    <!-- Text -->
+    <color name="fear_text_primary">#FFFFFF</color>
+    <color name="fear_text_secondary">#8888aa</color>
+    <color name="fear_text_hint">#666688</color>
+    <color name="fear_text_message">#e0e0e0</color>
+
+    <!-- Accent -->
+    <color name="fear_accent">#e94560</color>
+
+    <!-- Message bubble -->
+    <color name="fear_bubble_bg">#1a1a2e</color>
+    <color name="fear_bubble_stroke">#2a2a4e</color>
+
+    <!-- Status bar -->
+    <color name="fear_status_bar">#16213e</color>
+
+    <!-- Themed buttons -->
+    <color name="fear_btn_host">#16213e</color>
+    <color name="fear_btn_menu">#16213e</color>
+
+    <!-- Misc -->
+    <color name="fear_warning">#f39c12</color>
+    <color name="fear_fingerprint">#aaaacc</color>
+</resources>

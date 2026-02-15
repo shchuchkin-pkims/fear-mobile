@@ -4,7 +4,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="#1a1a2e">
+    android:background="@color/fear_bg_primary">
 
     <!-- Connection Layout -->
     <LinearLayout
@@ -15,13 +15,21 @@
         android:gravity="center"
         android:padding="24dp">
 
+        <ImageView
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:layout_gravity="center"
+            android:layout_marginBottom="8dp"
+            android:src="@drawable/logo_white"
+            android:contentDescription="F.E.A.R. logo" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="F.E.A.R."
             android:textSize="36sp"
             android:textStyle="bold"
-            android:textColor="#e94560"
+            android:textColor="@color/fear_accent"
             android:gravity="center"
             android:fontFamily="monospace" />
 
@@ -30,7 +38,7 @@
             android:layout_height="wrap_content"
             android:text="Encrypted Messenger v0.4.1"
             android:textSize="14sp"
-            android:textColor="#8888aa"
+            android:textColor="@color/fear_text_secondary"
             android:gravity="center"
             android:layout_marginBottom="32dp" />
 
@@ -38,18 +46,20 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="8dp"
-            app:boxStrokeColor="#e94560"
-            app:hintTextColor="#e94560"
-            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+            app:boxStrokeColor="@color/fear_accent"
+            app:hintTextColor="@color/fear_accent"
+            android:textColorHint="@color/fear_accent"
+            app:endIconMode="dropdown_menu"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
 
-            <com.google.android.material.textfield.TextInputEditText
+            <AutoCompleteTextView
                 android:id="@+id/hostEditText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:hint="Server host"
                 android:inputType="text"
-                android:textColor="#FFFFFF"
-                android:textColorHint="#666688" />
+                android:textColor="@color/fear_text_primary"
+                android:textColorHint="@color/fear_text_hint" />
         </com.google.android.material.textfield.TextInputLayout>
 
         <LinearLayout
@@ -63,8 +73,9 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:layout_marginEnd="4dp"
-                app:boxStrokeColor="#e94560"
-                app:hintTextColor="#e94560"
+                app:boxStrokeColor="@color/fear_accent"
+                app:hintTextColor="@color/fear_accent"
+                android:textColorHint="@color/fear_accent"
                 style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
 
                 <com.google.android.material.textfield.TextInputEditText
@@ -73,7 +84,7 @@
                     android:layout_height="wrap_content"
                     android:hint="Port"
                     android:inputType="number"
-                    android:textColor="#FFFFFF" />
+                    android:textColor="@color/fear_text_primary" />
             </com.google.android.material.textfield.TextInputLayout>
 
             <com.google.android.material.textfield.TextInputLayout
@@ -81,8 +92,9 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:layout_marginStart="4dp"
-                app:boxStrokeColor="#e94560"
-                app:hintTextColor="#e94560"
+                app:boxStrokeColor="@color/fear_accent"
+                app:hintTextColor="@color/fear_accent"
+                android:textColorHint="@color/fear_accent"
                 style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
 
                 <com.google.android.material.textfield.TextInputEditText
@@ -91,7 +103,7 @@
                     android:layout_height="wrap_content"
                     android:hint="Room"
                     android:inputType="text"
-                    android:textColor="#FFFFFF" />
+                    android:textColor="@color/fear_text_primary" />
             </com.google.android.material.textfield.TextInputLayout>
         </LinearLayout>
 
@@ -99,8 +111,9 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="8dp"
-            app:boxStrokeColor="#e94560"
-            app:hintTextColor="#e94560"
+            app:boxStrokeColor="@color/fear_accent"
+            app:hintTextColor="@color/fear_accent"
+            android:textColorHint="@color/fear_accent"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
 
             <com.google.android.material.textfield.TextInputEditText
@@ -109,24 +122,25 @@
                 android:layout_height="wrap_content"
                 android:hint="Your name"
                 android:inputType="text"
-                android:textColor="#FFFFFF" />
+                android:textColor="@color/fear_text_primary" />
         </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="24dp"
-            app:boxStrokeColor="#e94560"
-            app:hintTextColor="#e94560"
+            app:boxStrokeColor="@color/fear_accent"
+            app:hintTextColor="@color/fear_accent"
+            android:textColorHint="@color/fear_accent"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
 
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/keyEditText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:hint="Room key (Base64URL)"
+                android:hint="Room key (optional - leave empty to auto-join)"
                 android:inputType="text"
-                android:textColor="#FFFFFF" />
+                android:textColor="@color/fear_text_primary" />
         </com.google.android.material.textfield.TextInputLayout>
 
         <Button
@@ -138,20 +152,29 @@
             android:backgroundTint="#e94560" />
 
         <Button
+            android:id="@+id/createRoomButton"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="8dp"
+            android:text="Create Room"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#2ecc71" />
+
+        <Button
             android:id="@+id/hostRoomButton"
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:layout_marginTop="8dp"
             android:text="Host Room"
             android:textColor="#FFFFFF"
-            android:backgroundTint="#16213e" />
+            android:backgroundTint="@color/fear_btn_host" />
 
         <!-- Identity info -->
         <TextView
             android:id="@+id/identityInfoTextView"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textColor="#8888aa"
+            android:textColor="@color/fear_text_secondary"
             android:textSize="12sp"
             android:gravity="center"
             android:layout_marginTop="16dp" />
@@ -162,7 +185,7 @@
             android:layout_height="wrap_content"
             android:text="Generate Identity Key"
             android:textColor="#FFFFFF"
-            android:backgroundTint="#16213e"
+            android:backgroundTint="@color/fear_btn_host"
             android:layout_gravity="center"
             android:layout_marginTop="8dp"
             android:visibility="gone" />
@@ -182,7 +205,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:background="#16213e"
+            android:background="@color/fear_bg_secondary"
             android:padding="12dp">
 
             <LinearLayout
@@ -190,6 +213,20 @@
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:gravity="center_vertical">
+
+                <Button
+                    android:id="@+id/menuButton"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:text="☰"
+                    android:textSize="20sp"
+                    android:textColor="@color/fear_text_primary"
+                    android:backgroundTint="@color/fear_btn_menu"
+                    android:minWidth="0dp"
+                    android:padding="0dp"
+                    android:insetTop="0dp"
+                    android:insetBottom="0dp"
+                    android:layout_marginEnd="8dp" />
 
                 <TextView
                     android:id="@+id/statusTextView"
@@ -204,11 +241,14 @@
                 <Button
                     android:id="@+id/clearChatButton"
                     android:layout_width="wrap_content"
-                    android:layout_height="28dp"
+                    android:layout_height="36dp"
                     android:text="Clear"
                     android:textSize="11sp"
                     android:backgroundTint="#95a5a6"
                     android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:insetTop="0dp"
+                    android:insetBottom="0dp"
                     android:paddingStart="10dp"
                     android:paddingEnd="10dp" />
             </LinearLayout>
@@ -217,7 +257,7 @@
                 android:id="@+id/onlineUsersTextView"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:textColor="#8888aa"
+                android:textColor="@color/fear_text_secondary"
                 android:textSize="12sp"
                 android:visibility="gone" />
 
@@ -225,7 +265,7 @@
                 android:id="@+id/serverStatusTextView"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:textColor="#f39c12"
+                android:textColor="@color/fear_warning"
                 android:textSize="12sp"
                 android:visibility="gone" />
         </LinearLayout>
@@ -236,7 +276,7 @@
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:background="#0f3460"
+            android:background="@color/fear_bg_tertiary"
             android:padding="8dp"
             android:clipToPadding="false" />
 
@@ -245,7 +285,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:background="#16213e"
+            android:background="@color/fear_bg_secondary"
             android:padding="8dp">
 
             <EditText
@@ -254,9 +294,9 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:hint="Message..."
-                android:textColorHint="#666688"
-                android:textColor="#FFFFFF"
-                android:background="#1a1a2e"
+                android:textColorHint="@color/fear_text_hint"
+                android:textColor="@color/fear_text_primary"
+                android:background="@color/fear_bg_input"
                 android:padding="12dp"
                 android:inputType="text"
                 android:layout_marginEnd="8dp" />
@@ -275,7 +315,7 @@
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center"
-            android:background="#16213e"
+            android:background="@color/fear_bg_secondary"
             android:paddingStart="8dp"
             android:paddingEnd="8dp"
             android:paddingBottom="8dp">
@@ -311,16 +351,6 @@
                 android:textSize="12sp" />
 
             <Button
-                android:id="@+id/trustedKeysButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Keys"
-                android:backgroundTint="#9b59b6"
-                android:layout_marginEnd="4dp"
-                android:textSize="12sp" />
-
-            <Button
                 android:id="@+id/disconnectButton"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -337,8 +367,8 @@
             android:text="Call in progress..."
             android:gravity="center"
             android:textStyle="bold"
-            android:textColor="#e94560"
-            android:background="#16213e"
+            android:textColor="@color/fear_accent"
+            android:background="@color/fear_bg_secondary"
             android:padding="8dp"
             android:visibility="gone" />
 

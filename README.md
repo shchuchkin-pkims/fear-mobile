@@ -1,230 +1,198 @@
-# F.E.A.R. Messenger - Android
+# F.E.A.R. - Fully Encrypted Anonymous Routing
 
-[![Android](https://img.shields.io/badge/Platform-Android-green.svg)](https://www.android.com/)
-[![API](https://img.shields.io/badge/API-24%2B-brightgreen.svg)](https://android-arsenal.com/api?level=24)
-[![Kotlin](https://img.shields.io/badge/Kotlin-1.9.0-blue.svg)](https://kotlinlang.org)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<div align="center">
 
-**F.E.A.R. Messenger** - кроссплатформенный зашифрованный мессенджер с поддержкой аудиозвонков в реальном времени. Мобильная версия для Android, совместимая с [PC версией](https://github.com/shchuchkin-pkims/fear).
+![F.E.A.R. Project](./doc/images/banner_small.png)
 
-> 📱 **Это Android-клиент**. Для полноценной работы требуется [PC версия сервера](https://github.com/shchuchkin-pkims/fear) (Windows/Linux/macOS).
+**Privacy-focused secure messaging platform with end-to-end encryption**
 
-## Возможности
+*Бояться - это нормально...*
 
-- ✅ **Зашифрованные аудиозвонки** - AES-GCM шифрование для всех аудиопакетов
-- ✅ **Высокое качество звука** - Opus codec (48kHz, mono, 128kbps)
-- ✅ **Низкая задержка** - Оптимизирован для real-time коммуникации
-- ✅ **Работа в фоне** - Foreground Service для непрерывной связи даже при заблокированном экране
-- ✅ **Кроссплатформенность** - Совместимость с PC версией (Windows/Linux/macOS)
-- ✅ **Текстовые сообщения** - Обмен зашифрованными сообщениями
-- ✅ **Передача файлов** - Отправка файлов между участниками
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/Platform-Android-green.svg)]()
+[![API](https://img.shields.io/badge/API-24%2B-brightgreen.svg)]()
+[![Kotlin](https://img.shields.io/badge/Kotlin-1.9-blue.svg)](https://kotlinlang.org)
 
-## Скриншоты
+[Features](#features) • [Quick Start](#quick-start) • [Desktop Version](#desktop-version)
 
-[TODO: Добавьте скриншоты приложения]
-
-## Технические характеристики
-
-### Аудио
-- **Codec**: Opus 1.3.1
-- **Sample Rate**: 48000 Hz
-- **Channels**: Mono
-- **Bitrate**: 128 kbps
-- **Frame Size**: 960 samples (~20ms)
-- **Latency**: < 100ms (зависит от сети)
-
-### Безопасность
-- **Шифрование**: AES-GCM
-- **Nonce**: 12 bytes (4-byte prefix + 8-byte sequence)
-- **Протокол**: UDP с custom binary protocol
-
-### Требования
-- **Минимальная версия Android**: 7.0 (API 24)
-- **Целевая версия Android**: 34
-- **Разрешения**:
-  - `INTERNET` - для сетевого соединения
-  - `RECORD_AUDIO` - для записи звука с микрофона
-  - `ACCESS_NETWORK_STATE` - для проверки состояния сети
-  - `WAKE_LOCK` - для работы в фоне
-  - `FOREGROUND_SERVICE` - для Foreground Service
-  - `FOREGROUND_SERVICE_MICROPHONE` - для использования микрофона в фоне
-  - `POST_NOTIFICATIONS` - для уведомлений (Android 13+)
-
-## Быстрый старт
-
-### Установка готового APK
-
-1. Скачайте последний релиз APK:
-   - [F.E.A.R.Messenger-v0.3.0-release.apk](release/F.E.A.R.Messenger-v0.3.0-release.apk)
-   - Или из [Releases](https://github.com/shchuchkin-pkims/fear-mobile/releases)
-2. Установите APK на устройство
-3. Предоставьте необходимые разрешения
-
-**Важно**: Перед использованием убедитесь, что запущен [PC сервер](https://github.com/shchuchkin-pkims/fear)
-
-### Сборка из исходников
-
-Подробная инструкция по сборке находится в [BUILD.md](BUILD.md)
-
-**Краткая версия:**
-
-```bash
-# Клонировать репозиторий
-git clone https://github.com/shchuchkin-pkims/fear-mobile.git
-cd fear-mobile
-
-# Собрать Debug версию
-./gradlew assembleDebug
-
-# Собрать Release версию
-./gradlew assembleRelease
-
-# APK будет в app/build/outputs/apk/
-```
-
-## Использование
-
-1. Запустите приложение
-2. Введите данные подключения:
-   - **Server Host**: IP адрес сервера
-   - **Port**: Порт сервера
-   - **Room**: Название комнаты
-   - **Your Name**: Ваше имя
-   - **Room Key**: Ключ комнаты (Base64)
-3. Нажмите **Connect** для подключения к комнате
-4. Нажмите **Audio Call** для начала аудиозвонка
-5. Используйте **End Call** для завершения звонка
-
-### Обмен сообщениями
-
-- Введите текст в поле ввода и нажмите **Send**
-- Для отправки файла используйте команду: `/sendfile filename`
-
-## Архитектура
-
-```
-fear-mobile/
-├── app/
-│   ├── src/
-│   │   ├── main/
-│   │   │   ├── java/com/fear/
-│   │   │   │   ├── MainActivity.kt           # Главная активность
-│   │   │   │   ├── FearClient.kt             # Клиент для текстовых сообщений
-│   │   │   │   ├── AudioCallManager.kt       # Менеджер аудиозвонков
-│   │   │   │   ├── AudioCallService.kt       # Foreground Service
-│   │   │   │   └── OpusCodec.kt              # JNI обертка для Opus
-│   │   │   ├── cpp/
-│   │   │   │   ├── opus_jni.cpp              # JNI реализация Opus
-│   │   │   │   ├── CMakeLists.txt            # CMake конфигурация
-│   │   │   │   └── opus/                     # Prebuilt Opus библиотеки
-│   │   │   │       ├── include/              # Заголовочные файлы
-│   │   │   │       └── libs/                 # .so библиотеки
-│   │   │   ├── res/                          # Ресурсы приложения
-│   │   │   └── AndroidManifest.xml
-│   │   └── build.gradle.kts
-│   └── build.gradle.kts
-├── gradle/
-├── .gitignore
-├── BUILD.md                                  # Инструкция по сборке
-├── README.md                                 # Этот файл
-└── settings.gradle.kts
-```
-
-## Протокол связи
-
-### Типы пакетов
-
-- `0x01` - HELLO (обмен nonce prefix)
-- `0x02` - AUDIO (аудио пакет)
-
-### Формат HELLO пакета
-
-```
-[1 byte: version 0x01][4 bytes: nonce prefix]
-```
-
-### Формат AUDIO пакета
-
-```
-[1 byte: version 0x02][12 bytes: nonce][N bytes: encrypted audio]
-```
-
-### Nonce структура
-
-```
-[4 bytes: random prefix][8 bytes: sequence number (big-endian)]
-```
-
-## Известные проблемы
-
-- Групповые звонки (3+ участников) работают нестабильно - в текущей реализации используется только один remote nonce prefix
-- При первом запуске требуется предоставить разрешения вручную
-- Возможно эхо при использовании без наушников
-
-## Roadmap
-
-- [ ] Полноценная поддержка групповых звонков
-- [ ] Улучшение качества звука при плохом интернете (PLC - Packet Loss Concealment)
-- [ ] Видеозвонки
-- [ ] End-to-end шифрование для текстовых сообщений
-- [ ] Push уведомления
-- [ ] Контакты и история звонков
-
-## Разработка
-
-### Требования для разработки
-
-- Android Studio Hedgehog (2023.1.1) или новее
-- JDK 17+
-- Android SDK 34
-- NDK 25.1.8937393 или новее
-- CMake 3.22.1+
-
-### Отладка
-
-```bash
-# Просмотр логов
-adb logcat -s "ACM_DEBUG" "FC_DEBUG" "MainActivity" "OpusJNI"
-
-# Установка Debug APK
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-
-# Очистка данных приложения
-adb shell pm clear com.fear
-```
-
-## Вклад в проект
-
-Приветствуются Pull Requests! Пожалуйста, следуйте:
-
-1. Fork проекта
-2. Создайте feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit изменения (`git commit -m 'Add some AmazingFeature'`)
-4. Push в branch (`git push origin feature/AmazingFeature`)
-5. Откройте Pull Request
-
-## Лицензия
-
-Этот проект лицензирован под MIT License - см. файл [LICENSE](LICENSE) для деталей.
-
-## Авторы
-
-- **Разработка** - [shchuchkin-pkims](https://github.com/shchuchkin-pkims)
-
-## Благодарности
-
-- [Opus Audio Codec](https://opus-codec.org/) - за отличный аудио кодек
-- [Kotlin](https://kotlinlang.org/) - за прекрасный язык программирования
-- Всем, кто тестирует и предлагает улучшения
-
-## Связанные проекты
-
-- [F.E.A.R. Desktop](https://github.com/shchuchkin-pkims/fear) - Десктопная версия мессенджера
-
-## Контакты
-
-Для вопросов и предложений свяжитесь через GitHub Issues.
+</div>
 
 ---
 
-**⚠️ Disclaimer**: Этот проект создан в образовательных целях. Используйте на свой риск.
+## Overview
+
+**F.E.A.R. Messenger** is the Android client for the F.E.A.R. secure messaging platform. Fully compatible with the [desktop server and clients](https://github.com/shchuchkin-pkims/fear) — supports encrypted text, audio calls, video calls, ECDH key exchange, identity verification, and file transfer.
+
+## Features
+
+- **End-to-end encrypted messaging** — AES-256-GCM with Lazysodium; server never sees plaintext
+- **Encrypted audio calls** — Opus codec via JNI, AES-256-GCM over UDP
+- **Encrypted video calls** — Compatible with desktop VP8 video calls
+- **ECDH key exchange** — Create rooms with auto-generated keys or join via X25519 exchange
+- **Identity verification** — Ed25519 keypairs with Trust On First Use (TOFU) model
+- **File transfer** — Encrypted file sharing with CRC32 integrity checks
+- **Push notifications** — Notifications for new messages when app is in background
+- **Light and dark themes** — Toggle between light and dark UI from the menu
+- **Recent hosts** — Dropdown with recently used server addresses
+- **Foreground service** — Persistent connection even when screen is locked
+- **Cross-platform** — Full compatibility with desktop F.E.A.R. server and clients
+
+## Requirements
+
+- Android 7.0+ (API 24)
+- Permissions: Internet, Microphone, Camera, Notifications
+
+## Quick Start
+
+### Install from APK
+
+1. Download the latest release from [Releases](https://github.com/shchuchkin-pkims/fear-mobile/releases)
+2. Install the APK on your device
+3. Grant requested permissions
+
+### Build from Source
+
+```bash
+git clone https://github.com/shchuchkin-pkims/fear-mobile.git
+cd fear-mobile
+./gradlew assembleDebug
+```
+
+APK: `app/build/outputs/apk/debug/app-debug.apk`
+
+See [BUILD.md](BUILD.md) for detailed build instructions.
+
+### Connect
+
+1. Start a F.E.A.R. server on your PC (see [desktop version](https://github.com/shchuchkin-pkims/fear))
+2. Open the app and enter:
+   - **Server Host** — server IP address
+   - **Port** — server port
+   - **Room** — room name
+   - **Your Name** — your username
+   - **Room Key** — encryption key (Base64)
+3. Press **Connect**
+
+Or use **Create Room** to auto-generate a key, or leave the key field empty and press **Connect** to join via ECDH key exchange.
+
+## Usage
+
+### Connection Modes
+
+- **Create Room** — generates a random encryption key and starts a new room
+- **Join Room** — connects with an empty key field; ECDH key exchange happens automatically
+- **Connect** — connects with a manually entered key
+
+### Chat
+
+- Type a message and press **Send**
+- Send files via `/sendfile filename` or the attachment button
+- Messages are encrypted with AES-256-GCM before transmission
+
+### Audio Calls
+
+1. Connect to a room
+2. Tap the **Audio Call** button
+3. Both parties must be in the same room
+4. Tap **End Call** to finish
+
+### Video Calls
+
+Compatible with desktop video calls. Start from the call menu in the room.
+
+### Themes
+
+Toggle between light and dark themes from the hamburger menu (top-left).
+
+### Push Notifications
+
+When the app is in the background or the screen is locked, new messages trigger push notifications. Tap a notification to return to the chat.
+
+### Identity Verification
+
+On first connection to a peer, their Ed25519 public key is saved locally. On subsequent connections, keys are compared. A mismatch triggers a security warning. Manage trusted keys from the menu.
+
+## Architecture
+
+```
+app/src/main/java/com/fear/
+├── MainActivity.kt         # Main screen: connection form, chat, menu
+├── FearClient.kt           # TCP client, encryption, ECDH, identity
+├── AudioCallManager.kt     # Audio call manager (Opus via JNI, UDP)
+├── AudioCallService.kt     # Foreground service for audio calls
+├── ChatService.kt          # Foreground service for chat connection
+├── MessageNotifier.kt      # Push notification handler
+├── IdentityManager.kt      # Ed25519 identity and trusted keys
+├── ThemeManager.kt         # Light/dark theme persistence
+├── TrustedKeysActivity.kt  # Trusted keys management screen
+├── OpusCodec.kt            # JNI wrapper for Opus codec
+├── Crypto.kt               # AES-256-GCM encryption
+├── Common.kt               # Constants and utilities
+└── Message.kt              # Data classes
+
+app/src/main/cpp/
+├── opus_jni.cpp            # JNI implementation for Opus
+└── opus/                   # Prebuilt Opus libraries (arm64, armv7, x86, x86_64)
+```
+
+## Protocol Compatibility
+
+The Android app uses the same binary protocol as the desktop version:
+
+| Channel | Format |
+|---------|--------|
+| TCP chat | `[2 room_len][room][2 name_len][name][2 nonce_len][nonce][1 type][4 clen][cipher]` (LE) |
+| UDP audio | `[0x01][seq(8 BE)][AES-GCM(opus) + 16-byte tag]` |
+| ECDH | MSG_TYPE_KEY_REQUEST (15) / MSG_TYPE_KEY_RESPONSE (16) |
+| Identity | Ed25519 signatures on ECDH responses |
+
+## Development
+
+### Requirements
+
+- Android Studio Hedgehog (2023.1.1) or newer
+- JDK 17+
+- Android SDK 34, NDK 25.1+, CMake 3.22.1+
+
+### Debug
+
+```bash
+# Build and install
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# View logs
+adb logcat -s "ACM_DEBUG" "FC_DEBUG" "MainActivity" "OpusJNI"
+```
+
+## Desktop Version
+
+The desktop F.E.A.R. application (Linux/Windows) with GUI and CLI is available at:
+**[github.com/shchuchkin-pkims/fear](https://github.com/shchuchkin-pkims/fear)**
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/name`
+3. Make changes and test
+4. Open a Pull Request
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.
+
+## Acknowledgments
+
+- **[Lazysodium](https://github.com/nicksulker/lazysodium-android)** — libsodium bindings for Android
+- **[Opus](https://opus-codec.org/)** — Xiph.Org Foundation
+- **[Kotlin](https://kotlinlang.org/)** — JetBrains
+
+---
+
+<div align="center">
+
+**Stay Anonymous. Stay Secure.**
+
+Made by Shchuchkin E. Yu. and the F.E.A.R. Project community
+
+</div>

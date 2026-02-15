@@ -84,6 +84,16 @@ object Common {
     const val MSG_TYPE_AUDIO_CALL_END: Byte = 13
     const val MSG_TYPE_AUDIO_UDP_INFO: Byte = 14
 
+    // ECDH key exchange message types
+    const val MSG_TYPE_KEY_REQUEST: Byte = 15
+    const val MSG_TYPE_KEY_RESPONSE: Byte = 16
+
+    // crypto_box constants (X25519 + XSalsa20-Poly1305)
+    const val CRYPTO_BOX_PUBLICKEYBYTES = 32
+    const val CRYPTO_BOX_SECRETKEYBYTES = 32
+    const val CRYPTO_BOX_NONCEBYTES = 24
+    const val CRYPTO_BOX_MACBYTES = 16
+
     fun readUInt16(bytes: ByteArray, offset: Int): Int {
         return (bytes[offset].toInt() and 0xFF) or
                 ((bytes[offset + 1].toInt() and 0xFF) shl 8)

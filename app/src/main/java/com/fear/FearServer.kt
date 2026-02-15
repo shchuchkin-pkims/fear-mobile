@@ -40,7 +40,10 @@ class FearServer(private val port: Int, private val listener: ServerListener) {
         running = true
         acceptThread = Thread {
             try {
-                val ss = ServerSocket(port).apply { reuseAddress = true }
+                val ss = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(java.net.InetSocketAddress(port))
+                }
                 serverSocket = ss
                 Log.i(TAG, "Listening on port $port")
                 listener.onServerStarted(port)

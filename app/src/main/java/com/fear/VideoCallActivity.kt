@@ -34,6 +34,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         const val EXTRA_LOCAL_PORT = "local_port"
         const val EXTRA_ENCRYPTION_KEY = "encryption_key"
         const val EXTRA_QUALITY = "quality"
+        const val EXTRA_IS_LISTENING = "is_listening"
         private const val PERMISSION_CODE = 200
     }
 
@@ -54,6 +55,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     private var localPort = 0
     private var encryptionKeyHex = ""
     private var qualityPreset = "medium"
+    private var isListeningMode = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,8 +67,9 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         localPort = intent.getIntExtra(EXTRA_LOCAL_PORT, 0)
         encryptionKeyHex = intent.getStringExtra(EXTRA_ENCRYPTION_KEY) ?: ""
         qualityPreset = intent.getStringExtra(EXTRA_QUALITY) ?: "medium"
+        isListeningMode = intent.getBooleanExtra(EXTRA_IS_LISTENING, false)
 
-        Log.d(TAG, "onCreate: remote=$remoteIp:$remotePort keyLen=${encryptionKeyHex.length} quality=$qualityPreset")
+        Log.d(TAG, "onCreate: remote=$remoteIp:$remotePort keyLen=${encryptionKeyHex.length} quality=$qualityPreset listen=$isListeningMode")
 
         remoteSurfaceView = findViewById(R.id.remoteSurfaceView)
         localPreview = findViewById(R.id.localPreview)
@@ -108,7 +111,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     }
 
     private fun startVideoCall() {
-        if (remoteIp.isEmpty()) {
+        if (!isListeningMode && remoteIp.isEmpty()) {
             Log.e(TAG, "Remote IP is empty")
             Toast.makeText(this, "Remote IP is empty", Toast.LENGTH_LONG).show()
             finish()
@@ -140,18 +143,22 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
             else -> VideoQualityPreset.MEDIUM
         }
 
-        Log.d(TAG, "Starting call to $remoteIp:$remotePort quality=$qualityPreset")
-
         val manager = VideoCallManager(this, this)
         videoCallManager = manager
 
         val identityMgr = IdentityManager(this)
         manager.initialize(keyBytes, preset, if (identityMgr.hasIdentity()) identityMgr else null)
 
-        statsTextView.text = "Connecting to $remoteIp..."
-
-        // Start network (HELLO handshake) immediately — don't wait for surface
-        manager.startCall(remoteIp, remotePort, localPort)
+        if (isListeningMode) {
+            val listenPort = if (localPort > 0) localPort else 50000
+            Log.d(TAG, "Starting listen on port $listenPort quality=$qualityPreset")
+            statsTextView.text = "Listening on port $listenPort..."
+            manager.startListen(listenPort)
+        } else {
+            Log.d(TAG, "Starting call to $remoteIp:$remotePort quality=$qualityPreset")
+            statsTextView.text = "Connecting to $remoteIp..."
+            manager.startCall(remoteIp, remotePort, localPort)
+        }
 
         // Set up decoder when surface is ready
         remoteSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {

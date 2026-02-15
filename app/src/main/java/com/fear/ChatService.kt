@@ -73,7 +73,7 @@ class ChatService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("F.E.A.R.")
             .setContentText("Connected to room")
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pendingIntent)

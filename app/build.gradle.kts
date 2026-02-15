@@ -1,11 +1,27 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) load(f.inputStream())
+}
+
 android {
     namespace = "com.fear"
     compileSdk = 36
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("${rootProject.projectDir}/${localProps["STORE_FILE"] ?: "fear-app.keystore"}")
+            storePassword = localProps["STORE_PASSWORD"]?.toString() ?: ""
+            keyAlias = localProps["KEY_ALIAS"]?.toString() ?: ""
+            keyPassword = localProps["KEY_PASSWORD"]?.toString() ?: ""
+        }
+    }
 
     defaultConfig {
         applicationId = "com.fear"
@@ -20,6 +36,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -38,6 +55,7 @@ android {
     
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 
     externalNativeBuild {

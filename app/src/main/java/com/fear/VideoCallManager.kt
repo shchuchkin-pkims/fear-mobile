@@ -64,6 +64,7 @@ class VideoCallManager(
     private var remotePort = 0
 
     // State
+    private val isListening = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
     private var receiveThread: Thread? = null
     private var helloThread: Thread? = null
@@ -191,6 +192,48 @@ class VideoCallManager(
     }
 
     /**
+     * Start listening for incoming video call on local port.
+     * Remote address will be set when first HELLO arrives.
+     */
+    fun startListen(localUdpPort: Int) {
+        if (running.get()) return
+
+        val bindPort = if (localUdpPort > 0) localUdpPort else 50000
+        Log.d(TAG, "startListen: port=$bindPort")
+
+        // Don't set remote address — will be learned from incoming HELLO
+        remoteAddress = null
+        remotePort = 0
+        isListening.set(true)
+
+        try {
+            udpSocket = DatagramSocket(bindPort)
+            udpSocket?.soTimeout = 100
+            Log.d(TAG, "Listening on port ${udpSocket?.localPort}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind to port $bindPort", e)
+            listener.onCallError("Cannot bind to port $bindPort: ${e.message}")
+            isListening.set(false)
+            return
+        }
+
+        running.set(true)
+
+        initializeAudio()
+
+        // Start receive loop (will extract sender from first HELLO)
+        receiveThread = Thread {
+            try {
+                receiveLoop()
+            } catch (e: Exception) {
+                Log.e(TAG, "receiveLoop crashed", e)
+            }
+        }.also { it.start() }
+
+        listener.onCallStarted()
+    }
+
+    /**
      * Attach decoder surface for rendering remote video. Can be called after startCall.
      */
     fun attachDecoderSurface(surface: Surface) {
@@ -291,7 +334,7 @@ class VideoCallManager(
             val recBuf = maxOf(minRecBuf, Common.AUDIO_PCM_BYTES_PER_FRAME * 4)
 
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 Common.AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -302,6 +345,18 @@ class VideoCallManager(
                 Log.e(TAG, "AudioRecord init failed")
                 audioRecord?.release()
                 audioRecord = null
+            } else {
+                val sessionId = audioRecord!!.audioSessionId
+                if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
+                    val aec = android.media.audiofx.AcousticEchoCanceler.create(sessionId)
+                    aec?.enabled = true
+                    Log.d(TAG, "AcousticEchoCanceler enabled")
+                }
+                if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
+                    val ns = android.media.audiofx.NoiseSuppressor.create(sessionId)
+                    ns?.enabled = true
+                    Log.d(TAG, "NoiseSuppressor enabled")
+                }
             }
 
             // AudioTrack (speaker)
@@ -413,6 +468,7 @@ class VideoCallManager(
 
         pendingFrames.clear()
         remotePrefixReady.set(false)
+        isListening.set(false)
         remoteNoncePrefix = null
         audioSeqTx.set(0)
         videoSeqTx.set(0)
@@ -523,6 +579,21 @@ class VideoCallManager(
                 if (data.isEmpty()) continue
 
                 val pktType = data[0].toInt() and 0xFF
+
+                // Listen mode: learn remote address from first packet
+                if (isListening.get() && remoteAddress == null && packet.address != null) {
+                    remoteAddress = packet.address
+                    remotePort = packet.port
+                    isListening.set(false)
+                    Log.d(TAG, "Listen mode - peer connected from ${packet.address.hostAddress}:${packet.port}")
+
+                    // Start HELLO handshake now that we know the remote
+                    helloThread = Thread {
+                        try { helloLoop() } catch (e: Exception) {
+                            Log.e(TAG, "helloLoop crashed", e)
+                        }
+                    }.also { it.start() }
+                }
 
                 when (data[0]) {
                     Common.PKT_VER_HELLO -> {

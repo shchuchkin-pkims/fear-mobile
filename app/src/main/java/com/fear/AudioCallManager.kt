@@ -70,6 +70,9 @@ class AudioCallManager(
     private val opusBuffer = ByteArray(AUDIO_MAX_OPUS_BYTES)
     private val packetBuffer = ByteArray(AUDIO_UDP_RECV_BUFSIZE)
 
+    // Listen mode: waiting for incoming connection
+    private val isListening = AtomicBoolean(false)
+
     // Socket lock for thread-safe access
     private val socketLock = Any()
 
@@ -321,6 +324,74 @@ class AudioCallManager(
         }
     }
 
+    fun startListenDirect(localPort: Int, encryptionKey: ByteArray) {
+        println("ACM_DEBUG: startListenDirect called, localPort=$localPort")
+
+        CoroutineScope(Dispatchers.IO).launch {
+            if (isRunning.get()) {
+                println("ACM_DEBUG: Call already running, stopping first...")
+                stopAudioCall()
+                delay(200)
+            }
+            try {
+                if (encryptionKey.size != 32) {
+                    notifyError("Invalid encryption key size")
+                    return@launch
+                }
+
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
+                    initialize(encryptionKey)
+                }
+
+                // Listen mode: don't set remote address yet
+                remoteAddress = null
+                remoteUdpPort = 0
+                isListening.set(true)
+
+                // Create UDP socket bound to local port
+                val bindPort = if (localPort > 0) localPort else 50000
+                udpSocket = try {
+                    DatagramSocket(bindPort).apply {
+                        broadcast = false
+                        reuseAddress = true
+                    }
+                } catch (e: Exception) {
+                    println("ACM_DEBUG: Port $bindPort binding failed: ${e.message}")
+                    notifyError("Cannot bind to port $bindPort: ${e.message}")
+                    return@launch
+                }
+                println("ACM_DEBUG: Listening on port ${udpSocket?.localPort}")
+
+                initializeAudio()
+
+                audioCallState = AudioCallState(
+                    isInCall = true,
+                    isCallActive = true,
+                    remoteUser = "Listening on :$bindPort",
+                    isInitiator = false,
+                    udpPort = udpSocket?.localPort ?: 0,
+                    localNoncePrefix = localNoncePrefix,
+                    remoteNoncePrefix = ByteArray(0)
+                )
+
+                isRunning.set(true)
+                AudioCallService.start(context)
+                acquireWakeLocks()
+
+                startUdpReceiving()
+                startAudioRecording()
+
+                notifyCallStarted("Listening on :$bindPort", false)
+
+            } catch (e: Exception) {
+                println("ACM_DEBUG: Exception in startListenDirect: ${e.message}")
+                notifyError("Failed to start listening: ${e.message}")
+                isListening.set(false)
+                stopAudioCall()
+            }
+        }
+    }
+
     private fun startAudioCall(isInitiator: Boolean, remoteUser: String) {
         if (isRunning.get()) return
 
@@ -483,6 +554,7 @@ class AudioCallManager(
 
         // Reset state
         remotePrefixReady.set(false)
+        isListening.set(false)
         audioCallState = AudioCallState()
 
         println("ACM_DEBUG: stopAudioCall completed")
@@ -528,13 +600,9 @@ class AudioCallManager(
             val recordBufferSize = maxOf(minRecordBufferSize, AUDIO_PCM_BYTES_PER_FRAME * 4)
             println("ACM_DEBUG: Using record buffer size: $recordBufferSize")
 
-            // Use MIC instead of VOICE_COMMUNICATION to avoid echo cancellation issues
-            // VOICE_COMMUNICATION applies aggressive AEC/AGC which can:
-            // 1. Mute microphone when hearing sound from speaker
-            // 2. Capture echo from speaker in multi-party calls
-            // MIC gives raw microphone input without processing
+            // Use VOICE_COMMUNICATION to enable platform AEC (echo cancellation)
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -545,6 +613,19 @@ class AudioCallManager(
                 throw Exception("Failed to initialize AudioRecord - state is ${audioRecord?.state}")
             }
             println("ACM_DEBUG: AudioRecord created successfully")
+
+            // Enable AEC and noise suppression
+            val sessionId = audioRecord!!.audioSessionId
+            if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
+                val aec = android.media.audiofx.AcousticEchoCanceler.create(sessionId)
+                aec?.enabled = true
+                println("ACM_DEBUG: AcousticEchoCanceler enabled")
+            }
+            if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
+                val ns = android.media.audiofx.NoiseSuppressor.create(sessionId)
+                ns?.enabled = true
+                println("ACM_DEBUG: NoiseSuppressor enabled")
+            }
 
             println("ACM_DEBUG: Creating AudioTrack...")
             // AudioTrack for playback
@@ -672,6 +753,18 @@ class AudioCallManager(
                         true -> {
                             // Success, process packet
                             if (packet.length > 0 && isRunning.get()) {
+                                // Listen mode: extract remote address from first incoming packet
+                                if (isListening.get() && remoteAddress == null && packet.address != null) {
+                                    remoteAddress = packet.address
+                                    remoteUdpPort = packet.port
+                                    isListening.set(false)
+                                    println("ACM_DEBUG: Listen mode - peer connected from ${packet.address.hostAddress}:${packet.port}")
+                                    // Send HELLO back to the peer
+                                    sendHelloPacket()
+                                    handler.post {
+                                        listener.onCallStarted("${packet.address.hostAddress}:${packet.port}", false)
+                                    }
+                                }
                                 try {
                                     processAudioPacket(packet.data, packet.length)
                                 } catch (e: Throwable) {

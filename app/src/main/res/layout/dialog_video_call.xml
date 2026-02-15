@@ -49,6 +49,7 @@
             android:layout_marginBottom="12dp" />
 
         <TextView
+            android:id="@+id/videoEncryptionKeyLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="Encryption Key (64 hex chars):"
@@ -59,9 +60,25 @@
             android:id="@+id/videoEncryptionKeyEditText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="32-byte key in hex"
+            android:hint="Auto-filled from room key"
             android:inputType="text"
             android:maxLines="2"
+            android:layout_marginBottom="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Local Port (for Listen mode):"
+            android:textSize="14sp"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/videoLocalPortEditText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="50000"
+            android:text="50000"
+            android:inputType="number"
             android:layout_marginBottom="12dp" />
 
         <TextView

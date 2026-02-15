@@ -25,7 +25,7 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:textStyle="bold"
-                android:textColor="#e94560"
+                android:textColor="@color/fear_accent"
                 android:textSize="13sp" />
 
             <TextView
@@ -33,7 +33,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:textSize="11sp"
-                android:textColor="#666688"
+                android:textColor="@color/fear_text_hint"
                 android:layout_marginStart="8dp" />
         </LinearLayout>
 
@@ -42,7 +42,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textSize="15sp"
-            android:textColor="#e0e0e0"
+            android:textColor="@color/fear_text_message"
             android:layout_marginTop="2dp" />
     </LinearLayout>
 </LinearLayout>
