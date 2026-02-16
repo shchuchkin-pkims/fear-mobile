@@ -35,6 +35,9 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         const val EXTRA_ENCRYPTION_KEY = "encryption_key"
         const val EXTRA_QUALITY = "quality"
         const val EXTRA_IS_LISTENING = "is_listening"
+        const val EXTRA_IS_RELAY = "is_relay"
+        const val EXTRA_RELAY_ROOM = "relay_room"
+        const val EXTRA_RELAY_NAME = "relay_name"
         private const val PERMISSION_CODE = 200
     }
 
@@ -56,6 +59,9 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     private var encryptionKeyHex = ""
     private var qualityPreset = "medium"
     private var isListeningMode = false
+    private var isRelayMode = false
+    private var relayRoom = ""
+    private var relayName = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,8 +74,11 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         encryptionKeyHex = intent.getStringExtra(EXTRA_ENCRYPTION_KEY) ?: ""
         qualityPreset = intent.getStringExtra(EXTRA_QUALITY) ?: "medium"
         isListeningMode = intent.getBooleanExtra(EXTRA_IS_LISTENING, false)
+        isRelayMode = intent.getBooleanExtra(EXTRA_IS_RELAY, false)
+        relayRoom = intent.getStringExtra(EXTRA_RELAY_ROOM) ?: ""
+        relayName = intent.getStringExtra(EXTRA_RELAY_NAME) ?: ""
 
-        Log.d(TAG, "onCreate: remote=$remoteIp:$remotePort keyLen=${encryptionKeyHex.length} quality=$qualityPreset listen=$isListeningMode")
+        Log.d(TAG, "onCreate: remote=$remoteIp:$remotePort keyLen=${encryptionKeyHex.length} quality=$qualityPreset listen=$isListeningMode relay=$isRelayMode")
 
         remoteSurfaceView = findViewById(R.id.remoteSurfaceView)
         localPreview = findViewById(R.id.localPreview)
@@ -111,7 +120,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     }
 
     private fun startVideoCall() {
-        if (!isListeningMode && remoteIp.isEmpty()) {
+        if (!isListeningMode && !isRelayMode && remoteIp.isEmpty()) {
             Log.e(TAG, "Remote IP is empty")
             Toast.makeText(this, "Remote IP is empty", Toast.LENGTH_LONG).show()
             finish()
@@ -149,7 +158,11 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         val identityMgr = IdentityManager(this)
         manager.initialize(keyBytes, preset, if (identityMgr.hasIdentity()) identityMgr else null)
 
-        if (isListeningMode) {
+        if (isRelayMode) {
+            Log.d(TAG, "Starting relay call to $remoteIp:$remotePort room=$relayRoom name=$relayName")
+            statsTextView.text = "Relay via $remoteIp..."
+            manager.startRelay(remoteIp, remotePort, relayRoom, relayName, localPort)
+        } else if (isListeningMode) {
             val listenPort = if (localPort > 0) localPort else 50000
             Log.d(TAG, "Starting listen on port $listenPort quality=$qualityPreset")
             statsTextView.text = "Listening on port $listenPort..."

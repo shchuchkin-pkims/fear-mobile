@@ -230,7 +230,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             dialogView.findViewById<View>(R.id.encryptionKeyLabel).visibility = View.GONE
         }
 
-        AlertDialog.Builder(this)
+        val builder = AlertDialog.Builder(this)
             .setTitle("Audio Call")
             .setView(dialogView)
             .setPositiveButton("Call") { _, _ ->
@@ -262,7 +262,23 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                 startAudioListen(localPort, encryptionKey)
             }
             .setNegativeButton("Cancel", null)
-            .show()
+
+        val dialog = builder.create()
+        dialog.show()
+
+        // Add relay button if connected to a remote server
+        if (fearClient.isConnected() && fearClient.getServerHost().isNotEmpty()) {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).text = "Relay"
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                val encryptionKey = encryptionKeyEditText.text.toString().trim()
+                if (encryptionKey.length != 64) {
+                    Toast.makeText(this, "Key must be 64 hex characters", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                startAudioRelay(encryptionKey)
+                dialog.dismiss()
+            }
+        }
     }
 
     private fun showVideoCallDialog() {
@@ -287,7 +303,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
         val localPortEditText = dialogView.findViewById<EditText>(R.id.videoLocalPortEditText)
 
-        AlertDialog.Builder(this)
+        val builder = AlertDialog.Builder(this)
             .setTitle("Video Call")
             .setView(dialogView)
             .setPositiveButton("Call") { _, _ ->
@@ -344,7 +360,40 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                 startActivity(intent)
             }
             .setNegativeButton("Cancel", null)
-            .show()
+
+        val dialog = builder.create()
+        dialog.show()
+
+        // Add relay button if connected to a remote server
+        if (fearClient.isConnected() && fearClient.getServerHost().isNotEmpty()) {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).text = "Relay"
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                val encryptionKey = encryptionKeyEditText.text.toString().trim()
+                val quality = when (qualitySpinner.selectedItemPosition) {
+                    0 -> "low"
+                    2 -> "high"
+                    else -> "medium"
+                }
+
+                if (encryptionKey.length != 64) {
+                    Toast.makeText(this, "Key must be 64 hex characters", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+
+                val intent = Intent(this, VideoCallActivity::class.java).apply {
+                    putExtra(VideoCallActivity.EXTRA_REMOTE_IP, fearClient.getServerHost())
+                    putExtra(VideoCallActivity.EXTRA_REMOTE_PORT, fearClient.getServerPort())
+                    putExtra(VideoCallActivity.EXTRA_LOCAL_PORT, 0)
+                    putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, encryptionKey)
+                    putExtra(VideoCallActivity.EXTRA_QUALITY, quality)
+                    putExtra(VideoCallActivity.EXTRA_IS_RELAY, true)
+                    putExtra(VideoCallActivity.EXTRA_RELAY_ROOM, fearClient.getCurrentRoom())
+                    putExtra(VideoCallActivity.EXTRA_RELAY_NAME, fearClient.getCurrentName())
+                }
+                startActivity(intent)
+                dialog.dismiss()
+            }
+        }
     }
 
     private fun startAudioCall(serverIp: String, serverPort: Int, localPort: Int, encryptionKey: String) {
@@ -380,6 +429,26 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             updateCallUI(true)
         } catch (e: Exception) {
             Toast.makeText(this, "Error starting listen: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startAudioRelay(encryptionKey: String) {
+        try {
+            if (encryptionKey.length != 64) {
+                throw IllegalArgumentException("Key must be 64 hex characters (32 bytes)")
+            }
+            val keyBytes = ByteArray(32)
+            for (i in 0 until 32) {
+                keyBytes[i] = encryptionKey.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+            fearClient.startAudioRelay(keyBytes)
+            val host = fearClient.getServerHost()
+            val port = fearClient.getServerPort()
+            currentCallTarget = "Relay $host:$port"
+            callStatusTextView.text = "Relay call via $host:$port..."
+            updateCallUI(true)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Error starting relay call: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 

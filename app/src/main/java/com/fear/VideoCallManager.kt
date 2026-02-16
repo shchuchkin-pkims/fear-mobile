@@ -11,6 +11,7 @@ import android.view.Surface
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
@@ -101,6 +102,15 @@ class VideoCallManager(
     private var identityManager: IdentityManager? = null
     private var peerVerified = false
 
+    // Relay mode
+    private var relayMode = false
+    private var relayRoom = ""
+    private var relayName = ""
+
+    // TCP relay
+    private var tcpSocket: Socket? = null
+    private val tcpSendLock = Any()
+
     // Stats
     private var videoPacketsSent = 0L
     private var videoPacketsReceived = 0L
@@ -132,6 +142,197 @@ class VideoCallManager(
     }
 
     fun getLocalUdpPort(): Int = udpSocket?.localPort ?: 0
+
+    /**
+     * Send UDP relay registration packet: [0xFE][2 room_len LE][room][2 name_len LE][name]
+     */
+    private fun sendRelayRegistration() {
+        val roomBytes = relayRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = relayName.toByteArray(Charsets.UTF_8)
+        val pkt = ByteBuffer.allocate(1 + 2 + roomBytes.size + 2 + nameBytes.size).apply {
+            order(ByteOrder.LITTLE_ENDIAN)
+            put(0xFE.toByte())
+            putShort(roomBytes.size.toShort())
+            put(roomBytes)
+            putShort(nameBytes.size.toShort())
+            put(nameBytes)
+        }.array()
+        sendUdp(pkt)
+        Log.d(TAG, "Sent relay registration: room='$relayRoom' name='$relayName'")
+    }
+
+    // --- TCP relay helpers ---
+
+    private fun tcpRecvAll(input: java.io.InputStream, buf: ByteArray, len: Int): Boolean {
+        var received = 0
+        while (received < len) {
+            val n = input.read(buf, received, len - received)
+            if (n <= 0) return false
+            received += n
+        }
+        return true
+    }
+
+    private fun tcpRelayConnect(host: String, port: Int): Boolean {
+        return try {
+            tcpSocket = Socket(host, port)
+            Log.d(TAG, "TCP relay connected to $host:$port")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "TCP relay connect failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tcpRelayRegister(): Boolean {
+        val sock = tcpSocket ?: return false
+        val roomBytes = relayRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = relayName.toByteArray(Charsets.UTF_8)
+        val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val frameSize = 2 + roomBytes.size + 2 + nameBytes.size + 2 + zeroNonce.size + 1 + 4 + 1
+        val frame = ByteArray(frameSize)
+        var off = 0
+        Common.writeUInt16(frame, off, roomBytes.size); off += 2
+        System.arraycopy(roomBytes, 0, frame, off, roomBytes.size); off += roomBytes.size
+        Common.writeUInt16(frame, off, nameBytes.size); off += 2
+        System.arraycopy(nameBytes, 0, frame, off, nameBytes.size); off += nameBytes.size
+        Common.writeUInt16(frame, off, zeroNonce.size); off += 2
+        System.arraycopy(zeroNonce, 0, frame, off, zeroNonce.size); off += zeroNonce.size
+        frame[off++] = Common.MSG_TYPE_MEDIA_RELAY
+        Common.writeUInt32(frame, off, 1L); off += 4
+        frame[off] = 0x20.toByte()
+        Log.d(TAG, "TCP relay register: room='$relayRoom' name='$relayName'")
+        return Common.sendAll(sock, frame)
+    }
+
+    private fun tcpRelaySendMedia(data: ByteArray): Boolean {
+        val sock = tcpSocket ?: return false
+        val roomBytes = relayRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = relayName.toByteArray(Charsets.UTF_8)
+        val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val hdrLen = 2 + roomBytes.size + 2 + nameBytes.size + 2 + zeroNonce.size + 1 + 4
+        val frame = ByteArray(hdrLen + data.size)
+        var off = 0
+        Common.writeUInt16(frame, off, roomBytes.size); off += 2
+        System.arraycopy(roomBytes, 0, frame, off, roomBytes.size); off += roomBytes.size
+        Common.writeUInt16(frame, off, nameBytes.size); off += 2
+        System.arraycopy(nameBytes, 0, frame, off, nameBytes.size); off += nameBytes.size
+        Common.writeUInt16(frame, off, zeroNonce.size); off += 2
+        System.arraycopy(zeroNonce, 0, frame, off, zeroNonce.size); off += zeroNonce.size
+        frame[off++] = Common.MSG_TYPE_MEDIA_RELAY
+        Common.writeUInt32(frame, off, data.size.toLong()); off += 4
+        System.arraycopy(data, 0, frame, off, data.size)
+        synchronized(tcpSendLock) {
+            return Common.sendAll(sock, frame)
+        }
+    }
+
+    private fun tcpRelayRecvMedia(): ByteArray? {
+        val sock = tcpSocket ?: return null
+        val input = sock.getInputStream()
+        val hdr2 = ByteArray(2)
+        val hdr4 = ByteArray(4)
+        val skipBuf = ByteArray(Common.MAX_ROOM)
+        val nonceBuf = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val typeBuf = ByteArray(1)
+
+        while (running.get()) {
+            if (!tcpRecvAll(input, hdr2, 2)) return null
+            val roomLen = Common.readUInt16(hdr2, 0)
+            if (roomLen > Common.MAX_ROOM) return null
+            if (!tcpRecvAll(input, skipBuf, roomLen)) return null
+
+            if (!tcpRecvAll(input, hdr2, 2)) return null
+            val nameLen = Common.readUInt16(hdr2, 0)
+            if (nameLen > Common.MAX_NAME) return null
+            if (!tcpRecvAll(input, skipBuf, nameLen)) return null
+
+            if (!tcpRecvAll(input, hdr2, 2)) return null
+            val nonceLen = Common.readUInt16(hdr2, 0)
+            if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) return null
+            if (!tcpRecvAll(input, nonceBuf, nonceLen)) return null
+
+            if (!tcpRecvAll(input, typeBuf, 1)) return null
+
+            if (!tcpRecvAll(input, hdr4, 4)) return null
+            val clen = Common.readUInt32(hdr4, 0).toInt()
+            if (clen > Common.MAX_FRAME) return null
+
+            if (typeBuf[0] == Common.MSG_TYPE_MEDIA_RELAY) {
+                val payload = ByteArray(clen)
+                if (clen > 0 && !tcpRecvAll(input, payload, clen)) return null
+                return payload
+            }
+
+            // Skip non-media frame payload
+            var remaining = clen
+            while (remaining > 0) {
+                val chunk = minOf(remaining, skipBuf.size)
+                if (!tcpRecvAll(input, skipBuf, chunk)) return null
+                remaining -= chunk
+            }
+        }
+        return null
+    }
+
+    /**
+     * Start relay video call through server (TCP media relay).
+     */
+    fun startRelay(serverIp: String, serverPort: Int, room: String, name: String, localUdpPort: Int = 0) {
+        if (running.get()) return
+
+        relayMode = true
+        relayRoom = room
+        relayName = name
+
+        Log.d(TAG, "startRelay (TCP): server=$serverIp:$serverPort room=$room name=$name")
+
+        // Run on background thread — Socket() is a blocking network call
+        Thread {
+            try {
+                // Connect TCP to server for media relay
+                if (!tcpRelayConnect(serverIp, serverPort)) {
+                    listener.onCallError("TCP relay connect failed")
+                    return@Thread
+                }
+
+                // Register with server
+                if (!tcpRelayRegister()) {
+                    Log.e(TAG, "TCP relay registration failed")
+                    try { tcpSocket?.close() } catch (_: Exception) {}
+                    tcpSocket = null
+                    listener.onCallError("TCP relay registration failed")
+                    return@Thread
+                }
+
+                running.set(true)
+                initializeAudio()
+
+                // Start HELLO handshake
+                helloThread = Thread {
+                    try { helloLoop() } catch (e: Exception) {
+                        Log.e(TAG, "helloLoop crashed", e)
+                        if (running.get()) {
+                            listener.onCallError("Handshake failed: ${e.message}")
+                            endCall()
+                        }
+                    }
+                }.also { it.start() }
+
+                // Start receive loop
+                receiveThread = Thread {
+                    try { receiveLoop() } catch (e: Exception) {
+                        Log.e(TAG, "receiveLoop crashed", e)
+                    }
+                }.also { it.start() }
+
+                listener.onCallStarted()
+            } catch (e: Exception) {
+                Log.e(TAG, "startRelay failed: ${e.message}")
+                listener.onCallError("Relay failed: ${e.message}")
+            }
+        }.start()
+    }
 
     /**
      * Start video call to remote peer (network only — decoder attached later via attachDecoderSurface).
@@ -317,7 +518,7 @@ class VideoCallManager(
             put(encrypted)
         }.array()
 
-        sendUdp(packet)
+        sendPacket(packet)
     }
 
     // --- Audio ---
@@ -465,6 +666,8 @@ class VideoCallManager(
 
         udpSocket?.close()
         udpSocket = null
+        try { tcpSocket?.close() } catch (_: Exception) {}
+        tcpSocket = null
 
         pendingFrames.clear()
         remotePrefixReady.set(false)
@@ -473,6 +676,9 @@ class VideoCallManager(
         audioSeqTx.set(0)
         videoSeqTx.set(0)
         peerVerified = false
+        relayMode = false
+        relayRoom = ""
+        relayName = ""
 
         Log.d(TAG, "Call ended. Sent=$videoPacketsSent Received=$videoPacketsReceived")
         videoPacketsSent = 0
@@ -547,7 +753,7 @@ class VideoCallManager(
             }
         }
 
-        sendUdp(buf.array())
+        sendPacket(buf.array())
     }
 
     private fun sendHelloWithoutIdentity() {
@@ -561,43 +767,57 @@ class VideoCallManager(
             putShort(sendHeight.toShort())
             put(quality.fps.toByte())
         }
-        sendUdp(buf.array())
+        sendPacket(buf.array())
     }
 
     // --- Receive loop ---
 
     private fun receiveLoop() {
         val recvBuf = ByteArray(Common.AUDIO_UDP_RECV_BUFSIZE)
-        Log.d(TAG, "Receive loop started on port ${udpSocket?.localPort}")
+        Log.d(TAG, "Receive loop started" + if (relayMode) " (TCP relay)" else " on port ${udpSocket?.localPort}")
 
         while (running.get()) {
             try {
-                val packet = DatagramPacket(recvBuf, recvBuf.size)
-                udpSocket?.receive(packet) ?: break
+                val data: ByteArray
 
-                val data = recvBuf.copyOfRange(0, packet.length)
+                if (relayMode && tcpSocket != null) {
+                    // TCP relay path
+                    val received = tcpRelayRecvMedia()
+                    if (received == null) {
+                        Log.e(TAG, "[relay] TCP connection lost")
+                        running.set(false)
+                        break
+                    }
+                    data = received
+                } else {
+                    // UDP path
+                    val packet = DatagramPacket(recvBuf, recvBuf.size)
+                    udpSocket?.receive(packet) ?: break
+
+                    data = recvBuf.copyOfRange(0, packet.length)
+
+                    // Listen mode: learn remote address from first packet
+                    if (isListening.get() && remoteAddress == null && packet.address != null) {
+                        remoteAddress = packet.address
+                        remotePort = packet.port
+                        isListening.set(false)
+                        Log.d(TAG, "Listen mode - peer connected from ${packet.address.hostAddress}:${packet.port}")
+
+                        helloThread = Thread {
+                            try { helloLoop() } catch (e: Exception) {
+                                Log.e(TAG, "helloLoop crashed", e)
+                            }
+                        }.also { it.start() }
+                    }
+                }
+
                 if (data.isEmpty()) continue
 
                 val pktType = data[0].toInt() and 0xFF
 
-                // Listen mode: learn remote address from first packet
-                if (isListening.get() && remoteAddress == null && packet.address != null) {
-                    remoteAddress = packet.address
-                    remotePort = packet.port
-                    isListening.set(false)
-                    Log.d(TAG, "Listen mode - peer connected from ${packet.address.hostAddress}:${packet.port}")
-
-                    // Start HELLO handshake now that we know the remote
-                    helloThread = Thread {
-                        try { helloLoop() } catch (e: Exception) {
-                            Log.e(TAG, "helloLoop crashed", e)
-                        }
-                    }.also { it.start() }
-                }
-
                 when (data[0]) {
                     Common.PKT_VER_HELLO -> {
-                        Log.d(TAG, "Received HELLO (${data.size} bytes) from ${packet.address?.hostAddress}:${packet.port}")
+                        Log.d(TAG, "Received HELLO (${data.size} bytes)")
                         handleHello(data)
                     }
                     Common.PKT_VER_AUDIO -> handleAudioPacket(data)
@@ -609,7 +829,7 @@ class VideoCallManager(
                     else -> Log.w(TAG, "Unknown packet type: 0x${"%02x".format(pktType)} (${data.size} bytes)")
                 }
             } catch (e: java.net.SocketTimeoutException) {
-                // Normal timeout, continue
+                // Normal timeout, continue (UDP only)
                 cleanupTimedOutFrames()
             } catch (e: Exception) {
                 if (running.get()) {
@@ -851,7 +1071,7 @@ class VideoCallManager(
                 put(encrypted)
             }.array()
 
-            sendUdp(packet)
+            sendPacket(packet)
             videoPacketsSent++
         }
 
@@ -905,6 +1125,14 @@ class VideoCallManager(
             udpSocket?.send(packet)
         } catch (e: Exception) {
             Log.e(TAG, "sendUdp failed (${data.size} bytes): ${e.message}")
+        }
+    }
+
+    private fun sendPacket(data: ByteArray) {
+        if (relayMode && tcpSocket != null) {
+            tcpRelaySendMedia(data)
+        } else {
+            sendUdp(data)
         }
     }
 

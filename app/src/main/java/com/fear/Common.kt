@@ -87,6 +87,7 @@ object Common {
     // ECDH key exchange message types
     const val MSG_TYPE_KEY_REQUEST: Byte = 15
     const val MSG_TYPE_KEY_RESPONSE: Byte = 16
+    const val MSG_TYPE_MEDIA_RELAY: Byte = 17
 
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32

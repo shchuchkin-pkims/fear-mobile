@@ -45,7 +45,14 @@ class FearClient(
     fun isConnected(): Boolean = isConnected
     private var currentRoom = ""
     private var clientName = ""
+    private var serverHost = ""
+    private var serverPort = 0
     private var roomKey = ByteArray(0)
+
+    fun getServerHost(): String = serverHost
+    fun getServerPort(): Int = serverPort
+    fun getCurrentRoom(): String = currentRoom
+    fun getCurrentName(): String = clientName
 
     fun getRoomKeyHex(): String {
         if (roomKey.isEmpty()) return ""
@@ -90,6 +97,8 @@ class FearClient(
             try {
                 currentRoom = room
                 clientName = name
+                serverHost = host
+                serverPort = port
 
                 when (mode) {
                     ConnectMode.MANUAL_KEY -> {
@@ -223,6 +232,8 @@ class FearClient(
             socket?.close()
             socket = null
             isConnected = false
+            serverHost = ""
+            serverPort = 0
             notifyDisconnected()
         }
     }
@@ -323,6 +334,27 @@ class FearClient(
                 notifyCallStarted("$serverIp:$serverPort", true)
             } catch (e: Exception) {
                 notifyError("Failed to start direct audio call: ${e.message}")
+            }
+        }
+    }
+
+    fun startAudioRelay(encryptionKey: ByteArray) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                if (encryptionKey.size != 32) {
+                    notifyError("Invalid encryption key size: ${encryptionKey.size}, expected 32 bytes")
+                    return@launch
+                }
+                if (serverHost.isEmpty() || serverPort == 0) {
+                    notifyError("Not connected to a server")
+                    return@launch
+                }
+                val manager = getOrCreateAudioCallManager()
+                manager.initialize(encryptionKey)
+                manager.startRelay(serverHost, serverPort, currentRoom, clientName, 0, encryptionKey)
+                notifyCallStarted("Relay $serverHost:$serverPort", true)
+            } catch (e: Exception) {
+                notifyError("Failed to start relay audio call: ${e.message}")
             }
         }
     }

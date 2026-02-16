@@ -16,6 +16,9 @@ import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -79,6 +82,15 @@ class AudioCallManager(
     // Wake locks to keep call alive when screen is off
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+
+    // Relay mode
+    private var relayMode = false
+    private var relayRoom = ""
+    private var relayName = ""
+
+    // TCP relay
+    private var tcpSocket: Socket? = null
+    private val tcpSendLock = Any()
 
     // Opus codec
     private var opusEncoder: OpusCodec.Encoder? = null
@@ -392,6 +404,229 @@ class AudioCallManager(
         }
     }
 
+    /**
+     * Send UDP relay registration packet: [0xFE][2 room_len LE][room][2 name_len LE][name]
+     */
+    private fun sendRelayRegistration() {
+        val roomBytes = relayRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = relayName.toByteArray(Charsets.UTF_8)
+        val pkt = ByteBuffer.allocate(1 + 2 + roomBytes.size + 2 + nameBytes.size).apply {
+            order(ByteOrder.LITTLE_ENDIAN)
+            put(0xFE.toByte())
+            putShort(roomBytes.size.toShort())
+            put(roomBytes)
+            putShort(nameBytes.size.toShort())
+            put(nameBytes)
+        }.array()
+        sendUdpPacket(pkt)
+        println("ACM_DEBUG: Sent relay registration: room='$relayRoom' name='$relayName'")
+    }
+
+    // --- TCP relay helpers ---
+
+    private fun tcpRecvAll(input: java.io.InputStream, buf: ByteArray, len: Int): Boolean {
+        var received = 0
+        while (received < len) {
+            val n = input.read(buf, received, len - received)
+            if (n <= 0) return false
+            received += n
+        }
+        return true
+    }
+
+    private fun tcpRelayConnect(host: String, port: Int): Boolean {
+        return try {
+            tcpSocket = Socket(host, port)
+            println("ACM_DEBUG: TCP relay connected to $host:$port")
+            true
+        } catch (e: Exception) {
+            println("ACM_DEBUG: TCP relay connect failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tcpRelayRegister(): Boolean {
+        val sock = tcpSocket ?: return false
+        val roomBytes = relayRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = relayName.toByteArray(Charsets.UTF_8)
+        val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val frameSize = 2 + roomBytes.size + 2 + nameBytes.size + 2 + zeroNonce.size + 1 + 4 + 1
+        val frame = ByteArray(frameSize)
+        var off = 0
+        Common.writeUInt16(frame, off, roomBytes.size); off += 2
+        System.arraycopy(roomBytes, 0, frame, off, roomBytes.size); off += roomBytes.size
+        Common.writeUInt16(frame, off, nameBytes.size); off += 2
+        System.arraycopy(nameBytes, 0, frame, off, nameBytes.size); off += nameBytes.size
+        Common.writeUInt16(frame, off, zeroNonce.size); off += 2
+        System.arraycopy(zeroNonce, 0, frame, off, zeroNonce.size); off += zeroNonce.size
+        frame[off++] = Common.MSG_TYPE_MEDIA_RELAY
+        Common.writeUInt32(frame, off, 1L); off += 4
+        frame[off] = 0x20.toByte()
+        println("ACM_DEBUG: TCP relay register: room='$relayRoom' name='$relayName'")
+        return Common.sendAll(sock, frame)
+    }
+
+    private fun tcpRelaySendMedia(data: ByteArray): Boolean {
+        val sock = tcpSocket ?: return false
+        val roomBytes = relayRoom.toByteArray(Charsets.UTF_8)
+        val nameBytes = relayName.toByteArray(Charsets.UTF_8)
+        val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val hdrLen = 2 + roomBytes.size + 2 + nameBytes.size + 2 + zeroNonce.size + 1 + 4
+        val frame = ByteArray(hdrLen + data.size)
+        var off = 0
+        Common.writeUInt16(frame, off, roomBytes.size); off += 2
+        System.arraycopy(roomBytes, 0, frame, off, roomBytes.size); off += roomBytes.size
+        Common.writeUInt16(frame, off, nameBytes.size); off += 2
+        System.arraycopy(nameBytes, 0, frame, off, nameBytes.size); off += nameBytes.size
+        Common.writeUInt16(frame, off, zeroNonce.size); off += 2
+        System.arraycopy(zeroNonce, 0, frame, off, zeroNonce.size); off += zeroNonce.size
+        frame[off++] = Common.MSG_TYPE_MEDIA_RELAY
+        Common.writeUInt32(frame, off, data.size.toLong()); off += 4
+        System.arraycopy(data, 0, frame, off, data.size)
+        synchronized(tcpSendLock) {
+            return Common.sendAll(sock, frame)
+        }
+    }
+
+    private fun tcpRelayRecvMedia(): ByteArray? {
+        val sock = tcpSocket ?: return null
+        val input = sock.getInputStream()
+        val hdr2 = ByteArray(2)
+        val hdr4 = ByteArray(4)
+        val skipBuf = ByteArray(Common.MAX_ROOM)
+        val nonceBuf = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        val typeBuf = ByteArray(1)
+
+        while (isRunning.get()) {
+            if (!tcpRecvAll(input, hdr2, 2)) return null
+            val roomLen = Common.readUInt16(hdr2, 0)
+            if (roomLen > Common.MAX_ROOM) return null
+            if (!tcpRecvAll(input, skipBuf, roomLen)) return null
+
+            if (!tcpRecvAll(input, hdr2, 2)) return null
+            val nameLen = Common.readUInt16(hdr2, 0)
+            if (nameLen > Common.MAX_NAME) return null
+            if (!tcpRecvAll(input, skipBuf, nameLen)) return null
+
+            if (!tcpRecvAll(input, hdr2, 2)) return null
+            val nonceLen = Common.readUInt16(hdr2, 0)
+            if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) return null
+            if (!tcpRecvAll(input, nonceBuf, nonceLen)) return null
+
+            if (!tcpRecvAll(input, typeBuf, 1)) return null
+
+            if (!tcpRecvAll(input, hdr4, 4)) return null
+            val clen = Common.readUInt32(hdr4, 0).toInt()
+            if (clen > Common.MAX_FRAME) return null
+
+            if (typeBuf[0] == Common.MSG_TYPE_MEDIA_RELAY) {
+                val payload = ByteArray(clen)
+                if (clen > 0 && !tcpRecvAll(input, payload, clen)) return null
+                return payload
+            }
+
+            // Skip non-media frame payload
+            var remaining = clen
+            while (remaining > 0) {
+                val chunk = minOf(remaining, skipBuf.size)
+                if (!tcpRecvAll(input, skipBuf, chunk)) return null
+                remaining -= chunk
+            }
+        }
+        return null
+    }
+
+    private fun sendPacket(data: ByteArray) {
+        if (relayMode && tcpSocket != null) {
+            tcpRelaySendMedia(data)
+        } else {
+            sendUdpPacket(data)
+        }
+    }
+
+    /**
+     * Start relay audio call through server (TCP media relay).
+     */
+    fun startRelay(serverIp: String, serverPort: Int, room: String, name: String,
+                   localPort: Int, encryptionKey: ByteArray) {
+        println("ACM_DEBUG: startRelay (TCP) called: server=$serverIp:$serverPort room=$room name=$name")
+
+        CoroutineScope(Dispatchers.IO).launch {
+            if (isRunning.get()) {
+                stopAudioCall()
+                delay(200)
+            }
+            try {
+                if (encryptionKey.size != 32) {
+                    notifyError("Invalid encryption key size")
+                    return@launch
+                }
+
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
+                    initialize(encryptionKey)
+                }
+
+                relayMode = true
+                relayRoom = room
+                relayName = name
+
+                // Connect TCP to server for media relay
+                if (!tcpRelayConnect(serverIp, serverPort)) {
+                    notifyError("TCP relay connect failed")
+                    relayMode = false
+                    return@launch
+                }
+
+                // Register with server
+                if (!tcpRelayRegister()) {
+                    println("ACM_DEBUG: TCP relay registration failed")
+                    try { tcpSocket?.close() } catch (_: Exception) {}
+                    tcpSocket = null
+                    notifyError("TCP relay registration failed")
+                    relayMode = false
+                    return@launch
+                }
+
+                initializeAudio()
+
+                audioCallState = AudioCallState(
+                    isInCall = true, isCallActive = true,
+                    remoteUser = "Relay $serverIp:$serverPort",
+                    isInitiator = true,
+                    udpPort = 0,
+                    localNoncePrefix = localNoncePrefix,
+                    remoteNoncePrefix = ByteArray(0)
+                )
+
+                isRunning.set(true)
+                AudioCallService.start(context)
+                acquireWakeLocks()
+
+                startUdpReceiving()
+                startAudioRecording()
+                sendHelloPacket()
+
+                // Periodic HELLO until handshake
+                CoroutineScope(Dispatchers.IO).launch {
+                    var attempts = 0
+                    while (!remotePrefixReady.get() && isRunning.get() && attempts < 100) {
+                        sendHelloPacket()
+                        delay(50)
+                        attempts++
+                    }
+                }
+
+                notifyCallStarted("Relay $serverIp:$serverPort", true)
+
+            } catch (e: Exception) {
+                println("ACM_DEBUG: Exception in startRelay: ${e.message}")
+                notifyError("Failed to start relay call: ${e.message}")
+                relayMode = false
+                stopAudioCall()
+            }
+        }
+    }
+
     private fun startAudioCall(isInitiator: Boolean, remoteUser: String) {
         if (isRunning.get()) return
 
@@ -515,7 +750,7 @@ class AudioCallManager(
             audioTrack = null
         }
 
-        println("ACM_DEBUG: Closing UDP socket...")
+        println("ACM_DEBUG: Closing sockets...")
         // Close UDP socket
         try {
             synchronized(socketLock) {
@@ -524,6 +759,13 @@ class AudioCallManager(
             }
         } catch (e: Exception) {
             println("ACM_DEBUG: Error closing UDP socket: ${e.message}")
+        }
+        // Close TCP relay socket
+        try {
+            tcpSocket?.close()
+            tcpSocket = null
+        } catch (e: Exception) {
+            println("ACM_DEBUG: Error closing TCP socket: ${e.message}")
         }
 
         println("ACM_DEBUG: Cleaning up Opus codecs...")
@@ -555,6 +797,9 @@ class AudioCallManager(
         // Reset state
         remotePrefixReady.set(false)
         isListening.set(false)
+        relayMode = false
+        relayRoom = ""
+        relayName = ""
         audioCallState = AudioCallState()
 
         println("ACM_DEBUG: stopAudioCall completed")
@@ -703,16 +948,31 @@ class AudioCallManager(
 
     private fun startUdpReceiving() {
         udpReceiveJob = CoroutineScope(Dispatchers.IO).launch {
-            println("ACM_DEBUG: startUdpReceiving - entering loop")
+            println("ACM_DEBUG: startUdpReceiving - entering loop" + if (relayMode) " (TCP relay)" else "")
 
             while (isRunning.get()) {
                 try {
-                    // Create a FRESH buffer for each receive to avoid memory corruption
-                    // This prevents native crashes from invalid buffer references
+                    // TCP relay path
+                    if (relayMode && tcpSocket != null) {
+                        val received = tcpRelayRecvMedia()
+                        if (received == null) {
+                            println("ACM_DEBUG: [relay] TCP connection lost")
+                            break
+                        }
+                        if (received.isNotEmpty() && isRunning.get()) {
+                            try {
+                                processAudioPacket(received, received.size)
+                            } catch (e: Throwable) {
+                                // Silently ignore packet processing errors
+                            }
+                        }
+                        continue
+                    }
+
+                    // UDP path
                     val receiveBuffer = ByteArray(AUDIO_UDP_RECV_BUFSIZE)
                     val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
 
-                    // Thread-safe socket access with synchronized block
                     val receiveSuccessful = synchronized(socketLock) {
                         val socket = udpSocket
                         if (socket == null || socket.isClosed) {
@@ -720,46 +980,38 @@ class AudioCallManager(
                             return@synchronized false
                         }
 
-                        // Set timeout inside synchronized block
                         try {
-                            socket.soTimeout = 1000 // 1 second timeout
+                            socket.soTimeout = 1000
                         } catch (e: Exception) {
                             println("ACM_DEBUG: Failed to set socket timeout: ${e.message}")
                             return@synchronized false
                         }
 
-                        // Receive data inside synchronized block to prevent socket closure during receive
                         try {
                             socket.receive(packet)
                             true
                         } catch (e: java.net.SocketTimeoutException) {
-                            // Timeout is normal, continue loop
                             null
                         } catch (e: java.net.SocketException) {
-                            // Socket was closed, exit loop
                             println("ACM_DEBUG: Socket exception during receive: ${e.message}")
                             false
                         } catch (e: Exception) {
-                            // Other exception, exit loop
                             println("ACM_DEBUG: Unexpected exception during receive: ${e.message}")
                             false
                         }
                     }
 
-                    // Check result from synchronized block
                     when (receiveSuccessful) {
-                        null -> continue // Timeout, try again
-                        false -> break // Error or socket closed, exit loop
+                        null -> continue
+                        false -> break
                         true -> {
-                            // Success, process packet
                             if (packet.length > 0 && isRunning.get()) {
                                 // Listen mode: extract remote address from first incoming packet
-                                if (isListening.get() && remoteAddress == null && packet.address != null) {
+                                if (isListening.get() && remoteAddress == null && packet.address != null && !relayMode) {
                                     remoteAddress = packet.address
                                     remoteUdpPort = packet.port
                                     isListening.set(false)
                                     println("ACM_DEBUG: Listen mode - peer connected from ${packet.address.hostAddress}:${packet.port}")
-                                    // Send HELLO back to the peer
                                     sendHelloPacket()
                                     handler.post {
                                         listener.onCallStarted("${packet.address.hostAddress}:${packet.port}", false)
@@ -776,7 +1028,7 @@ class AudioCallManager(
 
                 } catch (e: Throwable) {
                     if (isRunning.get()) {
-                        println("ACM_DEBUG: UDP receive outer exception: ${e.message}")
+                        println("ACM_DEBUG: receive outer exception: ${e.message}")
                         break
                     }
                 }
@@ -965,8 +1217,8 @@ class AudioCallManager(
                 println("ACM_DEBUG: Encrypted ${encryptedPacket.size} bytes, seq=$seq")
             }
 
-            // Send over UDP
-            sendUdpPacket(encryptedPacket)
+            // Send media packet
+            sendPacket(encryptedPacket)
 
             if (audioFrameCount % 100 == 0) {
                 println("ACM_DEBUG: Sent audio packet, seq=$seq")
@@ -1235,8 +1487,8 @@ class AudioCallManager(
         val packet = ByteArray(1 + AUDIO_NONCE_PREFIX_LEN)
         packet[0] = PKT_VER_HELLO
         System.arraycopy(localNoncePrefix, 0, packet, 1, AUDIO_NONCE_PREFIX_LEN)
-        
-        sendUdpPacket(packet)
+
+        sendPacket(packet)
     }
 
     private fun sendUdpPacket(packet: ByteArray) {
