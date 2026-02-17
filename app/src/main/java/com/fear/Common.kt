@@ -12,7 +12,7 @@ object Common {
     const val FILE_CHUNK_SIZE: Long = 8192L
     const val DEFAULT_PORT = 8888
 
-    // Message types matching C version (v0.4.1)
+    // Message types matching C version (v0.4.2)
     const val MSG_TYPE_TEXT: Byte = 0
     const val MSG_TYPE_FILE_START: Byte = 1
     const val MSG_TYPE_FILE_CHUNK: Byte = 2
