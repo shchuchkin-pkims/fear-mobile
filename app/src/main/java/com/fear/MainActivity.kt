@@ -560,6 +560,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
     private fun setupRecyclerView() {
         messagesAdapter = MessagesAdapter(messages)
+        messagesAdapter.localName = sharedClient?.getCurrentName() ?: ""
         messagesRecyclerView.layoutManager = LinearLayoutManager(this)
         messagesRecyclerView.adapter = messagesAdapter
     }
@@ -584,6 +585,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             FearClient.ConnectMode.MANUAL_KEY
         }
 
+        messagesAdapter.localName = name
         fearClient.connect(host, port, room, name, key, mode)
         statusTextView.text = if (mode == FearClient.ConnectMode.JOIN_ROOM) {
             "Joining room (key exchange)..."
@@ -606,6 +608,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
         saveRecentHost(host)
 
+        messagesAdapter.localName = name
         fearClient.connect(host, port, room, name, "", FearClient.ConnectMode.CREATE_ROOM)
         statusTextView.text = "Creating room..."
         connectButton.isEnabled = false
@@ -640,6 +643,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             FearClient.ConnectMode.MANUAL_KEY
         }
 
+        messagesAdapter.localName = name
         hostRoomButton.isEnabled = false
         connectButton.isEnabled = false
 
@@ -814,10 +818,13 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
     }
 }
 
-class MessagesAdapter(private val messages: List<Message>) :
-    RecyclerView.Adapter<MessagesAdapter.MessageViewHolder>() {
+class MessagesAdapter(
+    private val messages: List<Message>,
+    var localName: String = ""
+) : RecyclerView.Adapter<MessagesAdapter.MessageViewHolder>() {
 
     class MessageViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        val messageBubble: View = itemView.findViewById(R.id.messageBubble)
         val senderTextView: TextView = itemView.findViewById(R.id.senderTextView)
         val contentTextView: TextView = itemView.findViewById(R.id.contentTextView)
         val timeTextView: TextView = itemView.findViewById(R.id.timeTextView)
@@ -837,6 +844,23 @@ class MessagesAdapter(private val messages: List<Message>) :
         holder.contentTextView.text = message.content
         holder.timeTextView.text = dateFormat.format(Date(message.timestamp))
 
+        val isSelf = localName.isNotEmpty() && message.sender == localName
+        val lp = holder.messageBubble.layoutParams as android.widget.FrameLayout.LayoutParams
+
+        if (isSelf) {
+            lp.gravity = android.view.Gravity.END
+            lp.marginStart = dpToPx(holder.itemView.context, 48)
+            lp.marginEnd = dpToPx(holder.itemView.context, 4)
+            holder.messageBubble.setBackgroundResource(R.drawable.message_bubble_self)
+        } else {
+            lp.gravity = android.view.Gravity.START
+            lp.marginStart = dpToPx(holder.itemView.context, 4)
+            lp.marginEnd = dpToPx(holder.itemView.context, 48)
+            holder.messageBubble.setBackgroundResource(R.drawable.message_bubble)
+        }
+        holder.messageBubble.layoutParams = lp
+        holder.messageBubble.requestLayout()
+
         holder.itemView.setOnLongClickListener {
             val clipboard = it.context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("message", message.content))
@@ -846,4 +870,8 @@ class MessagesAdapter(private val messages: List<Message>) :
     }
 
     override fun getItemCount(): Int = messages.size
+
+    private fun dpToPx(context: android.content.Context, dp: Int): Int {
+        return (dp * context.resources.displayMetrics.density).toInt()
+    }
 }

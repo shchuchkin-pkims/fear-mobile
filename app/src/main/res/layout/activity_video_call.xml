@@ -62,7 +62,8 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="End Call"
-            android:backgroundTint="#E74C3C" />
+            android:backgroundTint="#E74C3C"
+            android:textColor="#FFFFFF" />
 
     </LinearLayout>
 </FrameLayout>

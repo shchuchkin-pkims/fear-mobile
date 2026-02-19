@@ -20,6 +20,8 @@
     <!-- Message bubble -->
     <color name="fear_bubble_bg">#1a1a2e</color>
     <color name="fear_bubble_stroke">#2a2a4e</color>
+    <color name="fear_bubble_self_bg">#16213e</color>
+    <color name="fear_bubble_self_stroke">#2a3a5e</color>
 
     <!-- Status bar -->
     <color name="fear_status_bar">#16213e</color>
