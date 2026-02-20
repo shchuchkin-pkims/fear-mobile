@@ -18,6 +18,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.*
@@ -179,6 +181,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             popup.menu.add("Trusted Keys")
             val themeLabel = if (ThemeManager.isDark(this)) "Light Theme" else "Dark Theme"
             popup.menu.add(themeLabel)
+            popup.menu.add("Check for Updates")
             popup.setOnMenuItemClickListener { item ->
                 when (item.title) {
                     "Trusted Keys" -> {
@@ -191,6 +194,10 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     }
                     "Dark Theme" -> {
                         ThemeManager.setTheme(this, ThemeManager.THEME_DARK)
+                        true
+                    }
+                    "Check for Updates" -> {
+                        checkForUpdates()
                         true
                     }
                     else -> false
@@ -709,6 +716,68 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         val dir = java.io.File(filesDir, ".fear")
         if (!dir.exists()) dir.mkdirs()
         java.io.File(dir, "recent_hosts").writeText(recentHosts.joinToString("\n"))
+    }
+
+    private fun checkForUpdates() {
+        Toast.makeText(this, "Checking for updates...", Toast.LENGTH_SHORT).show()
+        val updater = AppUpdater(applicationContext)
+        lifecycleScope.launch {
+            try {
+                val info = updater.checkForUpdate()
+                if (info.hasUpdate && info.downloadUrl.isNotEmpty()) {
+                    showUpdateDialog(info, updater)
+                } else {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "You're up to date (v${BuildConfig.VERSION_NAME})",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Update check failed: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun showUpdateDialog(info: AppUpdater.UpdateInfo, updater: AppUpdater) {
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Update Available")
+            .setMessage("New version ${info.latestVersion} is available.\nCurrent: ${BuildConfig.VERSION_NAME}")
+            .setPositiveButton("Update", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+
+        dialog.show()
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).isEnabled = false
+            dialog.setCancelable(false)
+            dialog.setMessage("Downloading... 0%")
+
+            lifecycleScope.launch {
+                try {
+                    val apkFile = updater.downloadApk(info.downloadUrl) { progress ->
+                        runOnUiThread {
+                            dialog.setMessage("Downloading... $progress%")
+                        }
+                    }
+                    dialog.dismiss()
+                    updater.installApk(apkFile)
+                } catch (e: Exception) {
+                    dialog.dismiss()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Download failed: ${e.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
     }
 
     private fun getLocalIpAddress(): String? {
