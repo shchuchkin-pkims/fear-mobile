@@ -7,13 +7,33 @@
     android:background="@color/fear_bg_primary">
 
     <!-- Connection Layout -->
-    <LinearLayout
+    <FrameLayout
         android:id="@+id/connectionLayout"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:orientation="vertical"
-        android:gravity="center"
-        android:padding="24dp">
+        android:layout_height="match_parent">
+
+        <Button
+            android:id="@+id/connectionMenuButton"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_gravity="top|start"
+            android:layout_marginTop="12dp"
+            android:layout_marginStart="12dp"
+            android:text="☰"
+            android:textSize="20sp"
+            android:textColor="@color/fear_text_primary"
+            android:backgroundTint="@color/fear_btn_menu"
+            android:minWidth="0dp"
+            android:padding="0dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="24dp">
 
         <ImageView
             android:layout_width="96dp"
@@ -190,7 +210,8 @@
             android:layout_marginTop="8dp"
             android:visibility="gone" />
 
-    </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
 
     <!-- Chat Layout -->
     <LinearLayout

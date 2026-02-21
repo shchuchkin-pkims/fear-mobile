@@ -122,9 +122,9 @@ fear-mobile/
 1. Проверьте что все файлы на месте: https://github.com/shchuchkin-pkims/fear-mobile
 2. Создайте Release:
    - Перейдите в Releases → Create a new release
-   - Tag version: `v0.3.1`
-   - Release title: `F.E.A.R. Messenger v0.3.1`
-   - Прикрепите `F.E.A.R.Messenger-v0.3.1-release.apk` из папки `release/`
+   - Tag version: `v0.4.2`
+   - Release title: `F.E.A.R. v0.4.2`
+   - Прикрепите release APK файл
 3. Обновите README.md если нужно (добавьте скриншоты, ссылки)
 
 ## Коммит который будет отправлен
@@ -134,14 +134,16 @@ commit db4cc36
 Author: Your Name <your@email.com>
 Date:   [current date]
 
-    Initial commit: F.E.A.R. Messenger v0.3.1 for Android
+    F.E.A.R. Messenger v0.4.2 for Android
 
     Features:
-    - Encrypted audio calls using Opus codec
-    - AES-GCM encryption
-    - Text messaging and file transfer
-    - Foreground service for background calls
-    - Cross-platform compatibility
+    - E2E encrypted messaging (AES-256-GCM)
+    - ECDH key exchange (X25519 + crypto_box)
+    - Ed25519 identity verification (TOFU)
+    - Encrypted audio and video calls (TCP media relay)
+    - File transfer with CRC32 verification
+    - In-app updates from GitHub releases
+    - Light/dark theme, push notifications
 
     [... полное описание в коммите ...]
 ```

@@ -37,6 +37,7 @@ class FearClient(
     private var receiveJob: Job? = null
     @Volatile private var isConnected = false
     @Volatile var isInForeground = true
+    @Volatile var lastContacts: List<String> = emptyList()
 
     fun setListener(newListener: FearClientListener) {
         listener = newListener
@@ -95,6 +96,12 @@ class FearClient(
                 keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                // Close any previous connection before starting a new one
+                receiveJob?.cancel()
+                try { socket?.close() } catch (_: Exception) {}
+                socket = null
+                isConnected = false
+
                 currentRoom = room
                 clientName = name
                 serverHost = host
@@ -1081,6 +1088,7 @@ class FearClient(
             contacts.add(name)
         }
 
+        lastContacts = contacts
         handler.post { listener.onContactsUpdated(contacts) }
     }
 

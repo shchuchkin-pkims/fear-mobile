@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import android.widget.FrameLayout
 import androidx.appcompat.widget.PopupMenu
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -27,7 +28,7 @@ import java.util.*
 
 class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
-    private lateinit var connectionLayout: LinearLayout
+    private lateinit var connectionLayout: FrameLayout
     private lateinit var chatLayout: LinearLayout
     private lateinit var hostEditText: AutoCompleteTextView
     private lateinit var portEditText: EditText
@@ -101,6 +102,12 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                 statusTextView.text = "Connected"
                 connectButton.isEnabled = false
                 disconnectButton.isEnabled = true
+                // Restore online users list after activity recreation (e.g. theme change)
+                val contacts = fearClient.lastContacts
+                if (contacts.isNotEmpty()) {
+                    onlineUsersTextView.visibility = View.VISIBLE
+                    onlineUsersTextView.text = "Online: ${contacts.joinToString(", ")}"
+                }
             }
         } else {
             fearClient = FearClient(applicationContext, this)
@@ -176,35 +183,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         videoCallButton.setOnClickListener { showVideoCallDialog() }
         endCallButton.setOnClickListener { endCurrentCall() }
 
-        findViewById<Button>(R.id.menuButton).setOnClickListener { view ->
-            val popup = PopupMenu(this, view)
-            popup.menu.add("Trusted Keys")
-            val themeLabel = if (ThemeManager.isDark(this)) "Light Theme" else "Dark Theme"
-            popup.menu.add(themeLabel)
-            popup.menu.add("Check for Updates")
-            popup.setOnMenuItemClickListener { item ->
-                when (item.title) {
-                    "Trusted Keys" -> {
-                        startActivity(Intent(this, TrustedKeysActivity::class.java))
-                        true
-                    }
-                    "Light Theme" -> {
-                        ThemeManager.setTheme(this, ThemeManager.THEME_LIGHT)
-                        true
-                    }
-                    "Dark Theme" -> {
-                        ThemeManager.setTheme(this, ThemeManager.THEME_DARK)
-                        true
-                    }
-                    "Check for Updates" -> {
-                        checkForUpdates()
-                        true
-                    }
-                    else -> false
-                }
-            }
-            popup.show()
-        }
+        findViewById<Button>(R.id.menuButton).setOnClickListener { showPopupMenu(it) }
 
         updateCallUI(false)
     }
@@ -554,6 +533,8 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         nameEditText.setText("Android-user")
         keyEditText.setText("")
 
+        findViewById<Button>(R.id.connectionMenuButton).setOnClickListener { showPopupMenu(it) }
+
         connectButton.setOnClickListener { connect() }
         disconnectButton.setOnClickListener { disconnect() }
         sendButton.setOnClickListener { sendMessage() }
@@ -716,6 +697,36 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         val dir = java.io.File(filesDir, ".fear")
         if (!dir.exists()) dir.mkdirs()
         java.io.File(dir, "recent_hosts").writeText(recentHosts.joinToString("\n"))
+    }
+
+    private fun showPopupMenu(anchor: View) {
+        val popup = PopupMenu(this, anchor)
+        popup.menu.add("Trusted Keys")
+        val themeLabel = if (ThemeManager.isDark(this)) "Light Theme" else "Dark Theme"
+        popup.menu.add(themeLabel)
+        popup.menu.add("Check for Updates")
+        popup.setOnMenuItemClickListener { item ->
+            when (item.title) {
+                "Trusted Keys" -> {
+                    startActivity(Intent(this, TrustedKeysActivity::class.java))
+                    true
+                }
+                "Light Theme" -> {
+                    ThemeManager.setTheme(this, ThemeManager.THEME_LIGHT)
+                    true
+                }
+                "Dark Theme" -> {
+                    ThemeManager.setTheme(this, ThemeManager.THEME_DARK)
+                    true
+                }
+                "Check for Updates" -> {
+                    checkForUpdates()
+                    true
+                }
+                else -> false
+            }
+        }
+        popup.show()
     }
 
     private fun checkForUpdates() {
