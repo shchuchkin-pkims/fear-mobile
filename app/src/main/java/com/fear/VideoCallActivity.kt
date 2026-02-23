@@ -52,6 +52,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     private var isFrontCamera = true
     private var isMuted = false
     private var encoderAvailable = false
+    @Volatile private var callEnded = false
 
     private var remoteIp = ""
     private var remotePort = 0
@@ -253,7 +254,10 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
 
 
     private fun endCall() {
+        if (callEnded) return
+        callEnded = true
         videoCallManager?.endCall()
+        videoCallManager = null
         finish()
     }
 
@@ -280,14 +284,24 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     }
 
     override fun onCallEnded() {
-        runOnUiThread { finish() }
+        runOnUiThread {
+            if (!callEnded) {
+                callEnded = true
+                videoCallManager = null
+                finish()
+            }
+        }
     }
 
     override fun onCallError(error: String) {
         runOnUiThread {
             Log.e(TAG, "Call error: $error")
             Toast.makeText(this, error, Toast.LENGTH_LONG).show()
-            finish()
+            if (!callEnded) {
+                callEnded = true
+                videoCallManager = null
+                finish()
+            }
         }
     }
 
@@ -342,11 +356,22 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
             val lossPercent = if (packetsReceived > 0)
                 (packetsLost * 100) / (packetsReceived + packetsLost) else 0
             statsTextView.text = "RTT: ${rttMs}ms | Loss: $lossPercent%"
+            // Color: green < 100ms, yellow 100-300ms, red > 300ms
+            val color = when {
+                rttMs < 100 -> 0xFF00DD00.toInt()   // green
+                rttMs < 300 -> 0xFFFFC800.toInt()   // yellow
+                else -> 0xFFFF2828.toInt()           // red
+            }
+            statsTextView.setTextColor(color)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        videoCallManager?.endCall()
+        if (!callEnded) {
+            callEnded = true
+            videoCallManager?.endCall()
+            videoCallManager = null
+        }
     }
 }

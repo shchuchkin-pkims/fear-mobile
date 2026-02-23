@@ -23,5 +23,6 @@ object AudioConstants {
     
     // Packet types (compatible with PC version)
     const val PKT_VER_AUDIO: Byte = 0x01  // Audio packet version
+    const val PKT_VER_STATS: Byte = 0x04  // Stats/RTT measurement packet
     const val PKT_VER_HELLO: Byte = 0x7F  // HELLO handshake packet
 }

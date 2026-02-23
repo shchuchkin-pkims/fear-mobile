@@ -31,7 +31,9 @@ import com.fear.AudioConstants.AUDIO_NONCE_PREFIX_LEN
 import com.fear.AudioConstants.AUDIO_AEAD_NONCE_LEN
 import com.fear.AudioConstants.AUDIO_AEAD_ABYTES
 import com.fear.AudioConstants.PKT_VER_AUDIO
+import com.fear.AudioConstants.PKT_VER_STATS
 import com.fear.AudioConstants.PKT_VER_HELLO
+import android.os.SystemClock
 import com.fear.AudioConstants.AUDIO_SAMPLE_RATE
 import com.fear.AudioConstants.AUDIO_CHANNELS
 import com.fear.AudioConstants.AC_OPUS_BITRATE
@@ -49,6 +51,7 @@ class AudioCallManager(
         fun onCallError(error: String)
         fun onCallStarted(remoteUser: String, isInitiator: Boolean)
         fun onCallEnded()
+        fun onStatsUpdated(rttMs: Int) {}
     }
 
     private var audioCallState = AudioCallState()
@@ -95,6 +98,12 @@ class AudioCallManager(
     // Opus codec
     private var opusEncoder: OpusCodec.Encoder? = null
     private var opusDecoder: OpusCodec.Decoder? = null
+
+    // RTT measurement (ping/pong via stats packets)
+    @Volatile private var lastPeerPingTs = 0
+    @Volatile private var peerPingRecvTime = 0L
+    @Volatile private var measuredRttMs = 0
+    private var lastStatsSendTime = 0L
 
     fun initialize(roomKey: ByteArray) {
         this.roomKey = roomKey
@@ -436,7 +445,9 @@ class AudioCallManager(
 
     private fun tcpRelayConnect(host: String, port: Int): Boolean {
         return try {
-            tcpSocket = Socket(host, port)
+            tcpSocket = Socket(host, port).apply {
+                tcpNoDelay = true  // Disable Nagle's algorithm for low-latency media
+            }
             println("ACM_DEBUG: TCP relay connected to $host:$port")
             true
         } catch (e: Exception) {
@@ -681,13 +692,19 @@ class AudioCallManager(
     private fun stopAudioCall() {
         println("ACM_DEBUG: stopAudioCall called, isRunning=${isRunning.get()}")
 
-        if (!isRunning.get()) {
+        if (!isRunning.compareAndSet(true, false)) {
             println("ACM_DEBUG: Already stopped, returning")
             return
         }
 
-        println("ACM_DEBUG: Setting isRunning to false")
-        isRunning.set(false)
+        println("ACM_DEBUG: Closing sockets to unblock I/O...")
+        // Close sockets first to unblock blocking I/O in receive threads
+        try {
+            synchronized(socketLock) {
+                udpSocket?.close()
+            }
+        } catch (_: Exception) {}
+        try { tcpSocket?.close() } catch (_: Exception) {}
 
         println("ACM_DEBUG: Cancelling jobs...")
         // Stop jobs
@@ -712,9 +729,9 @@ class AudioCallManager(
             println("ACM_DEBUG: Error cancelling udpReceiveJob: ${e.message}")
         }
 
-        // Small delay to allow threads to finish (non-blocking if already in coroutine)
+        // Wait for coroutines to finish
         try {
-            Thread.sleep(100)
+            Thread.sleep(200)
         } catch (e: InterruptedException) {
             // Interrupted during sleep, continue cleanup
         }
@@ -750,23 +767,10 @@ class AudioCallManager(
             audioTrack = null
         }
 
-        println("ACM_DEBUG: Closing sockets...")
-        // Close UDP socket
-        try {
-            synchronized(socketLock) {
-                udpSocket?.close()
-                udpSocket = null
-            }
-        } catch (e: Exception) {
-            println("ACM_DEBUG: Error closing UDP socket: ${e.message}")
-        }
-        // Close TCP relay socket
-        try {
-            tcpSocket?.close()
-            tcpSocket = null
-        } catch (e: Exception) {
-            println("ACM_DEBUG: Error closing TCP socket: ${e.message}")
-        }
+        println("ACM_DEBUG: Cleaning up sockets...")
+        // Sockets already closed above to unblock I/O, just null them out
+        synchronized(socketLock) { udpSocket = null }
+        tcpSocket = null
 
         println("ACM_DEBUG: Cleaning up Opus codecs...")
         // Clean up Opus encoder/decoder
@@ -1220,8 +1224,15 @@ class AudioCallManager(
             // Send media packet
             sendPacket(encryptedPacket)
 
+            // Send stats every 2 seconds
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastStatsSendTime >= 2000L) {
+                lastStatsSendTime = now
+                sendStatsPacket()
+            }
+
             if (audioFrameCount % 100 == 0) {
-                println("ACM_DEBUG: Sent audio packet, seq=$seq")
+                println("ACM_DEBUG: Sent audio packet, seq=$seq, RTT=${measuredRttMs}ms")
             }
 
         } catch (e: Exception) {
@@ -1281,6 +1292,12 @@ class AudioCallManager(
                     println("ACM_DEBUG: HELLO processing error: ${e.message}")
                     e.printStackTrace()
                 }
+                return
+            }
+
+            // Check for stats packet (RTT measurement)
+            if (length >= 1 && packetData[0] == PKT_VER_STATS) {
+                handleStatsPacket(packetData, length)
                 return
             }
 
@@ -1482,6 +1499,83 @@ class AudioCallManager(
 
         return Pair(plaintext, seq)
     }
+
+    private fun handleStatsPacket(packetData: ByteArray, length: Int) {
+        if (length < 1 + 8 + AUDIO_AEAD_ABYTES) return
+        if (!remotePrefixReady.get()) return
+        if (remoteNoncePrefix.size < AUDIO_NONCE_PREFIX_LEN) return
+
+        // Extract sequence number
+        var seq: Long = 0
+        for (i in 0 until 8) {
+            seq = (seq shl 8) or (packetData[1 + i].toLong() and 0xFF)
+        }
+
+        // Build nonce
+        val nonce = ByteArray(AUDIO_AEAD_NONCE_LEN).apply {
+            System.arraycopy(remoteNoncePrefix, 0, this, 0, AUDIO_NONCE_PREFIX_LEN)
+            for (i in 0 until 8) {
+                this[AUDIO_NONCE_PREFIX_LEN + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
+            }
+        }
+
+        val ciphertext = packetData.copyOfRange(9, length)
+        val decrypted = Crypto.decrypt(ciphertext, byteArrayOf(), nonce, roomKey) ?: return
+
+        if (decrypted.size >= 8) {
+            val bb = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
+            val pingTs = bb.int   // peer's timestamp
+            val pongTs = bb.int   // echo of our last timestamp
+
+            if (pongTs != 0) {
+                val now32 = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
+                measuredRttMs = now32 - pongTs
+                handler.post { listener.onStatsUpdated(measuredRttMs) }
+            }
+            lastPeerPingTs = pingTs
+            peerPingRecvTime = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun sendStatsPacket() {
+        if (!remotePrefixReady.get()) return
+        if (localNoncePrefix.size < AUDIO_NONCE_PREFIX_LEN) return
+
+        val now = SystemClock.elapsedRealtime()
+        val now32 = (now and 0xFFFFFFFFL).toInt()
+        // Hold time compensation
+        val holdTime = if (peerPingRecvTime > 0) (now - peerPingRecvTime).toInt() else 0
+        val pongValue = lastPeerPingTs + holdTime
+
+        // AudioStatsPayload: ping_ts(4) + pong_ts(4) + reserved1(4) + reserved2(4)
+        val payload = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putInt(now32)              // ping_ts
+            putInt(pongValue)          // pong_ts (echo peer's ping + hold time)
+            putInt(0)                  // reserved1
+            putInt(0)                  // reserved2
+        }.array()
+
+        val seq = seqTx.getAndIncrement()
+        val nonce = ByteArray(AUDIO_AEAD_NONCE_LEN).apply {
+            System.arraycopy(localNoncePrefix, 0, this, 0, AUDIO_NONCE_PREFIX_LEN)
+            for (i in 0 until 8) {
+                this[AUDIO_NONCE_PREFIX_LEN + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
+            }
+        }
+
+        val encrypted = Crypto.encrypt(payload, byteArrayOf(), nonce, roomKey) ?: return
+
+        val packet = ByteArray(1 + 8 + encrypted.size)
+        packet[0] = PKT_VER_STATS
+        for (i in 0 until 8) {
+            packet[1 + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
+        }
+        System.arraycopy(encrypted, 0, packet, 9, encrypted.size)
+
+        sendPacket(packet)
+    }
+
+    fun getMeasuredRttMs(): Int = measuredRttMs
 
     private fun sendHelloPacket() {
         val packet = ByteArray(1 + AUDIO_NONCE_PREFIX_LEN)

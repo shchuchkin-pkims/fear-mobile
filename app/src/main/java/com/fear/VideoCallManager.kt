@@ -6,6 +6,7 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import java.net.DatagramPacket
@@ -115,6 +116,12 @@ class VideoCallManager(
     private var videoPacketsSent = 0L
     private var videoPacketsReceived = 0L
 
+    // RTT measurement (ping/pong via stats packets)
+    @Volatile private var lastPeerPingTs = 0
+    @Volatile private var peerPingRecvTime = 0L
+    @Volatile private var measuredRttMs = 0
+    private var lastStatsSendTime = 0L
+
     data class PendingFrame(
         val frameId: Long,
         val totalFrags: Int,
@@ -175,7 +182,9 @@ class VideoCallManager(
 
     private fun tcpRelayConnect(host: String, port: Int): Boolean {
         return try {
-            tcpSocket = Socket(host, port)
+            tcpSocket = Socket(host, port).apply {
+                tcpNoDelay = true  // Disable Nagle's algorithm for low-latency media
+            }
             Log.d(TAG, "TCP relay connected to $host:$port")
             true
         } catch (e: Exception) {
@@ -498,6 +507,13 @@ class VideoCallManager(
         ) ?: return
 
         sendFragmentedFrame(encoded, vKey)
+
+        // Send stats every 2 seconds
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastStatsSendTime >= 2000L) {
+            lastStatsSendTime = now
+            sendStatsPacket(vKey)
+        }
     }
 
     /**
@@ -641,18 +657,37 @@ class VideoCallManager(
     }
 
     fun endCall() {
-        running.set(false)
+        if (!running.compareAndSet(true, false)) return  // Guard against re-entry
 
+        // Close sockets first to unblock any blocking I/O in threads
+        try { udpSocket?.close() } catch (_: Exception) {}
+        try { tcpSocket?.close() } catch (_: Exception) {}
+
+        // Interrupt threads
         helloThread?.interrupt()
         receiveThread?.interrupt()
         audioSendThread?.interrupt()
         videoSendThread?.interrupt()
         audioRecordThread?.interrupt()
 
-        vp8Encoder?.stop()
-        vp8Decoder?.stop()
+        // Wait for threads to finish (with timeout)
+        val threads = listOfNotNull(helloThread, receiveThread, audioSendThread,
+                                    videoSendThread, audioRecordThread)
+        for (t in threads) {
+            try { t.join(500) } catch (_: Exception) {}
+        }
+        helloThread = null
+        receiveThread = null
+        audioSendThread = null
+        videoSendThread = null
+        audioRecordThread = null
 
-        // Stop audio
+        // Now safe to release codecs and audio
+        try { vp8Encoder?.stop() } catch (_: Exception) {}
+        try { vp8Decoder?.stop() } catch (_: Exception) {}
+        vp8Encoder = null
+        vp8Decoder = null
+
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
@@ -664,9 +699,7 @@ class VideoCallManager(
         try { opusDecoder?.destroy() } catch (_: Exception) {}
         opusDecoder = null
 
-        udpSocket?.close()
         udpSocket = null
-        try { tcpSocket?.close() } catch (_: Exception) {}
         tcpSocket = null
 
         pendingFrames.clear()
@@ -1017,13 +1050,51 @@ class VideoCallManager(
         val ciphertext = data.copyOfRange(9, data.size)
         val decrypted = aesGcmDecrypt(ciphertext, vKey, nonce) ?: return
 
-        if (decrypted.size >= 12) {
+        if (decrypted.size >= 16) {
             val stats = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
             val received = stats.int
             val lost = stats.int
-            val rtt = stats.int
-            listener.onStatsUpdated(received, lost, rtt)
+            val pongTs = stats.int   // echo of our last ping timestamp
+            val pingTs = stats.int   // peer's current timestamp (reserved field)
+
+            // RTT: pongTs echoes our ping + hold time
+            if (pongTs != 0) {
+                val now32 = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
+                measuredRttMs = now32 - pongTs
+            }
+            lastPeerPingTs = pingTs
+            peerPingRecvTime = SystemClock.elapsedRealtime()
+
+            listener.onStatsUpdated(received, lost, measuredRttMs)
         }
+    }
+
+    private fun sendStatsPacket(vKey: ByteArray) {
+        val now = SystemClock.elapsedRealtime()
+        val now32 = (now and 0xFFFFFFFFL).toInt()
+        // Hold time compensation: add time we held the peer's ping
+        val holdTime = if (peerPingRecvTime > 0) (now - peerPingRecvTime).toInt() else 0
+        val pongValue = lastPeerPingTs + holdTime
+        // StatsPayload: packets_received(4) + packets_lost(4) + rtt_ms/pong(4) + reserved/ping(4)
+        val payload = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putInt(videoPacketsReceived.toInt())  // packets_received
+            putInt(0)                              // packets_lost (not tracked)
+            putInt(pongValue)                      // rtt_ms field = echo peer's ping + hold time
+            putInt(now32)                          // reserved field = our ping timestamp
+        }.array()
+
+        val seq = videoSeqTx.getAndIncrement()
+        val nonce = buildNonce(localNoncePrefix, seq)
+        val encrypted = aesGcmEncrypt(payload, vKey, nonce) ?: return
+
+        val packet = ByteBuffer.allocate(1 + 8 + encrypted.size).apply {
+            order(ByteOrder.BIG_ENDIAN)
+            put(Common.PKT_TYPE_STATS)
+            putLong(seq)
+            put(encrypted)
+        }.array()
+
+        sendPacket(packet)
     }
 
     // --- Fragment and send video ---

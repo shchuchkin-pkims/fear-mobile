@@ -498,6 +498,19 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         }
     }
 
+    override fun onAudioStatsUpdated(rttMs: Int) {
+        runOnUiThread {
+            callStatusTextView.text = "In call | RTT: ${rttMs}ms"
+            // Color: green < 100ms, yellow 100-300ms, red > 300ms
+            val color = when {
+                rttMs < 100 -> 0xFF00DD00.toInt()   // green
+                rttMs < 300 -> 0xFFFFC800.toInt()   // yellow
+                else -> 0xFFFF2828.toInt()           // red
+            }
+            callStatusTextView.setTextColor(color)
+        }
+    }
+
     private fun initializeViews() {
         connectionLayout = findViewById(R.id.connectionLayout)
         chatLayout = findViewById(R.id.chatLayout)

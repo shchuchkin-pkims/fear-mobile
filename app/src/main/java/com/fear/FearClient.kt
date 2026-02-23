@@ -30,6 +30,7 @@ class FearClient(
         fun onCallRequestReceived(fromUser: String)
         fun onCallStarted(remoteUser: String, isInitiator: Boolean)
         fun onCallEnded()
+        fun onAudioStatsUpdated(rttMs: Int) {}
         fun onContactsUpdated(contacts: List<String>)
     }
 
@@ -86,6 +87,10 @@ class FearClient(
 
                 override fun onCallEnded() {
                     handler.post { listener.onCallEnded() }
+                }
+
+                override fun onStatsUpdated(rttMs: Int) {
+                    handler.post { listener.onAudioStatsUpdated(rttMs) }
                 }
             })
         }
