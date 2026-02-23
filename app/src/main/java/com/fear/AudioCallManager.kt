@@ -966,8 +966,23 @@ class AudioCallManager(
                         if (received.isNotEmpty() && isRunning.get()) {
                             try {
                                 processAudioPacket(received, received.size)
-                            } catch (e: Throwable) {
-                                // Silently ignore packet processing errors
+                            } catch (e: Throwable) {}
+                        }
+
+                        // Drain TCP buffer: process all immediately available packets
+                        // to prevent latency accumulation in TCP relay mode
+                        val sock = tcpSocket
+                        if (sock != null) {
+                            val input = sock.getInputStream()
+                            var drained = 0
+                            while (drained < 200 && input.available() > 0 && isRunning.get()) {
+                                val more = tcpRelayRecvMedia() ?: break
+                                if (more.isNotEmpty()) {
+                                    try {
+                                        processAudioPacket(more, more.size)
+                                    } catch (e: Throwable) {}
+                                }
+                                drained++
                             }
                         }
                         continue
@@ -1384,7 +1399,12 @@ class AudioCallManager(
                         if (track != null &&
                             track.state == AudioTrack.STATE_INITIALIZED &&
                             track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                            val written = track.write(audioData, 0, audioData.size)
+                            // Non-blocking write in relay mode to prevent stalling receive loop
+                            val written = if (relayMode) {
+                                track.write(audioData, 0, audioData.size, AudioTrack.WRITE_NON_BLOCKING)
+                            } else {
+                                track.write(audioData, 0, audioData.size)
+                            }
                             if (seq % 50 == 0L) {
                                 println("ACM_DEBUG: Wrote $written bytes to AudioTrack (requested ${audioData.size})")
                             }

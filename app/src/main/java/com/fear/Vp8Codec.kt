@@ -36,7 +36,7 @@ class Vp8Encoder(
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
     }
 
@@ -240,8 +240,15 @@ class Vp8Decoder {
 
     private var codec: MediaCodec? = null
     private val bufferInfo = MediaCodec.BufferInfo()
+    private var decoderSurface: Surface? = null
+    private var decoderWidth = 0
+    private var decoderHeight = 0
+    @Volatile private var needsKeyframe = false
 
     fun start(surface: Surface, width: Int, height: Int) {
+        decoderSurface = surface
+        decoderWidth = width
+        decoderHeight = height
         codec = tryCreateDecoder(MIME_VP8, surface, width, height)
             ?: tryCreateDecoder(MIME_VP8_ALT, surface, width, height)
             ?: tryCreateByName(surface, width, height)
@@ -285,19 +292,57 @@ class Vp8Decoder {
     fun decode(data: ByteArray, presentationTimeUs: Long) {
         val c = codec ?: return
 
-        val inputIndex = c.dequeueInputBuffer(10_000)
-        if (inputIndex >= 0) {
-            val inputBuffer = c.getInputBuffer(inputIndex) ?: return
-            inputBuffer.clear()
-            inputBuffer.put(data)
-            c.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
+        // VP8 keyframe: bit 0 of first byte is 0
+        val isKeyframe = data.isNotEmpty() && (data[0].toInt() and 0x01) == 0
+
+        // After decoder recreation, skip P-frames until we get a keyframe
+        if (needsKeyframe) {
+            if (!isKeyframe) return
+            Log.d(TAG, "Got keyframe after decoder recreation, resuming")
+            needsKeyframe = false
         }
 
-        var outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
-        while (outputIndex >= 0) {
-            c.releaseOutputBuffer(outputIndex, true)
-            outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+        try {
+            val inputIndex = c.dequeueInputBuffer(10_000)
+            if (inputIndex >= 0) {
+                val inputBuffer = c.getInputBuffer(inputIndex) ?: return
+                inputBuffer.clear()
+                inputBuffer.put(data)
+                c.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
+            }
+
+            var outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+            while (outputIndex >= 0) {
+                c.releaseOutputBuffer(outputIndex, true)
+                outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+            }
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "Decoder error, recreating: ${e.message}")
+            recreateDecoder()
         }
+    }
+
+    private fun recreateDecoder() {
+        try { codec?.stop() } catch (_: Exception) {}
+        try { codec?.release() } catch (_: Exception) {}
+        codec = null
+        val surface = decoderSurface ?: return
+        codec = tryCreateDecoder(MIME_VP8, surface, decoderWidth, decoderHeight)
+            ?: tryCreateDecoder(MIME_VP8_ALT, surface, decoderWidth, decoderHeight)
+            ?: tryCreateByName(surface, decoderWidth, decoderHeight)
+        if (codec != null) {
+            Log.d(TAG, "Decoder recreated: ${codec?.name}, waiting for keyframe")
+            needsKeyframe = true
+        } else {
+            Log.e(TAG, "Failed to recreate decoder")
+        }
+    }
+
+    fun flush() {
+        try {
+            codec?.flush()
+            codec?.start()
+        } catch (_: Exception) {}
     }
 
     fun stop() {
@@ -317,7 +362,7 @@ data class VideoQualityPreset(
 ) {
     companion object {
         val LOW = VideoQualityPreset(320, 240, 15, 200)
-        val MEDIUM = VideoQualityPreset(640, 480, 25, 500)
+        val MEDIUM = VideoQualityPreset(640, 480, 25, 800)
         val HIGH = VideoQualityPreset(1280, 720, 30, 1500)
     }
 }

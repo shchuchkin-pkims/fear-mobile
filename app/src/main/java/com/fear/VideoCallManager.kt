@@ -122,6 +122,9 @@ class VideoCallManager(
     @Volatile private var measuredRttMs = 0
     private var lastStatsSendTime = 0L
 
+    // TCP relay latency control: skip P-frames when falling behind
+    @Volatile private var skipToKeyframe = false
+
     data class PendingFrame(
         val frameId: Long,
         val totalFrags: Int,
@@ -703,6 +706,7 @@ class VideoCallManager(
         tcpSocket = null
 
         pendingFrames.clear()
+        skipToKeyframe = false
         remotePrefixReady.set(false)
         isListening.set(false)
         remoteNoncePrefix = null
@@ -726,12 +730,18 @@ class VideoCallManager(
         var retries = 0
         Log.d(TAG, "HELLO loop started, sending to ${remoteAddress?.hostAddress}:$remotePort")
 
+        // Always send at least one HELLO so the peer gets our nonce prefix,
+        // even if we already received the peer's HELLO via TCP buffer
+        sendHello()
+        Log.d(TAG, "HELLO sent #0 (waiting for response...)")
+        retries++
+
         while (running.get() && !remotePrefixReady.get() && retries < 100) {
+            Thread.sleep(50)
             sendHello()
             if (retries % 20 == 0) {
                 Log.d(TAG, "HELLO sent #$retries (waiting for response...)")
             }
-            Thread.sleep(50)
             retries++
         }
 
@@ -805,29 +815,52 @@ class VideoCallManager(
 
     // --- Receive loop ---
 
+    private fun processPacket(data: ByteArray) {
+        if (data.isEmpty()) return
+        when (data[0]) {
+            Common.PKT_VER_HELLO -> {
+                Log.d(TAG, "Received HELLO (${data.size} bytes)")
+                handleHello(data)
+            }
+            Common.PKT_VER_AUDIO -> handleAudioPacket(data)
+            Common.PKT_TYPE_VIDEO_FRAG -> {
+                videoPacketsReceived++
+                handleVideoFragment(data)
+            }
+            Common.PKT_TYPE_STATS -> handleStatsPacket(data)
+            else -> {
+                val pktType = data[0].toInt() and 0xFF
+                Log.w(TAG, "Unknown packet type: 0x${"%02x".format(pktType)} (${data.size} bytes)")
+            }
+        }
+    }
+
     private fun receiveLoop() {
         val recvBuf = ByteArray(Common.AUDIO_UDP_RECV_BUFSIZE)
         Log.d(TAG, "Receive loop started" + if (relayMode) " (TCP relay)" else " on port ${udpSocket?.localPort}")
 
         while (running.get()) {
             try {
-                val data: ByteArray
-
                 if (relayMode && tcpSocket != null) {
-                    // TCP relay path
+                    // TCP relay path: read one packet at a time, decode each
+                    // complete frame immediately (VP8 P-frames depend on all
+                    // previous frames — skipping any corrupts the picture)
                     val received = tcpRelayRecvMedia()
                     if (received == null) {
                         Log.e(TAG, "[relay] TCP connection lost")
                         running.set(false)
                         break
                     }
-                    data = received
+                    processPacket(received)
+
+                    // Periodic cleanup
+                    cleanupTimedOutFrames()
                 } else {
                     // UDP path
                     val packet = DatagramPacket(recvBuf, recvBuf.size)
                     udpSocket?.receive(packet) ?: break
 
-                    data = recvBuf.copyOfRange(0, packet.length)
+                    val data = recvBuf.copyOfRange(0, packet.length)
 
                     // Listen mode: learn remote address from first packet
                     if (isListening.get() && remoteAddress == null && packet.address != null) {
@@ -842,24 +875,8 @@ class VideoCallManager(
                             }
                         }.also { it.start() }
                     }
-                }
 
-                if (data.isEmpty()) continue
-
-                val pktType = data[0].toInt() and 0xFF
-
-                when (data[0]) {
-                    Common.PKT_VER_HELLO -> {
-                        Log.d(TAG, "Received HELLO (${data.size} bytes)")
-                        handleHello(data)
-                    }
-                    Common.PKT_VER_AUDIO -> handleAudioPacket(data)
-                    Common.PKT_TYPE_VIDEO_FRAG -> {
-                        videoPacketsReceived++
-                        handleVideoFragment(data)
-                    }
-                    Common.PKT_TYPE_STATS -> handleStatsPacket(data)
-                    else -> Log.w(TAG, "Unknown packet type: 0x${"%02x".format(pktType)} (${data.size} bytes)")
+                    processPacket(data)
                 }
             } catch (e: java.net.SocketTimeoutException) {
                 // Normal timeout, continue (UDP only)
@@ -890,7 +907,7 @@ class VideoCallManager(
         if (existingPrefix != null && !existingPrefix.contentEquals(prefix)) {
             Log.d(TAG, "Peer reconnected (new prefix), resetting state")
             pendingFrames.clear()
-            vp8Decoder?.stop()
+            vp8Decoder?.flush()
             peerVerified = false
         }
 
@@ -961,12 +978,16 @@ class VideoCallManager(
             audioData[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
         }
 
-        // Write to AudioTrack
+        // Write to AudioTrack (non-blocking in relay mode to prevent stalling video)
         try {
             val track = audioTrack
             if (track != null && track.state == AudioTrack.STATE_INITIALIZED
                 && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                track.write(audioData, 0, audioData.size)
+                if (relayMode) {
+                    track.write(audioData, 0, audioData.size, AudioTrack.WRITE_NON_BLOCKING)
+                } else {
+                    track.write(audioData, 0, audioData.size)
+                }
             }
         } catch (_: Exception) {}
     }
@@ -1029,12 +1050,33 @@ class VideoCallManager(
             val completeFrame = frame.data.copyOfRange(0, totalSize)
             pendingFrames.remove(frameId)
 
+            // Drop all older pending frames — they're stale
+            pendingFrames.entries.removeAll { (id, _) -> id < frameId }
+
             if (frameId <= 3) {
                 Log.d(TAG, "Complete VP8 frame #$frameId: $totalSize bytes ($totalFrags frags)")
             }
 
-            // Decode VP8
+            // VP8 keyframe: bit 0 of first byte is 0
+            val isKeyframe = completeFrame.isNotEmpty() && (completeFrame[0].toInt() and 0x01) == 0
+
+            // TCP relay latency control: when falling behind, skip P-frames
+            // until the next keyframe to catch up without corrupting the picture
+            if (relayMode && skipToKeyframe) {
+                if (!isKeyframe) return  // skip P-frame
+                skipToKeyframe = false   // resume normal decode
+            }
+
             vp8Decoder?.decode(completeFrame, System.nanoTime() / 1000)
+
+            // After decode, check if TCP buffer has significant backlog.
+            // ~30KB ≈ 200-300ms of video at 800kbps + overhead.
+            if (relayMode && tcpSocket != null) {
+                try {
+                    val avail = tcpSocket?.getInputStream()?.available() ?: 0
+                    if (avail > 30000) skipToKeyframe = true
+                } catch (_: Exception) {}
+            }
         }
     }
 
