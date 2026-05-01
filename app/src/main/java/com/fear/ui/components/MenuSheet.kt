@@ -15,6 +15,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -36,6 +38,8 @@ fun MenuSheet(
     onDisconnect: () -> Unit,
     onTrustedKeys: () -> Unit,
     onToggleTheme: () -> Unit,
+    onCheckUpdates: () -> Unit,
+    onAbout: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     val sheetState = rememberModalBottomSheetState()
@@ -49,6 +53,9 @@ fun MenuSheet(
             .navigationBarsPadding()
             .padding(bottom = 12.dp)) {
 
+            MenuItem(Icons.Filled.SystemUpdate, "Check for updates", colors.textPrimary) {
+                onCheckUpdates(); onDismiss()
+            }
             MenuItem(Icons.Filled.VpnKey, "Trusted keys", colors.textPrimary) {
                 onTrustedKeys(); onDismiss()
             }
@@ -57,6 +64,9 @@ fun MenuSheet(
                 if (colors.isDark) "Switch to light theme" else "Switch to dark theme",
                 colors.textPrimary,
             ) { onToggleTheme(); onDismiss() }
+            MenuItem(Icons.Filled.Info, "About F.E.A.R.", colors.textPrimary) {
+                onAbout(); onDismiss()
+            }
             MenuItem(Icons.AutoMirrored.Filled.ExitToApp, "Disconnect", colors.textPrimary) {
                 onDisconnect(); onDismiss()
             }

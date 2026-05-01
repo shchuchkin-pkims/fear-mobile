@@ -20,10 +20,19 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.lifecycleScope
+import com.fear.AppUpdater
+import com.fear.BuildConfig
+import kotlinx.coroutines.delay
 import com.fear.TrustedKeysActivity
 import com.fear.VideoCallActivity
+import com.fear.ui.components.AboutDialog
 import com.fear.ui.components.CallOverlay
 import com.fear.ui.components.MenuSheet
+import com.fear.ui.components.UpdateDialog
+import kotlinx.coroutines.launch
+import android.widget.Toast
 import com.fear.ui.screens.ChatScreen
 import com.fear.ui.screens.ConnectScreen
 import com.fear.ui.theme.FearTheme
@@ -48,6 +57,25 @@ class ComposeMainActivity : ComponentActivity() {
                 val state by viewModel.uiState.collectAsState()
                 val form  by viewModel.form.collectAsState()
                 var menuOpen by remember { mutableStateOf(false) }
+                var updateInfo by remember { mutableStateOf<AppUpdater.UpdateInfo?>(null) }
+                var downloadProgress by remember { mutableStateOf<Int?>(null) }
+                var autoChecked by remember { mutableStateOf(false) }
+                var aboutOpen by remember { mutableStateOf(false) }
+
+                // Silent auto-update check on first composition (delay 3s so the
+                // connect screen renders first). If a newer version is available,
+                // populate updateInfo → the UpdateDialog appears.
+                LaunchedEffect(Unit) {
+                    if (autoChecked) return@LaunchedEffect
+                    autoChecked = true
+                    delay(3000)
+                    runCatching {
+                        val info = AppUpdater(applicationContext).checkForUpdate()
+                        if (info.hasUpdate && info.downloadUrl.isNotEmpty()) {
+                            updateInfo = info
+                        }
+                    }.onFailure { /* silent — manual menu still works */ }
+                }
 
                 // File picker: SAF document → copy to cache → /sendfile <path>
                 val filePicker = rememberLauncherForActivityResult(
@@ -90,6 +118,40 @@ class ComposeMainActivity : ComponentActivity() {
                                 startActivity(Intent(this@ComposeMainActivity, TrustedKeysActivity::class.java))
                             },
                             onToggleTheme = { darkOverride = !effectiveDark },
+                            onCheckUpdates = { triggerUpdateCheck { updateInfo = it } },
+                            onAbout = { aboutOpen = true },
+                        )
+                    }
+
+                    if (aboutOpen) {
+                        AboutDialog(BuildConfig.VERSION_NAME) { aboutOpen = false }
+                    }
+
+                    // Update available dialog (download + install)
+                    val info = updateInfo
+                    if (info != null) {
+                        UpdateDialog(
+                            info = info,
+                            currentVersion = BuildConfig.VERSION_NAME,
+                            downloadProgress = downloadProgress,
+                            onConfirm = {
+                                downloadProgress = 0
+                                startApkDownload(
+                                    info = info,
+                                    onProgress = { p -> downloadProgress = p },
+                                    onDone = { err ->
+                                        downloadProgress = null
+                                        updateInfo = null
+                                        if (err != null) {
+                                            Toast.makeText(this@ComposeMainActivity,
+                                                "Download failed: $err", Toast.LENGTH_LONG).show()
+                                        }
+                                    },
+                                )
+                            },
+                            onDismiss = {
+                                if (downloadProgress == null) updateInfo = null
+                            },
                         )
                     }
 
@@ -131,6 +193,53 @@ class ComposeMainActivity : ComponentActivity() {
             putExtra(VideoCallActivity.EXTRA_RELAY_NAME,   viewModel.userName())
         }
         startActivity(intent)
+    }
+
+    private fun triggerUpdateCheck(onResult: (AppUpdater.UpdateInfo?) -> Unit) {
+        Toast.makeText(this, "Checking for updates…", Toast.LENGTH_SHORT).show()
+        val updater = AppUpdater(applicationContext)
+        lifecycleScope.launch {
+            try {
+                val info = updater.checkForUpdate()
+                if (info.hasUpdate && info.downloadUrl.isNotEmpty()) {
+                    onResult(info)
+                } else {
+                    onResult(null)
+                    Toast.makeText(
+                        this@ComposeMainActivity,
+                        "You're up to date (v${BuildConfig.VERSION_NAME})",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            } catch (e: Exception) {
+                onResult(null)
+                Toast.makeText(
+                    this@ComposeMainActivity,
+                    "Update check failed: ${e.message}",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    /** Download the APK and ask Android to install it. */
+    private fun startApkDownload(
+        info: AppUpdater.UpdateInfo,
+        onProgress: (Int) -> Unit,
+        onDone: (String?) -> Unit,
+    ) {
+        val updater = AppUpdater(applicationContext)
+        lifecycleScope.launch {
+            try {
+                val apk = updater.downloadApk(info.downloadUrl) { p ->
+                    runOnUiThread { onProgress(p) }
+                }
+                onDone(null)
+                updater.installApk(apk)
+            } catch (e: Exception) {
+                onDone(e.message ?: "unknown")
+            }
+        }
     }
 
     private fun hasAudioPermission() = ContextCompat.checkSelfPermission(
