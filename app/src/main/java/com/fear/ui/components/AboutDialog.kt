@@ -43,7 +43,7 @@ fun AboutDialog(version: String, onDismiss: () -> Unit) {
 
                 Spacer(Modifier.height(14.dp))
                 Text("Author", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                Text("Evgeny Shchuchkin", fontSize = 13.sp)
+                Text("Evgenii Shchuchkin", fontSize = 13.sp)
                 Link("shchuchkin-pkims@yandex.ru", "mailto:shchuchkin-pkims@yandex.ru", ctx)
 
                 Spacer(Modifier.height(10.dp))
