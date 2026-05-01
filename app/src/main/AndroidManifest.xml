@@ -28,9 +28,8 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
-        android:allowBackup="true"
-        android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/backup_rules"
+        android:allowBackup="false"
+        tools:replace="android:allowBackup"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.FEAR"
@@ -53,6 +52,15 @@
         <activity
             android:name=".TrustedKeysActivity"
             android:theme="@style/Theme.FEAR" />
+
+        <!-- New Compose-based UI (Telegram-style). Not yet the launcher.
+             Run via: adb shell am start -n com.fear/.ui.ComposeMainActivity -->
+        <activity
+            android:name=".ui.ComposeMainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.AppCompat.NoActionBar"
+            android:windowSoftInputMode="adjustResize"
+            android:label="F.E.A.R. (preview)" />
 
         <service
             android:name=".AudioCallService"

@@ -98,7 +98,8 @@ class FearClient(
     }
 
     fun connect(host: String, port: Int, room: String, name: String,
-                keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY) {
+                keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY,
+                joinTimeoutMs: Int = 30000) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 // Close any previous connection before starting a new one
@@ -153,7 +154,7 @@ class FearClient(
                 if (mode == ConnectMode.JOIN_ROOM) {
                     notifyMessageReceived(Message(room, "system",
                         "[join] Requesting room key via ECDH exchange...", System.currentTimeMillis()))
-                    val receivedKey = ecdhJoinRoom(s)
+                    val receivedKey = ecdhJoinRoom(s, joinTimeoutMs)
                     if (receivedKey == null) {
                         notifyError("Key exchange failed: no response (timeout)")
                         socket?.close()
@@ -406,7 +407,7 @@ class FearClient(
      * Perform ECDH key exchange as joiner: send KEY_REQUEST, wait for KEY_RESPONSE.
      * Returns the room key on success, null on failure/timeout.
      */
-    private fun ecdhJoinRoom(socket: Socket): ByteArray? {
+    private fun ecdhJoinRoom(socket: Socket, timeoutMs: Int = 30000): ByteArray? {
         val ls = LazySodiumAndroid(SodiumAndroid())
         val myPk = ByteArray(Common.CRYPTO_BOX_PUBLICKEYBYTES)
         val mySk = ByteArray(Common.CRYPTO_BOX_SECRETKEYBYTES)
@@ -416,9 +417,8 @@ class FearClient(
         sendServiceFrame(socket, Common.MSG_TYPE_KEY_REQUEST, myPk)
         Log.i("FearClient", "[join] Sent KEY_REQUEST, waiting for response...")
 
-        // Set socket timeout to 30 seconds
         val oldTimeout = socket.soTimeout
-        socket.soTimeout = 30000
+        socket.soTimeout = timeoutMs
 
         try {
             while (true) {
