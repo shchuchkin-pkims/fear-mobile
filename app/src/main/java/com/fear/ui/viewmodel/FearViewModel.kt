@@ -371,6 +371,30 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Open a 1-on-1 chat with `contact`: compute the deterministic DM
+     * room_id, set it on the form, and connect via AUTO mode (JOIN if the
+     * other peer already created the room, CREATE otherwise).
+     *
+     * Server stays the same as the form's current `host:port` — DMs live
+     * on whichever relay both sides happen to share.
+     */
+    fun openDmWith(contact: ContactEntity) {
+        val app = getApplication<Application>()
+        val im = IdentityManager(app)
+        if (!im.hasIdentity()) im.generateIdentity()
+        val otherPk = android.util.Base64.decode(
+            contact.identityPkB64,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+        )
+        val dmId = im.dmRoomId(otherPk) ?: run {
+            _uiState.update { it.copy(errorBanner = "No identity to open DM.") }
+            return
+        }
+        _form.update { it.copy(room = dmId, mode = ConnectMode.AUTO) }
+        connect()
+    }
+
     fun removeContact(pkB64: String, server: String?, port: Int) {
         viewModelScope.launch(Dispatchers.IO) {
             val ep = if (server != null) ContactsRepository.ServerEndpoint(server, port) else null

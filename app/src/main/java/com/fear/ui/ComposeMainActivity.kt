@@ -175,6 +175,10 @@ class ComposeMainActivity : ComponentActivity() {
                             viewModel.removeContact(c.identityPkB64,
                                 form.host, form.port)
                         },
+                        onOpenChat = { c ->
+                            viewModel.openDmWith(c)
+                            contactsOpen = false
+                        },
                     )
                     if (addContactOpen) {
                         AddContactDialog(

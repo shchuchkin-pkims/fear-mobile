@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.FloatingActionButton
@@ -47,6 +48,7 @@ fun ContactsScreen(
     onBack: () -> Unit,
     onAdd: () -> Unit,
     onRemove: (ContactEntity) -> Unit,
+    onOpenChat: (ContactEntity) -> Unit,
 ) {
     val colors = LocalFearColors.current
     Box(modifier = Modifier
@@ -85,7 +87,9 @@ fun ContactsScreen(
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(contacts, key = { it.identityPkB64 }) { c ->
-                        ContactRow(c, onRemove = { onRemove(c) })
+                        ContactRow(c,
+                            onOpenChat = { onOpenChat(c) },
+                            onRemove   = { onRemove(c) })
                         HorizontalDivider(color = colors.border)
                     }
                 }
@@ -101,10 +105,15 @@ fun ContactsScreen(
 }
 
 @Composable
-private fun ContactRow(c: ContactEntity, onRemove: () -> Unit) {
+private fun ContactRow(
+    c: ContactEntity,
+    onOpenChat: () -> Unit,
+    onRemove: () -> Unit,
+) {
     val colors = LocalFearColors.current
     Row(
         modifier = Modifier.fillMaxWidth()
+            .clickable(onClick = onOpenChat)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -123,6 +132,10 @@ private fun ContactRow(c: ContactEntity, onRemove: () -> Unit) {
             val handle = if (c.handle != null && c.server != null) "${c.handle}@${c.server}"
                          else c.identityPkB64.take(12) + "…"
             Text(handle, color = colors.textSecondary, fontSize = 12.sp)
+        }
+        IconButton(onClick = onOpenChat) {
+            Icon(Icons.AutoMirrored.Filled.Chat, "Open chat",
+                 tint = colors.accent, modifier = Modifier.size(20.dp))
         }
         IconButton(onClick = onRemove) {
             Icon(Icons.Filled.Delete, "Remove", tint = colors.textSecondary,

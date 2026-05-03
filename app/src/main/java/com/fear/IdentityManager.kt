@@ -117,6 +117,47 @@ class IdentityManager(private val context: Context) {
     }
 
     /**
+     * Deterministic room id for a 1-on-1 chat between two identities.
+     * Both sides compute the same value without coordination
+     * (Phase B-4, doc §11):
+     *
+     *   room_id = base64url(BLAKE2b(min(pk_a, pk_b) || max(pk_a, pk_b), 16))
+     *
+     * 16 raw bytes → 22 base64url chars; safely fits as a room name on the
+     * wire and is opaque to onlookers. Prefixed with "dm:" so the UI can
+     * tell DMs from user-named group rooms at a glance.
+     */
+    fun dmRoomId(otherPk: ByteArray): String? {
+        val mine = publicKey ?: return null
+        require(otherPk.size == Common.IDENTITY_PK_BYTES) { "other pk wrong size" }
+
+        // Sort the two pk byte-arrays lexicographically.
+        val (lo, hi) = if (compareUnsigned(mine, otherPk) <= 0) mine to otherPk
+                       else                                      otherPk to mine
+        val concat = ByteArray(64).apply {
+            System.arraycopy(lo, 0, this, 0, 32)
+            System.arraycopy(hi, 0, this, 32, 32)
+        }
+        val digest = ByteArray(16)
+        ls.cryptoGenericHash(digest, 16, concat, concat.size.toLong(), null, 0)
+        val b64 = android.util.Base64.encodeToString(
+            digest,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+        )
+        return "dm:$b64"
+    }
+
+    private fun compareUnsigned(a: ByteArray, b: ByteArray): Int {
+        val n = minOf(a.size, b.size)
+        for (i in 0 until n) {
+            val av = a[i].toInt() and 0xFF
+            val bv = b[i].toInt() and 0xFF
+            if (av != bv) return av - bv
+        }
+        return a.size - b.size
+    }
+
+    /**
      * Derive a 32-byte symmetric key from `identity_sk` for the given
      * application context. Used by ContactsCipher (Phase B-3) to encrypt
      * the contact-list blob without ever exposing identity_sk to the
