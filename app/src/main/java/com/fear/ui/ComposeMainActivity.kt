@@ -202,6 +202,11 @@ class ComposeMainActivity : ComponentActivity() {
                                     }
                                 )
                             },
+                            onClearHistory = {
+                                viewModel.clearHistory()
+                                Toast.makeText(this@ComposeMainActivity,
+                                    "Chat history cleared", Toast.LENGTH_SHORT).show()
+                            },
                         )
                     }
 

@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -48,6 +49,7 @@ fun MenuSheet(
     onImportIdentity: () -> Unit,
     onShowQr: () -> Unit,
     onImportQr: () -> Unit,
+    onClearHistory: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     val sheetState = rememberModalBottomSheetState()
@@ -86,6 +88,9 @@ fun MenuSheet(
             ) { onToggleTheme(); onDismiss() }
             MenuItem(Icons.Filled.Info, "About F.E.A.R.", colors.textPrimary) {
                 onAbout(); onDismiss()
+            }
+            MenuItem(Icons.Filled.Delete, "Clear chat history…", colors.textPrimary) {
+                onClearHistory(); onDismiss()
             }
             MenuItem(Icons.AutoMirrored.Filled.ExitToApp, "Disconnect", colors.textPrimary) {
                 onDisconnect(); onDismiss()

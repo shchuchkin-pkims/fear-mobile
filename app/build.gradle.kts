@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    id("com.google.devtools.ksp") version "2.0.21-1.0.27"
 }
 
 val localProps = Properties().apply {
@@ -91,6 +92,11 @@ dependencies {
 
     // EncryptedFile for at-rest encryption of identity_sk (Phase 0 security baseline)
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Room — local message history (Phase A §9a + §17 search)
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
 
     // ZXing for QR code generation (identity backup) and scanning (import).
     // Need transitive deps now: CameraView + the embedded CaptureActivity used

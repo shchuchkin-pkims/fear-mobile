@@ -7,6 +7,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.fear.FearClient
 import com.fear.Message
+import com.fear.data.AppDatabase
+import com.fear.data.MessageEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,6 +28,7 @@ private const val AUTO_JOIN_TIMEOUT_MS = 5000
 class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val dao   = AppDatabase.get(app).messageDao()
 
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
@@ -61,6 +64,9 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             seenPeers.clear()
             reportedCount = 0
             recomputeStatus()
+            // Load persisted history for this room (Phase A §9a) — fire and
+            // forget; the UI re-renders when state updates.
+            loadHistoryForRoom(f.room)
         }
 
         override fun onDisconnected() {
@@ -94,6 +100,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 delivered = true,
             )
             _uiState.update { it.copy(messages = it.messages + msg) }
+            persistMessage(msg)
             if (message.sender.isNotBlank() && message.sender != "system") {
                 seenPeers.add(message.sender)
                 recomputeStatus()
@@ -222,20 +229,68 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     fun sendMessage(text: String) {
         if (!_uiState.value.isConnected || text.isBlank()) return
-        _uiState.update {
-            it.copy(messages = it.messages + ChatMessage(
-                sender = _form.value.name,
-                text = text,
-                timestamp = Instant.now(),
-                fromSelf = true,
-                delivered = false,
-            ))
-        }
+        val msg = ChatMessage(
+            sender = _form.value.name,
+            text = text,
+            timestamp = Instant.now(),
+            fromSelf = true,
+            delivered = false,
+        )
+        _uiState.update { it.copy(messages = it.messages + msg) }
+        persistMessage(msg)
         viewModelScope.launch(Dispatchers.IO) { client.sendMessage(text) }
     }
 
     fun closeActiveChat() { _uiState.update { it.copy(activeChatId = null) } }
-    fun openChat(id: String) { _uiState.update { it.copy(activeChatId = id) } }
+    fun openChat(id: String) {
+        _uiState.update { it.copy(activeChatId = id) }
+        loadHistoryForRoom(id)
+    }
+
+    /** Wipe persisted history for the currently active chat. */
+    fun clearHistory() {
+        val roomId = _uiState.value.activeChatId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.clearRoom(roomId)
+            _uiState.update { it.copy(messages = emptyList()) }
+        }
+    }
+
+    /** Replace the in-memory message list with what's on disk for `roomId`. */
+    private fun loadHistoryForRoom(roomId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val rows = dao.loadRecent(roomId)
+            val msgs = rows.map { e ->
+                ChatMessage(
+                    sender    = e.senderName,
+                    text      = e.text,
+                    timestamp = Instant.ofEpochMilli(e.ts),
+                    fromSelf  = e.fromSelf,
+                    delivered = true,
+                    isSystem  = e.isSystem,
+                )
+            }
+            _uiState.update {
+                if (it.activeChatId == roomId) it.copy(messages = msgs) else it
+            }
+        }
+    }
+
+    /** Append `msg` to the persisted history of the currently active chat. */
+    private fun persistMessage(msg: ChatMessage) {
+        val roomId = _uiState.value.activeChatId ?: return
+        val ownName = _form.value.name
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.insert(MessageEntity(
+                roomId     = roomId,
+                senderName = msg.sender.ifEmpty { if (msg.fromSelf) ownName else "system" },
+                text       = msg.text,
+                ts         = msg.timestamp.toEpochMilli(),
+                fromSelf   = msg.fromSelf,
+                isSystem   = msg.isSystem,
+            ))
+        }
+    }
     fun dismissError() { _uiState.update { it.copy(errorBanner = null) } }
 
     /** Get the room key (32 bytes) for passing to call dialogs / VideoCallActivity. */
