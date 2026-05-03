@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -50,6 +51,7 @@ fun MenuSheet(
     onShowQr: () -> Unit,
     onImportQr: () -> Unit,
     onClearHistory: () -> Unit,
+    onSearch: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     val sheetState = rememberModalBottomSheetState()
@@ -63,6 +65,9 @@ fun MenuSheet(
             .navigationBarsPadding()
             .padding(bottom = 12.dp)) {
 
+            MenuItem(Icons.Filled.Search, "Search messages…", colors.textPrimary) {
+                onSearch(); onDismiss()
+            }
             MenuItem(Icons.Filled.SystemUpdate, "Check for updates", colors.textPrimary) {
                 onCheckUpdates(); onDismiss()
             }

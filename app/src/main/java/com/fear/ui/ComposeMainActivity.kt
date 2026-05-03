@@ -33,6 +33,7 @@ import com.fear.ui.components.CallOverlay
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.PasswordPromptDialog
 import com.fear.ui.components.QrShowDialog
+import com.fear.ui.components.SearchDialog
 import com.fear.ui.components.UpdateDialog
 import com.fear.Common
 import com.fear.IdentityBackup
@@ -88,6 +89,7 @@ class ComposeMainActivity : ComponentActivity() {
                 // After a successful QR scan, hold the base64 payload until the
                 // user types the password to decrypt it.
                 var importQrPasswordOpen by remember { mutableStateOf<String?>(null) }
+                var searchOpen by remember { mutableStateOf(false) }
                 val context = androidx.compose.ui.platform.LocalContext.current
 
                 // ZXing camera scan launcher — returns the decoded QR text (null on cancel)
@@ -207,6 +209,14 @@ class ComposeMainActivity : ComponentActivity() {
                                 Toast.makeText(this@ComposeMainActivity,
                                     "Chat history cleared", Toast.LENGTH_SHORT).show()
                             },
+                            onSearch = { searchOpen = true },
+                        )
+                    }
+
+                    if (searchOpen) {
+                        SearchDialog(
+                            onSearch = { needle -> viewModel.searchMessages(needle) },
+                            onDismiss = { searchOpen = false },
                         )
                     }
 

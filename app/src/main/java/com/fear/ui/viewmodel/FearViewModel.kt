@@ -247,6 +247,12 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         loadHistoryForRoom(id)
     }
 
+    /** Suspend search across all rooms. Used by the search dialog. */
+    suspend fun searchMessages(needle: String): List<MessageEntity> {
+        if (needle.length < 2) return emptyList()
+        return dao.search(needle)
+    }
+
     /** Wipe persisted history for the currently active chat. */
     fun clearHistory() {
         val roomId = _uiState.value.activeChatId ?: return
