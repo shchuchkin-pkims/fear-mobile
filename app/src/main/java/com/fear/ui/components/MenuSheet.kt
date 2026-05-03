@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.QrCode
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -46,6 +47,7 @@ fun MenuSheet(
     onExportIdentity: () -> Unit,
     onImportIdentity: () -> Unit,
     onShowQr: () -> Unit,
+    onImportQr: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     val sheetState = rememberModalBottomSheetState()
@@ -73,6 +75,9 @@ fun MenuSheet(
             }
             MenuItem(Icons.Filled.QrCode, "Show identity as QR…", colors.textPrimary) {
                 onShowQr(); onDismiss()
+            }
+            MenuItem(Icons.Filled.QrCodeScanner, "Import identity from QR…", colors.textPrimary) {
+                onImportQr(); onDismiss()
             }
             MenuItem(
                 if (colors.isDark) Icons.Filled.LightMode else Icons.Filled.DarkMode,

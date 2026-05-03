@@ -85,7 +85,18 @@ class ComposeMainActivity : ComponentActivity() {
                 var qrPasswordOpen     by remember { mutableStateOf(false) }
                 var qrShowText         by remember { mutableStateOf<String?>(null) }
                 var pendingQrSaveText  by remember { mutableStateOf<String?>(null) }
+                // After a successful QR scan, hold the base64 payload until the
+                // user types the password to decrypt it.
+                var importQrPasswordOpen by remember { mutableStateOf<String?>(null) }
                 val context = androidx.compose.ui.platform.LocalContext.current
+
+                // ZXing camera scan launcher — returns the decoded QR text (null on cancel)
+                val qrScanLauncher = rememberLauncherForActivityResult(
+                    com.journeyapps.barcodescanner.ScanContract()
+                ) { result ->
+                    val text = result?.contents
+                    if (!text.isNullOrEmpty()) importQrPasswordOpen = text
+                }
 
                 // SAF: pick destination .png to save the QR bitmap
                 val qrPngSaveLauncher = rememberLauncherForActivityResult(
@@ -179,6 +190,18 @@ class ComposeMainActivity : ComponentActivity() {
                                 importOpenLauncher.launch(arrayOf("*/*"))
                             },
                             onShowQr = { qrPasswordOpen = true },
+                            onImportQr = {
+                                qrScanLauncher.launch(
+                                    com.journeyapps.barcodescanner.ScanOptions().apply {
+                                        setDesiredBarcodeFormats(
+                                            com.journeyapps.barcodescanner.ScanOptions.QR_CODE
+                                        )
+                                        setPrompt("Scan FEAR identity QR")
+                                        setBeepEnabled(false)
+                                        setOrientationLocked(false)
+                                    }
+                                )
+                            },
                         )
                     }
 
@@ -229,6 +252,21 @@ class ComposeMainActivity : ComponentActivity() {
                             importPasswordOpen = null
                             runImportIdentity(importUri, pw)
                             pw.fill(' ')
+                        }
+                    }
+
+                    // Import password prompt (after a successful QR scan)
+                    val importQrText = importQrPasswordOpen
+                    if (importQrText != null) {
+                        PasswordPromptDialog(
+                            title = "Import from QR",
+                            message = "Enter the password that was used to encrypt this QR.",
+                            confirm = false,
+                            onDismiss = { importQrPasswordOpen = null },
+                        ) { pw ->
+                            importQrPasswordOpen = null
+                            runImportIdentityFromBase64(importQrText, pw)
+                            pw.fill(' ')
                         }
                     }
 
@@ -517,6 +555,42 @@ class ComposeMainActivity : ComponentActivity() {
                     Toast.makeText(this@ComposeMainActivity,
                         "QR save failed: ${e.message}", Toast.LENGTH_LONG).show()
                 }
+            }
+        }
+    }
+
+    /**
+     * Import an identity from a QR scan result. The scanned text is the
+     * base64 encoding produced by the export flow; we decode it back into
+     * the binary .fbk blob and feed it through IdentityBackup.importFromBuffer.
+     */
+    private fun runImportIdentityFromBase64(base64: String, password: CharArray) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val bytes = try {
+                    android.util.Base64.decode(
+                        base64,
+                        android.util.Base64.DEFAULT or android.util.Base64.NO_WRAP
+                    )
+                } catch (e: Exception) {
+                    throw IllegalArgumentException("scanned QR is not a FEAR backup")
+                }
+                val identity = IdentityBackup.importFromBuffer(bytes, password)
+                writeIdentitySkPk(applicationContext, identity.sk, identity.pk)
+                identity.wipe()
+                runOnUiThread {
+                    Toast.makeText(this@ComposeMainActivity,
+                        "Identity restored from QR. Reconnect to apply.",
+                        Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Log.e("ComposeMainActivity", "QR import failed", e)
+                runOnUiThread {
+                    Toast.makeText(this@ComposeMainActivity,
+                        "QR import failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                password.fill(' ')
             }
         }
     }
