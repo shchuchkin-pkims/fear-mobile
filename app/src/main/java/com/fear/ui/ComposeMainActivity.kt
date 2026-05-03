@@ -82,8 +82,19 @@ class ComposeMainActivity : ComponentActivity() {
                 // Identity backup state
                 var exportPasswordOpen by remember { mutableStateOf(false) }
                 var importPasswordOpen by remember { mutableStateOf<Uri?>(null) }
-                var qrShowText by remember { mutableStateOf<String?>(null) }
+                var qrPasswordOpen     by remember { mutableStateOf(false) }
+                var qrShowText         by remember { mutableStateOf<String?>(null) }
+                var pendingQrSaveText  by remember { mutableStateOf<String?>(null) }
                 val context = androidx.compose.ui.platform.LocalContext.current
+
+                // SAF: pick destination .png to save the QR bitmap
+                val qrPngSaveLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.CreateDocument("image/png")
+                ) { uri: Uri? ->
+                    val text = pendingQrSaveText
+                    pendingQrSaveText = null
+                    if (uri != null && text != null) saveQrPng(uri, text)
+                }
 
                 // Silent auto-update check on first composition (delay 3s so the
                 // connect screen renders first). If a newer version is available,
@@ -167,7 +178,22 @@ class ComposeMainActivity : ComponentActivity() {
                             onImportIdentity = {
                                 importOpenLauncher.launch(arrayOf("*/*"))
                             },
+                            onShowQr = { qrPasswordOpen = true },
                         )
+                    }
+
+                    // Password prompt for QR-only flow (no file save)
+                    if (qrPasswordOpen) {
+                        PasswordPromptDialog(
+                            title = "Show identity QR",
+                            message = "Pick a password for the encrypted QR. The receiving device will need this same password to decrypt.",
+                            confirm = true,
+                            onDismiss = { qrPasswordOpen = false },
+                        ) { pw ->
+                            qrPasswordOpen = false
+                            runEncryptToQr(pw) { base64 -> qrShowText = base64 }
+                            pw.fill(' ')
+                        }
                     }
 
                     // Export password prompt (after user chose destination)
@@ -210,13 +236,17 @@ class ComposeMainActivity : ComponentActivity() {
                         AboutDialog(BuildConfig.VERSION_NAME) { aboutOpen = false }
                     }
 
-                    // QR display after successful identity export
+                    // QR display (after successful identity export OR via Show-QR menu)
                     val qrText = qrShowText
                     if (qrText != null) {
                         QrShowDialog(
                             title = "Identity backup QR",
                             caption = "Scan on another device → Import identity. The same password is required to decrypt.",
                             qrText = qrText,
+                            onSavePng = { text ->
+                                pendingQrSaveText = text
+                                qrPngSaveLauncher.launch("fear-identity-qr.png")
+                            },
                             onDismiss = { qrShowText = null },
                         )
                     }
@@ -421,6 +451,72 @@ class ComposeMainActivity : ComponentActivity() {
                 }
             } finally {
                 password.fill(' ')
+            }
+        }
+    }
+
+    /**
+     * Encrypt the live identity under `password` purely in memory and hand
+     * the base64-encoded blob back via `onQrPayload`. No file is written —
+     * used by the 'Show identity as QR' menu shortcut.
+     */
+    private fun runEncryptToQr(password: CharArray, onQrPayload: (String) -> Unit) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val im = IdentityManager(applicationContext)
+                if (!im.hasIdentity()) {
+                    runOnUiThread {
+                        Toast.makeText(this@ComposeMainActivity,
+                            "No identity to encode — connect to a room first",
+                            Toast.LENGTH_LONG).show()
+                    }
+                    return@launch
+                }
+                val pk = im.getPublicKey()!!
+                val sk = readIdentitySk(applicationContext) ?: return@launch
+                val blob = IdentityBackup.exportToBuffer(sk, pk, password)
+                sk.fill(0)
+                val base64 = android.util.Base64.encodeToString(
+                    blob, android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+                )
+                runOnUiThread { onQrPayload(base64) }
+            } catch (e: Exception) {
+                Log.e("ComposeMainActivity", "encrypt-to-QR failed", e)
+                runOnUiThread {
+                    Toast.makeText(this@ComposeMainActivity,
+                        "QR encode failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                password.fill(' ')
+            }
+        }
+    }
+
+    /**
+     * Render the QR for `qrText` to a PNG and write it to the SAF Uri the
+     * user picked. Re-encoding (rather than caching the bitmap) keeps the
+     * memory footprint small — a 1024x1024 ARGB bitmap is only alive for
+     * the duration of compress().
+     */
+    private fun saveQrPng(uri: Uri, qrText: String) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val bmp = com.fear.ui.components.renderQrBitmap(qrText)
+                contentResolver.openOutputStream(uri).use { out ->
+                    if (out == null) throw java.io.IOException("openOutputStream null")
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                }
+                bmp.recycle()
+                runOnUiThread {
+                    Toast.makeText(this@ComposeMainActivity,
+                        "QR saved", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Log.e("ComposeMainActivity", "saveQrPng failed", e)
+                runOnUiThread {
+                    Toast.makeText(this@ComposeMainActivity,
+                        "QR save failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }

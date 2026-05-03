@@ -4,13 +4,15 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
@@ -18,18 +20,19 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 
 /**
- * Renders `text` as a QR code Bitmap inside a Composable Image.
+ * Renders `text` as a QR code.
  *
- * The produced QR uses error-correction level M and no margin: any quiet zone
- * the user wants comes from `Modifier.padding(...)`. We render at a fixed
- * `pixelsPerSide` (default 512) — Compose will scale down to layout size, so
- * detail loss only happens if the dialog is huge on a tablet.
+ * The Image is forced square via `aspectRatio(1f)` so it always fills the
+ * available width while remaining a true 1:1 QR. We render a 1024x1024
+ * bitmap so the QR stays sharp even on tablets — Compose will scale down
+ * for layout. `FilterQuality.None` preserves crisp module edges (no
+ * bilinear smoothing turning black squares into grey blobs).
  */
 @Composable
 fun QrCodeView(
     text: String,
     modifier: Modifier = Modifier,
-    pixelsPerSide: Int = 512,
+    pixelsPerSide: Int = 1024,
 ) {
     val bitmap = remember(text, pixelsPerSide) {
         encodeQrBitmap(text, pixelsPerSide)
@@ -37,13 +40,13 @@ fun QrCodeView(
     Image(
         bitmap = bitmap.asImageBitmap(),
         contentDescription = "QR code",
+        contentScale = ContentScale.Fit,
+        filterQuality = FilterQuality.None,
         modifier = modifier
             .fillMaxWidth()
-            .height(with(androidx.compose.ui.platform.LocalDensity.current) {
-                pixelsPerSide.toDp()
-            })
+            .aspectRatio(1f)
             .background(androidx.compose.ui.graphics.Color.White)
-            .padding(12.dp),
+            .padding(8.dp),
     )
 }
 
@@ -63,3 +66,7 @@ private fun encodeQrBitmap(text: String, sidePx: Int): Bitmap {
     }
     return bmp
 }
+
+/** Same as encodeQrBitmap but exposed for callers that want to save the PNG. */
+fun renderQrBitmap(text: String, pixelsPerSide: Int = 1024): Bitmap =
+    encodeQrBitmap(text, pixelsPerSide)
