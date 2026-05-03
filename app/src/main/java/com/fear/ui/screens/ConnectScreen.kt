@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -59,15 +60,25 @@ private val ServerPresets = listOf(
     ServerOption("81.200.28.93 — Russia (Moscow)",         "81.200.28.93"),
 )
 
+/**
+ * Single-button connect screen.
+ *
+ * Display name is supplied via the OnboardingScreen + ProfileStore, so this
+ * screen only shows the bare connect action plus an identity card the user
+ * can tap to open their profile. Server/room/port live behind an Advanced
+ * disclosure.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectScreen(
     form: ConnectFormState,
+    displayName: String,
     isConnecting: Boolean,
     errorBanner: String?,
     onUpdate: (ConnectFormState) -> Unit,
     onConnect: () -> Unit,
     onDismissError: () -> Unit,
+    onOpenProfile: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     var serverDropdownOpen by remember { mutableStateOf(false) }
@@ -84,30 +95,36 @@ fun ConnectScreen(
             .padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text(
-            text = "Connect",
-            color = colors.textPrimary,
-            fontSize = 22.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        Text(
-            text = "Type your name and tap Connect. We'll join the room if it " +
-                    "exists, or create it if you're first.",
-            color = colors.textSecondary,
-            fontSize = 12.sp,
-        )
+        // ── Identity card ──────────────────────────────────────────
+        // Tap → opens profile editor. Replaces the old "Type your name" field.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(colors.surface)
+                .clickable(onClick = onOpenProfile)
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier.size(48.dp).clip(CircleShape)
+                    .background(colors.accent.copy(alpha = 0.18f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                val letter = displayName.firstOrNull()?.uppercase() ?: "?"
+                Text(letter, color = colors.accent, fontSize = 22.sp,
+                     fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.size(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(displayName.ifBlank { "Set your name" },
+                     color = colors.textPrimary, fontSize = 16.sp,
+                     fontWeight = FontWeight.SemiBold)
+                Text("Tap to edit profile", color = colors.textSecondary, fontSize = 11.sp)
+            }
+        }
 
-        // Name first — it's the only thing most users need to pick.
-        OutlinedTextField(
-            value = form.name,
-            onValueChange = { onUpdate(form.copy(name = it)) },
-            label = { Text("Your name") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-            colors = textFieldThemeColors(),
-        )
-
-        // Server dropdown
+        // Server preset dropdown — power-users can also type a custom host.
         Box {
             OutlinedTextField(
                 value = form.host,
@@ -163,7 +180,6 @@ fun ConnectScreen(
                 contentDescription = null,
                 tint = colors.textSecondary,
             )
-            Spacer(Modifier.height(0.dp))
             Text("Advanced", color = colors.textSecondary, fontSize = 13.sp,
                  modifier = Modifier.padding(start = 4.dp))
         }
@@ -222,7 +238,7 @@ fun ConnectScreen(
         Spacer(Modifier.height(4.dp))
         Button(
             onClick = onConnect,
-            enabled = !isConnecting,
+            enabled = !isConnecting && displayName.isNotBlank(),
             modifier = Modifier.fillMaxWidth().height(48.dp),
             colors = ButtonDefaults.buttonColors(containerColor = colors.accent, contentColor = Color.White),
             shape = RoundedCornerShape(12.dp),
@@ -233,7 +249,6 @@ fun ConnectScreen(
                     strokeWidth = 2.dp,
                     modifier = Modifier.size(20.dp),
                 )
-                Spacer(Modifier.height(0.dp))
                 Text("Connecting…", fontSize = 16.sp, fontWeight = FontWeight.Medium,
                      modifier = Modifier.padding(start = 12.dp))
             } else {

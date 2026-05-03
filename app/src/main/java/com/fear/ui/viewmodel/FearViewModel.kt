@@ -9,6 +9,7 @@ import com.fear.FearClient
 import com.fear.Message
 import com.fear.data.AppDatabase
 import com.fear.data.MessageEntity
+import com.fear.data.ProfileStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -27,8 +28,10 @@ private const val AUTO_JOIN_TIMEOUT_MS = 5000
 
 class FearViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    private val dao   = AppDatabase.get(app).messageDao()
+    private val prefs    = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val dao      = AppDatabase.get(app).messageDao()
+    val profile          = ProfileStore.get(app)
+    val profileState: kotlinx.coroutines.flow.StateFlow<com.fear.data.ProfileState> = profile.state
 
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
@@ -191,15 +194,27 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun connect() {
-        val f = _form.value
-        if (f.host.isBlank() || f.room.isBlank() || f.name.isBlank()) {
-            _uiState.update { it.copy(errorBanner = "Type your name first (and check server/room).") }
+        val f    = _form.value
+        // Display name now lives in ProfileStore. The form's `name` field is kept
+        // around for the legacy connect screen but is overridden by the profile
+        // value when present (it's always present after first-launch onboarding).
+        val name = profile.state.value.displayName.ifBlank { f.name }
+        if (f.host.isBlank() || f.room.isBlank() || name.isBlank()) {
+            _uiState.update { it.copy(errorBanner = "Set your display name first (Profile).") }
             return
         }
         if (f.mode == ConnectMode.MANUAL_KEY && f.key.isBlank()) {
             _uiState.update { it.copy(errorBanner = "Room key is required for manual mode.") }
             return
         }
+        // Sync form.name with the profile so existing downstream code (call
+        // managers, file transfers) keeps seeing the right sender name.
+        if (f.name != name) {
+            _form.update { it.copy(name = name) }
+        }
+        // First connect to this server marks it as registered locally; once
+        // Phase B-2 ships REGISTER_HANDLE this becomes a real server claim.
+        profile.markRegistered(f.host)
 
         _uiState.update { it.copy(isConnecting = true, errorBanner = null) }
 

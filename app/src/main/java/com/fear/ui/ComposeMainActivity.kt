@@ -33,8 +33,11 @@ import com.fear.ui.components.CallOverlay
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.PasswordPromptDialog
 import com.fear.ui.components.QrShowDialog
+import com.fear.ui.components.RegisterServerDialog
 import com.fear.ui.components.SearchDialog
 import com.fear.ui.components.UpdateDialog
+import com.fear.ui.screens.OnboardingScreen
+import com.fear.ui.screens.ProfileScreen
 import com.fear.Common
 import com.fear.IdentityBackup
 import kotlinx.coroutines.launch
@@ -90,6 +93,11 @@ class ComposeMainActivity : ComponentActivity() {
                 // user types the password to decrypt it.
                 var importQrPasswordOpen by remember { mutableStateOf<String?>(null) }
                 var searchOpen by remember { mutableStateOf(false) }
+                var profileOpen by remember { mutableStateOf(false) }
+                /** When non-null, shows the "first time on this server" prompt
+                 *  carrying the host the user is trying to connect to. */
+                var pendingRegisterHost by remember { mutableStateOf<String?>(null) }
+                val profileState by viewModel.profileState.collectAsState()
                 val context = androidx.compose.ui.platform.LocalContext.current
 
                 // ZXing camera scan launcher — returns the decoded QR text (null on cancel)
@@ -151,15 +159,65 @@ class ComposeMainActivity : ComponentActivity() {
                     if (uri != null) importPasswordOpen = uri
                 }
 
-                if (!state.isConnected) {
+                if (profileState.displayName.isBlank()) {
+                    // First-launch onboarding: pick a display name and that's it.
+                    OnboardingScreen(initialName = form.name) { name ->
+                        viewModel.profile.setDisplayName(name)
+                        viewModel.updateForm { it.copy(name = name) }
+                    }
+                } else if (profileOpen) {
+                    val im = remember { com.fear.IdentityManager(applicationContext) }
+                    val pk = im.getPublicKey()
+                    val handles = profileState.registeredServers
+                        .map { "@${profileState.displayName}@$it" }
+                    ProfileScreen(
+                        displayName = profileState.displayName,
+                        setDisplayName = { viewModel.profile.setDisplayName(it) },
+                        handles = handles,
+                        fpshort = pk?.let { im.fpshort(it) },
+                        fullFingerprint = pk?.let { im.fingerprint(it) },
+                        onBack = { profileOpen = false },
+                        onExportIdentity = {
+                            profileOpen = false
+                            exportSaveLauncher.launch("fear-identity-backup.fbk")
+                        },
+                        onShowQr = {
+                            profileOpen = false
+                            qrPasswordOpen = true
+                        },
+                    )
+                } else if (!state.isConnected) {
                     ConnectScreen(
                         form = form,
+                        displayName = profileState.displayName,
                         isConnecting = state.isConnecting,
                         errorBanner = state.errorBanner,
                         onUpdate = { viewModel.updateForm { _ -> it } },
-                        onConnect = viewModel::connect,
+                        onConnect = {
+                            // First time on this server → require register-confirm.
+                            if (!viewModel.profile.isRegistered(form.host)) {
+                                pendingRegisterHost = form.host
+                            } else {
+                                viewModel.connect()
+                            }
+                        },
                         onDismissError = viewModel::dismissError,
+                        onOpenProfile = { profileOpen = true },
                     )
+
+                    // Register-on-this-server prompt (Phase B-1: local-only flag).
+                    val regHost = pendingRegisterHost
+                    if (regHost != null) {
+                        RegisterServerDialog(
+                            handlePreview = "@${profileState.displayName}@$regHost",
+                            server = regHost,
+                            onConfirm = {
+                                pendingRegisterHost = null
+                                viewModel.connect()  // markRegistered happens inside
+                            },
+                            onCancel = { pendingRegisterHost = null },
+                        )
+                    }
                 } else {
                     ChatScreen(
                         state = state,
@@ -210,6 +268,7 @@ class ComposeMainActivity : ComponentActivity() {
                                     "Chat history cleared", Toast.LENGTH_SHORT).show()
                             },
                             onSearch = { searchOpen = true },
+                            onProfile = { profileOpen = true },
                         )
                     }
 
