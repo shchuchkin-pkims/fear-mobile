@@ -10,6 +10,8 @@ import com.fear.HandleProtocol
 import com.fear.IdentityManager
 import com.fear.Message
 import com.fear.data.AppDatabase
+import com.fear.data.ContactEntity
+import com.fear.data.ContactsRepository
 import com.fear.data.MessageEntity
 import com.fear.data.ProfileStore
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,8 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     private val dao      = AppDatabase.get(app).messageDao()
     val profile          = ProfileStore.get(app)
     val profileState: kotlinx.coroutines.flow.StateFlow<com.fear.data.ProfileState> = profile.state
+    val contactsRepo: ContactsRepository = ContactsRepository.get(app)
+    val contactsFlow: kotlinx.coroutines.flow.Flow<List<ContactEntity>> = contactsRepo.observeAll()
 
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
@@ -72,6 +76,12 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             // Load persisted history for this room (Phase A §9a) — fire and
             // forget; the UI re-renders when state updates.
             loadHistoryForRoom(f.room)
+            // Phase B-3: pull the encrypted contact blob from the server we
+            // just connected to, so a new device picks up an existing list.
+            viewModelScope.launch(Dispatchers.IO) {
+                contactsRepo.pullFromServer(
+                    ContactsRepository.ServerEndpoint(f.host, f.port))
+            }
         }
 
         override fun onDisconnected() {
@@ -309,6 +319,62 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 is HandleProtocol.Result.Network ->
                     onResult("Cannot reach $host:$port — ${rc.cause.message ?: "network error"}")
             }
+        }
+    }
+
+    /**
+     * Resolve `nickname@server` against the relay (LOOKUP_HANDLE), persist
+     * the result as a contact, and schedule a push of the updated blob.
+     */
+    fun addContactByHandle(
+        nickname: String,
+        serverHost: String,
+        serverPort: Int,
+        displayName: String? = null,
+        onResult: (String?) -> Unit,                  // null on success, else error
+    ) {
+        viewModelScope.launch {
+            val rc = try {
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    com.fear.HandleProtocol.lookupHandle(serverHost, serverPort, nickname.trim())
+                }
+            } catch (e: Exception) {
+                com.fear.HandleProtocol.LookupResult.Network(e)
+            }
+            when (rc) {
+                is com.fear.HandleProtocol.LookupResult.Found -> {
+                    val name = displayName?.takeIf { it.isNotBlank() } ?: nickname
+                    val pkB64 = android.util.Base64.encodeToString(
+                        rc.pk,
+                        android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+                    )
+                    contactsRepo.upsert(
+                        ContactEntity(
+                            identityPkB64 = pkB64,
+                            displayName   = name,
+                            handle        = nickname.trim(),
+                            server        = serverHost,
+                            addedAt       = System.currentTimeMillis(),
+                            verified      = false,
+                        ),
+                        ContactsRepository.ServerEndpoint(serverHost, serverPort),
+                    )
+                    onResult(null)
+                }
+                com.fear.HandleProtocol.LookupResult.NotFound ->
+                    onResult("Nickname '$nickname' not found on $serverHost.")
+                is com.fear.HandleProtocol.LookupResult.ServerError ->
+                    onResult("Server: ${rc.reason}")
+                is com.fear.HandleProtocol.LookupResult.Network ->
+                    onResult("Cannot reach $serverHost: ${rc.cause.message ?: "network"}")
+            }
+        }
+    }
+
+    fun removeContact(pkB64: String, server: String?, port: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val ep = if (server != null) ContactsRepository.ServerEndpoint(server, port) else null
+            contactsRepo.delete(pkB64, ep)
         }
     }
 

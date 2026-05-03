@@ -35,8 +35,10 @@ import com.fear.ui.components.PasswordPromptDialog
 import com.fear.ui.components.QrShowDialog
 import com.fear.ui.components.SearchDialog
 import com.fear.ui.components.UpdateDialog
+import com.fear.ui.screens.ContactsScreen
 import com.fear.ui.screens.OnboardingScreen
 import com.fear.ui.screens.ProfileScreen
+import com.fear.ui.components.AddContactDialog
 import com.fear.Common
 import com.fear.IdentityBackup
 import kotlinx.coroutines.launch
@@ -93,7 +95,10 @@ class ComposeMainActivity : ComponentActivity() {
                 var importQrPasswordOpen by remember { mutableStateOf<String?>(null) }
                 var searchOpen by remember { mutableStateOf(false) }
                 var profileOpen by remember { mutableStateOf(false) }
+                var contactsOpen by remember { mutableStateOf(false) }
+                var addContactOpen by remember { mutableStateOf(false) }
                 val profileState by viewModel.profileState.collectAsState()
+                val contacts by viewModel.contactsFlow.collectAsState(initial = emptyList())
                 val context = androidx.compose.ui.platform.LocalContext.current
 
                 // ZXing camera scan launcher — returns the decoded QR text (null on cancel)
@@ -160,6 +165,34 @@ class ComposeMainActivity : ComponentActivity() {
                     OnboardingScreen(initialName = form.name) { name ->
                         viewModel.profile.setDisplayName(name)
                         viewModel.updateForm { it.copy(name = name) }
+                    }
+                } else if (contactsOpen) {
+                    ContactsScreen(
+                        contacts = contacts,
+                        onBack   = { contactsOpen = false },
+                        onAdd    = { addContactOpen = true },
+                        onRemove = { c ->
+                            viewModel.removeContact(c.identityPkB64,
+                                form.host, form.port)
+                        },
+                    )
+                    if (addContactOpen) {
+                        AddContactDialog(
+                            defaultServer = form.host,
+                            onDismiss = { addContactOpen = false },
+                            onSubmit  = { nick, srv, name ->
+                                viewModel.addContactByHandle(nick, srv, form.port, name) { err ->
+                                    addContactOpen = false
+                                    if (err != null) {
+                                        Toast.makeText(this@ComposeMainActivity,
+                                            err, Toast.LENGTH_LONG).show()
+                                    } else {
+                                        Toast.makeText(this@ComposeMainActivity,
+                                            "Added $nick@$srv", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                        )
                     }
                 } else if (profileOpen) {
                     val im = remember { com.fear.IdentityManager(applicationContext) }
@@ -267,6 +300,7 @@ class ComposeMainActivity : ComponentActivity() {
                             },
                             onSearch = { searchOpen = true },
                             onProfile = { profileOpen = true },
+                            onContacts = { contactsOpen = true },
                         )
                     }
 

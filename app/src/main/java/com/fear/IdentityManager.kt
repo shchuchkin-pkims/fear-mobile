@@ -117,6 +117,27 @@ class IdentityManager(private val context: Context) {
     }
 
     /**
+     * Derive a 32-byte symmetric key from `identity_sk` for the given
+     * application context. Used by ContactsCipher (Phase B-3) to encrypt
+     * the contact-list blob without ever exposing identity_sk to the
+     * caller.
+     *
+     *   K = BLAKE2b(input=ctx, key=identity_sk, length=32)
+     *
+     * Stable across devices that share the same identity (e.g. phone +
+     * desktop after `Import identity`), since identity_sk is the same
+     * — that's what makes the encrypted blob portable.
+     */
+    fun deriveSymmetricKey(ctx: String, length: Int = 32): ByteArray? {
+        val sk = secretKey ?: return null
+        val ctxBytes = ctx.toByteArray(Charsets.US_ASCII)
+        val out = ByteArray(length)
+        ls.cryptoGenericHash(out, length,
+                              ctxBytes, ctxBytes.size.toLong(), sk, sk.size)
+        return out
+    }
+
+    /**
      * Build the payload for MSG_TYPE_SIGNED_TEXT.
      * Format: [pk(32)][sig(64)][text]
      */

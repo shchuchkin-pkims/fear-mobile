@@ -94,6 +94,11 @@ object Common {
     const val MSG_TYPE_LOOKUP_HANDLE:   Byte = 21
     const val MSG_TYPE_HANDLE_RESULT:   Byte = 22
 
+    // Per-user encrypted blob storage (Phase B-3). See server_db.h.
+    const val MSG_TYPE_BLOB_PUT:        Byte = 23
+    const val MSG_TYPE_BLOB_GET:        Byte = 24
+    const val MSG_TYPE_BLOB_RESULT:     Byte = 25
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32

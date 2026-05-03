@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PeopleAlt
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -54,6 +55,7 @@ fun MenuSheet(
     onClearHistory: () -> Unit,
     onSearch: () -> Unit,
     onProfile: () -> Unit,
+    onContacts: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     val sheetState = rememberModalBottomSheetState()
@@ -69,6 +71,9 @@ fun MenuSheet(
 
             MenuItem(Icons.Filled.Person, "My profile", colors.textPrimary) {
                 onProfile(); onDismiss()
+            }
+            MenuItem(Icons.Filled.PeopleAlt, "Contacts", colors.textPrimary) {
+                onContacts(); onDismiss()
             }
             MenuItem(Icons.Filled.Search, "Search messages…", colors.textPrimary) {
                 onSearch(); onDismiss()
