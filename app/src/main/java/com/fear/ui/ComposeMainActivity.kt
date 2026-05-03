@@ -230,7 +230,6 @@ class ComposeMainActivity : ComponentActivity() {
                         ) { pw ->
                             qrPasswordOpen = false
                             runEncryptToQr(pw) { base64 -> qrShowText = base64 }
-                            pw.fill(' ')
                         }
                     }
 
@@ -250,7 +249,6 @@ class ComposeMainActivity : ComponentActivity() {
                             pendingExportUri = null
                             if (uri != null) {
                                 runExportIdentity(uri, pw) { base64Blob -> qrShowText = base64Blob }
-                                pw.fill(' ')
                             }
                         }
                     }
@@ -266,7 +264,6 @@ class ComposeMainActivity : ComponentActivity() {
                         ) { pw ->
                             importPasswordOpen = null
                             runImportIdentity(importUri, pw)
-                            pw.fill(' ')
                         }
                     }
 
@@ -281,7 +278,6 @@ class ComposeMainActivity : ComponentActivity() {
                         ) { pw ->
                             importQrPasswordOpen = null
                             runImportIdentityFromBase64(importQrText, pw)
-                            pw.fill(' ')
                         }
                     }
 

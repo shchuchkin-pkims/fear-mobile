@@ -77,11 +77,6 @@ object IdentityBackup {
         val nonce = ByteArray(SecretBox.NONCEBYTES)        // 24
         ls.sodium.randombytes_buf(nonce, nonce.size)
 
-        android.util.Log.d("IdentityBackup",
-            "export: plaintextLen=${plaintext.size} pwLen=${password.size}" +
-            " saltHex=${salt.toHex()} nonceHex=${nonce.toHex()}" +
-            " keyFp=${key.copyOfRange(0,4).toHex()}")
-
         val cipher = ByteArray(plaintext.size + SecretBox.MACBYTES)
         if (ls.sodium.crypto_secretbox_easy(cipher, plaintext, plaintext.size.toLong(), nonce, key) != 0) {
             wipe(key); wipe(plaintext)
@@ -122,21 +117,12 @@ object IdentityBackup {
         val nonce = buf.copyOfRange(38, 62)
         val cipher = buf.copyOfRange(HEADER_LEN, buf.size)
 
-        android.util.Log.d("IdentityBackup", "import: blobSize=${buf.size} cipherLen=${cipher.size}" +
-                " opslimit=$opslimit memlimit=$memlimit pwLen=${password.size}" +
-                " saltHex=${salt.toHex()} nonceHex=${nonce.toHex()}")
-
         if (memlimit <= 0 || memlimit > MEMLIMIT_CAP || opslimit <= 0 || opslimit > OPSLIMIT_CAP) {
             throw IllegalArgumentException("KDF parameters out of safe range")
         }
 
         val key = ByteArray(SecretBox.KEYBYTES)
         derivePasswordKey(password, salt, opslimit, memlimit, key)
-
-        // Log only the first 4 bytes of the derived key as a fingerprint —
-        // useful for cross-device debugging without leaking the full key.
-        android.util.Log.d("IdentityBackup",
-            "import: derived key fingerprint=${key.copyOfRange(0,4).toHex()}")
 
         val plaintext = ByteArray(cipher.size - SecretBox.MACBYTES)
         if (ls.sodium.crypto_secretbox_open_easy(plaintext, cipher, cipher.size.toLong(), nonce, key) != 0) {
@@ -186,13 +172,15 @@ object IdentityBackup {
         // avoid Java's String pool retaining the password.
         val pwBytes = charsToUtf8(password)
         try {
+            // alg=2 hardcoded (crypto_pwhash_ALG_ARGON2ID13) — avoids any
+            // chance the Lazysodium enum mis-resolves across versions.
             val rc = ls.sodium.crypto_pwhash(
                 outKey, outKey.size.toLong(),
                 pwBytes, pwBytes.size.toLong(),
                 salt,
                 opslimit,
                 NativeLong(memlimit),
-                PwHash.Alg.PWHASH_ALG_ARGON2ID13.value,
+                2,    // crypto_pwhash_ALG_ARGON2ID13
             )
             if (rc != 0) throw IllegalStateException("crypto_pwhash failed (insufficient memory?)")
         } finally {
@@ -219,7 +207,4 @@ object IdentityBackup {
     private fun wipe(b: ByteArray) {
         for (i in b.indices) b[i] = 0
     }
-
-    private fun ByteArray.toHex(): String =
-        joinToString("") { "%02x".format(it) }
 }
