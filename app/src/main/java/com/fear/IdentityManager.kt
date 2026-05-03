@@ -1,23 +1,26 @@
 package com.fear
 
 import android.content.Context
-import android.util.Base64
+import android.util.Log
+import androidx.security.crypto.EncryptedFile
+import androidx.security.crypto.MasterKey
 import com.goterl.lazysodium.LazySodiumAndroid
 import com.goterl.lazysodium.SodiumAndroid
 import com.goterl.lazysodium.interfaces.GenericHash
 import com.goterl.lazysodium.interfaces.Sign
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
  * Ed25519 identity manager for FEAR messenger.
- * Compatible with desktop identity.c implementation.
+ * Compatible with desktop identity.c on the wire (same PK/SK format),
+ * but on Android disk both `identity` and `known_keys` are wrapped by
+ * `EncryptedFile` (Android Keystore-backed AES-GCM, see Phase 0 in
+ * doc/architecture-decisions.md).
  *
- * Key storage format (matching desktop):
- *   PK:<base64url_no_padding>
- *   SK:<base64url_no_padding>
- *
- * Known keys format:
- *   name\tpk_base64\tverified_flag
+ * Logical record format (after decryption) matches desktop:
+ *   identity:    PK:<base64url>\nSK:<base64url>\n
+ *   known_keys:  name\tpk_base64\tverified_flag\n  (one per line)
  */
 class IdentityManager(private val context: Context) {
 
@@ -36,7 +39,14 @@ class IdentityManager(private val context: Context) {
     private val identityFile: File get() = File(fearDir, "identity")
     private val knownKeysFile: File get() = File(fearDir, "known_keys")
 
+    private val masterKey: MasterKey by lazy {
+        MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+    }
+
     init {
+        migratePlaintextIfNeeded()
         loadIdentity()
     }
 
@@ -141,8 +151,8 @@ class IdentityManager(private val context: Context) {
 
         return when {
             existing == null -> {
-                // First time seeing this peer — trust on first use
-                saveKnownKey(name, pk, false)
+                val updated = known + KnownKey(name, pk, false)
+                saveAllKnownKeys(updated)
                 "new"
             }
             existing.pk.contentEquals(pk) -> if (existing.verified) "verified" else "trusted"
@@ -151,9 +161,9 @@ class IdentityManager(private val context: Context) {
     }
 
     fun loadKnownKeys(): List<KnownKey> {
-        if (!knownKeysFile.exists()) return emptyList()
-
-        return knownKeysFile.readLines().mapNotNull { line ->
+        val text = readEncryptedText(knownKeysFile) ?: return emptyList()
+        return text.lineSequence().mapNotNull { line ->
+            if (line.isBlank()) return@mapNotNull null
             val parts = line.split('\t')
             if (parts.size >= 2) {
                 val name = parts[0]
@@ -163,7 +173,7 @@ class IdentityManager(private val context: Context) {
                     KnownKey(name, pkBytes, verified)
                 } else null
             } else null
-        }
+        }.toList()
     }
 
     /**
@@ -187,53 +197,163 @@ class IdentityManager(private val context: Context) {
         saveAllKnownKeys(keys)
     }
 
-    private fun saveKnownKey(name: String, pk: ByteArray, verified: Boolean) {
-        val line = "$name\t${Common.base64Encode(pk)}\t${if (verified) "1" else "0"}\n"
-        knownKeysFile.appendText(line)
-    }
-
     private fun saveAllKnownKeys(keys: List<KnownKey>) {
         val sb = StringBuilder()
         for (key in keys) {
             sb.append("${key.name}\t${Common.base64Encode(key.pk)}\t${if (key.verified) "1" else "0"}\n")
         }
-        knownKeysFile.writeText(sb.toString())
+        writeEncryptedText(knownKeysFile, sb.toString())
     }
 
-    // --- File I/O ---
+    // --- Encrypted file I/O ---
+
+    private fun encryptedFile(file: File): EncryptedFile = EncryptedFile.Builder(
+        context,
+        file,
+        masterKey,
+        EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB,
+    ).build()
+
+    /** Returns decrypted text or null if file does not exist / cannot be read. */
+    private fun readEncryptedText(file: File): String? {
+        if (!file.exists()) return null
+        return try {
+            encryptedFile(file).openFileInput().use { input ->
+                val baos = ByteArrayOutputStream()
+                val buf = ByteArray(4096)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    baos.write(buf, 0, n)
+                }
+                baos.toByteArray().toString(Charsets.UTF_8)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to read encrypted ${file.name}: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Atomically replace contents of `file` with encrypted `text`.
+     * EncryptedFile cannot overwrite — write to .tmp, then rename.
+     */
+    private fun writeEncryptedText(file: File, text: String): Boolean {
+        return try {
+            val tmp = File(file.parentFile, "${file.name}.tmp")
+            if (tmp.exists()) tmp.delete()
+            encryptedFile(tmp).openFileOutput().use { out ->
+                out.write(text.toByteArray(Charsets.UTF_8))
+            }
+            // Atomic replace
+            if (file.exists()) file.delete()
+            tmp.renameTo(file)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write encrypted ${file.name}: ${e.message}")
+            false
+        }
+    }
+
+    // --- Identity load/save ---
 
     private fun loadIdentity() {
-        if (!identityFile.exists()) return
-
-        try {
-            val lines = identityFile.readLines()
-            var pk: ByteArray? = null
-            var sk: ByteArray? = null
-
-            for (line in lines) {
-                when {
-                    line.startsWith("PK:") -> pk = Common.base64Decode(line.substring(3))
-                    line.startsWith("SK:") -> sk = Common.base64Decode(line.substring(3))
-                }
+        val text = readEncryptedText(identityFile) ?: return
+        var pk: ByteArray? = null
+        var sk: ByteArray? = null
+        for (line in text.lineSequence()) {
+            when {
+                line.startsWith("PK:") -> pk = Common.base64Decode(line.substring(3))
+                line.startsWith("SK:") -> sk = Common.base64Decode(line.substring(3))
             }
-
-            if (pk != null && pk.size == Common.IDENTITY_PK_BYTES &&
-                sk != null && sk.size == Common.IDENTITY_SK_BYTES) {
-                publicKey = pk
-                secretKey = sk
-            }
-        } catch (_: Exception) {}
+        }
+        if (pk != null && pk.size == Common.IDENTITY_PK_BYTES &&
+            sk != null && sk.size == Common.IDENTITY_SK_BYTES) {
+            publicKey = pk
+            secretKey = sk
+        }
     }
 
     private fun saveIdentity(): Boolean {
         val pk = publicKey ?: return false
         val sk = secretKey ?: return false
+        val body = "PK:${Common.base64Encode(pk)}\nSK:${Common.base64Encode(sk)}\n"
+        return writeEncryptedText(identityFile, body)
+    }
 
-        return try {
-            identityFile.writeText("PK:${Common.base64Encode(pk)}\nSK:${Common.base64Encode(sk)}\n")
-            true
+    /**
+     * Migrate legacy plaintext `identity` / `known_keys` (written by versions
+     * <= 0.5.0) to EncryptedFile form. Best effort: if the encrypted file
+     * already exists we leave the legacy untouched (shouldn't happen, but
+     * harmless). Plaintext is wiped and deleted after successful migration.
+     */
+    private fun migratePlaintextIfNeeded() {
+        migrateOnePlaintextFile(identityFile)
+        migrateOnePlaintextFile(knownKeysFile)
+    }
+
+    private fun migrateOnePlaintextFile(file: File) {
+        if (!file.exists()) return
+
+        // Heuristic: an EncryptedFile starts with the Tink keyset header,
+        // never with "PK:" or "<name>\t<base64>". Try to read as plaintext
+        // first; if it parses as our legacy text, treat as legacy.
+        val raw = try {
+            file.readBytes()
         } catch (_: Exception) {
-            false
+            return
         }
+
+        // Tink streaming AEAD writes a 1-byte version header, but the bytes
+        // are non-printable. Plaintext identity always starts with "PK:".
+        val isLegacyIdentity = file.name == "identity" &&
+            raw.size > 3 && raw[0] == 'P'.code.toByte() && raw[1] == 'K'.code.toByte() && raw[2] == ':'.code.toByte()
+
+        // Plaintext known_keys lines look like name\t<base64> — at least one tab in first 256 bytes,
+        // and all bytes printable. EncryptedFile contents are mostly non-printable.
+        val isLegacyKnownKeys = file.name == "known_keys" && looksLikePlaintextKnownKeys(raw)
+
+        if (!isLegacyIdentity && !isLegacyKnownKeys) return
+
+        val asString = try { raw.toString(Charsets.UTF_8) } catch (_: Exception) { return }
+
+        // Move legacy file aside so writeEncryptedText can create new one at the same path
+        val backup = File(file.parentFile, "${file.name}.legacy")
+        if (backup.exists()) backup.delete()
+        if (!file.renameTo(backup)) {
+            Log.w(TAG, "Migration: could not rename ${file.name} to .legacy — aborting")
+            return
+        }
+
+        val ok = writeEncryptedText(file, asString)
+        if (ok) {
+            // Best effort wipe of plaintext copy
+            try {
+                val len = backup.length().toInt().coerceAtMost(64 * 1024)
+                if (len > 0) backup.outputStream().use { it.write(ByteArray(len)) }
+            } catch (_: Exception) {}
+            backup.delete()
+            Log.i(TAG, "Migrated ${file.name} to EncryptedFile")
+        } else {
+            // Restore on failure so user doesn't lose identity
+            backup.renameTo(file)
+            Log.e(TAG, "Failed to encrypt ${file.name} — restored from .legacy")
+        }
+    }
+
+    private fun looksLikePlaintextKnownKeys(raw: ByteArray): Boolean {
+        if (raw.isEmpty()) return false
+        val sample = raw.copyOfRange(0, raw.size.coerceAtMost(256))
+        var sawTab = false
+        for (b in sample) {
+            val v = b.toInt() and 0xFF
+            if (v == 0x09) sawTab = true
+            // printable ASCII or LF — anything else → not plaintext
+            if (v != 0x09 && v != 0x0A && (v < 0x20 || v > 0x7E)) return false
+        }
+        return sawTab
+    }
+
+    companion object {
+        private const val TAG = "FearIdentity"
     }
 }

@@ -89,6 +89,9 @@ dependencies {
     implementation("com.goterl:lazysodium-android:5.1.0@aar")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
+    // EncryptedFile for at-rest encryption of identity_sk (Phase 0 security baseline)
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // CameraX for video calls
     implementation("androidx.camera:camera-core:1.3.4")
     implementation("androidx.camera:camera-camera2:1.3.4")

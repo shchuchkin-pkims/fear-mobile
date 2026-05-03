@@ -24,6 +24,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.lifecycle.lifecycleScope
 import com.fear.AppUpdater
 import com.fear.BuildConfig
+import com.fear.IdentityManager
 import kotlinx.coroutines.delay
 import com.fear.TrustedKeysActivity
 import com.fear.VideoCallActivity
@@ -46,6 +47,11 @@ class ComposeMainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        // Eagerly construct IdentityManager so its init block runs the
+        // plaintext-to-EncryptedFile migration before user interacts.
+        // Cheap: ~ms when no migration is needed, ~tens of ms otherwise.
+        IdentityManager(applicationContext)
 
         setContent {
             // App-wide theme override (null = follow system, true/false = forced).
