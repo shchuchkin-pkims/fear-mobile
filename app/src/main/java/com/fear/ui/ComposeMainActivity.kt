@@ -32,6 +32,7 @@ import com.fear.ui.components.AboutDialog
 import com.fear.ui.components.CallOverlay
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.PasswordPromptDialog
+import com.fear.ui.components.QrShowDialog
 import com.fear.ui.components.UpdateDialog
 import com.fear.Common
 import com.fear.IdentityBackup
@@ -81,6 +82,7 @@ class ComposeMainActivity : ComponentActivity() {
                 // Identity backup state
                 var exportPasswordOpen by remember { mutableStateOf(false) }
                 var importPasswordOpen by remember { mutableStateOf<Uri?>(null) }
+                var qrShowText by remember { mutableStateOf<String?>(null) }
                 val context = androidx.compose.ui.platform.LocalContext.current
 
                 // Silent auto-update check on first composition (delay 3s so the
@@ -183,7 +185,7 @@ class ComposeMainActivity : ComponentActivity() {
                             exportPasswordOpen = false
                             pendingExportUri = null
                             if (uri != null) {
-                                runExportIdentity(uri, pw)
+                                runExportIdentity(uri, pw) { base64Blob -> qrShowText = base64Blob }
                                 pw.fill(' ')
                             }
                         }
@@ -206,6 +208,17 @@ class ComposeMainActivity : ComponentActivity() {
 
                     if (aboutOpen) {
                         AboutDialog(BuildConfig.VERSION_NAME) { aboutOpen = false }
+                    }
+
+                    // QR display after successful identity export
+                    val qrText = qrShowText
+                    if (qrText != null) {
+                        QrShowDialog(
+                            title = "Identity backup QR",
+                            caption = "Scan on another device → Import identity. The same password is required to decrypt.",
+                            qrText = qrText,
+                            onDismiss = { qrShowText = null },
+                        )
                     }
 
                     // Update available dialog (download + install)
@@ -357,11 +370,15 @@ class ComposeMainActivity : ComponentActivity() {
     }
 
     /**
-     * Encrypt the live identity (loaded by IdentityManager from filesDir) under
-     * `password` and stream the .fbk bytes into the SAF destination Uri. Runs
-     * argon2id on a worker thread to keep the UI responsive.
+     * Encrypt the live identity under `password` and stream the .fbk bytes
+     * into the SAF destination Uri. Runs argon2id on a worker thread.
+     *
+     * On success, calls `onQrPayload` with the base64-encoded backup blob so
+     * the caller can offer scan-to-restore via a QR dialog. Argon2id is a few
+     * hundred ms — running it once and reusing the bytes keeps UX snappy.
      */
-    private fun runExportIdentity(uri: Uri, password: CharArray) {
+    private fun runExportIdentity(uri: Uri, password: CharArray,
+                                  onQrPayload: (String) -> Unit) {
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val im = IdentityManager(applicationContext)
@@ -374,8 +391,6 @@ class ComposeMainActivity : ComponentActivity() {
                     return@launch
                 }
                 val pk = im.getPublicKey()!!
-                // identity_sk is not directly exposed; reconstruct via reflection-free path:
-                // ed25519 sk = seed||pk, recoverable from sign() but we need raw sk.
                 val sk = readIdentitySk(applicationContext)
                 if (sk == null) {
                     runOnUiThread {
@@ -390,9 +405,13 @@ class ComposeMainActivity : ComponentActivity() {
                     if (out == null) throw java.io.IOException("openOutputStream returned null")
                     out.write(blob)
                 }
+                val base64 = android.util.Base64.encodeToString(
+                    blob, android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+                )
                 runOnUiThread {
                     Toast.makeText(this@ComposeMainActivity,
                         "Identity exported (${blob.size} bytes)", Toast.LENGTH_LONG).show()
+                    onQrPayload(base64)
                 }
             } catch (e: Exception) {
                 Log.e("ComposeMainActivity", "export failed", e)

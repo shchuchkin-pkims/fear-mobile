@@ -92,6 +92,10 @@ dependencies {
     // EncryptedFile for at-rest encryption of identity_sk (Phase 0 security baseline)
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // ZXing for QR code generation (identity backup) and scanning (import)
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0") { isTransitive = false }
+
     // CameraX for video calls
     implementation("androidx.camera:camera-core:1.3.4")
     implementation("androidx.camera:camera-camera2:1.3.4")
