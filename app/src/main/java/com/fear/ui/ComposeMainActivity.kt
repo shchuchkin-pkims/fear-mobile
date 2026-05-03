@@ -53,8 +53,16 @@ class ComposeMainActivity : ComponentActivity() {
 
         // Eagerly construct IdentityManager so its init block runs the
         // plaintext-to-EncryptedFile migration before user interacts.
-        // Cheap: ~ms when no migration is needed, ~tens of ms otherwise.
-        IdentityManager(applicationContext)
+        // If no identity exists yet (fresh install), generate one now so
+        // backup/export and the upcoming '@user@server' UX both work
+        // before the user has connected to any room.
+        val im = IdentityManager(applicationContext)
+        if (!im.hasIdentity()) {
+            val ok = im.generateIdentity()
+            Log.i("FearIdentity", "Eager generateIdentity: ok=$ok hasIdentity=${im.hasIdentity()}")
+        } else {
+            Log.i("FearIdentity", "Eager init: identity already present")
+        }
 
         setContent {
             // App-wide theme override (null = follow system, true/false = forced).
@@ -454,6 +462,9 @@ class ComposeMainActivity : ComponentActivity() {
     /**
      * Replace the live identity file (EncryptedFile-wrapped) with imported sk/pk.
      * IdentityManager will pick up the new keys on its next construction.
+     *
+     * Writes directly to the target path (no tmp+rename) — see the same note
+     * in IdentityManager.writeEncryptedText about EncryptedFile keyset binding.
      */
     private fun writeIdentitySkPk(ctx: android.content.Context, sk: ByteArray, pk: ByteArray) {
         val masterKey = androidx.security.crypto.MasterKey.Builder(ctx)
@@ -461,20 +472,18 @@ class ComposeMainActivity : ComponentActivity() {
             .build()
         val fearDir = File(ctx.filesDir, ".fear").apply { mkdirs() }
         val target = File(fearDir, "identity")
-        val tmp = File(fearDir, "identity.tmp")
-        if (tmp.exists()) tmp.delete()
+        if (target.exists() && !target.delete()) {
+            throw java.io.IOException("could not delete existing identity file")
+        }
 
         val body = "PK:${Common.base64Encode(pk)}\nSK:${Common.base64Encode(sk)}\n"
             .toByteArray(Charsets.UTF_8)
         val ef = androidx.security.crypto.EncryptedFile.Builder(
-            ctx, tmp, masterKey,
+            ctx, target, masterKey,
             androidx.security.crypto.EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB,
         ).build()
         ef.openFileOutput().use { it.write(body) }
         body.fill(0)
-
-        if (target.exists()) target.delete()
-        if (!tmp.renameTo(target)) throw java.io.IOException("rename failed")
     }
 
     companion object {

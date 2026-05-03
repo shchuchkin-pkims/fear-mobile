@@ -214,7 +214,15 @@ class IdentityManager(private val context: Context) {
         EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB,
     ).build()
 
-    /** Returns decrypted text or null if file does not exist / cannot be read. */
+    /**
+     * Returns decrypted text or null if file does not exist / cannot be read.
+     *
+     * If the file exists but decryption fails (e.g. EncryptedFile was written
+     * by a previous install whose Tink keyset is now unreachable — common after
+     * `adb install -r` if Keystore lost the master key, or if the SharedPrefs
+     * holding the keyset got cleared), we delete the stale ciphertext so the
+     * caller's `generateIdentity()` path can write a fresh one.
+     */
     private fun readEncryptedText(file: File): String? {
         if (!file.exists()) return null
         return try {
@@ -229,25 +237,36 @@ class IdentityManager(private val context: Context) {
                 baos.toByteArray().toString(Charsets.UTF_8)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to read encrypted ${file.name}: ${e.message}")
+            Log.w(TAG, "Failed to read encrypted ${file.name}: ${e.message} — discarding stale ciphertext")
+            try { file.delete() } catch (_: Exception) {}
             null
         }
     }
 
     /**
-     * Atomically replace contents of `file` with encrypted `text`.
-     * EncryptedFile cannot overwrite — write to .tmp, then rename.
+     * Replace contents of `file` with encrypted `text`.
+     *
+     * EncryptedFile cannot overwrite an existing file (Tink streaming AEAD
+     * refuses), so we delete first. We do NOT use a tmp+rename pattern: the
+     * Tink keyset is stored in SharedPreferences keyed on the file path, so
+     * writing to `identity.tmp` and renaming to `identity` would leave the
+     * file encrypted under one keyset while subsequent reads try to use a
+     * different one, producing the cryptic "no matching key" error.
+     *
+     * The write window is unsigned but tiny (~150 bytes) — a partial-write
+     * outage corrupts the identity file at worst, recovered on next launch
+     * via generateIdentity().
      */
     private fun writeEncryptedText(file: File, text: String): Boolean {
         return try {
-            val tmp = File(file.parentFile, "${file.name}.tmp")
-            if (tmp.exists()) tmp.delete()
-            encryptedFile(tmp).openFileOutput().use { out ->
+            if (file.exists() && !file.delete()) {
+                Log.e(TAG, "Could not delete existing ${file.name} before write")
+                return false
+            }
+            encryptedFile(file).openFileOutput().use { out ->
                 out.write(text.toByteArray(Charsets.UTF_8))
             }
-            // Atomic replace
-            if (file.exists()) file.delete()
-            tmp.renameTo(file)
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write encrypted ${file.name}: ${e.message}")
             false
