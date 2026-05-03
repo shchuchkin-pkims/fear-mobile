@@ -6,6 +6,8 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.fear.FearClient
+import com.fear.HandleProtocol
+import com.fear.IdentityManager
 import com.fear.Message
 import com.fear.data.AppDatabase
 import com.fear.data.MessageEntity
@@ -260,6 +262,46 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     fun openChat(id: String) {
         _uiState.update { it.copy(activeChatId = id) }
         loadHistoryForRoom(id)
+    }
+
+    /**
+     * First-time-on-server flow: try the real REGISTER_HANDLE round-trip with
+     * the relay (Phase B-2). On success, persist the local 'registered' flag
+     * (so we don't ask again) and proceed to connect. On any failure, return
+     * the message so the UI can surface it.
+     *
+     * `onResult(null)` = success, otherwise = error to display.
+     */
+    fun tryRegisterAndConnect(host: String, onResult: (String?) -> Unit) {
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            val im = IdentityManager(app)
+            if (!im.hasIdentity()) im.generateIdentity()
+            val pk = im.getPublicKey() ?: return@launch onResult("No identity yet")
+            val handle = profile.state.value.displayName.trim()
+            if (handle.isEmpty()) return@launch onResult("Set a display name first")
+            val port = _form.value.port
+
+            val rc = HandleProtocol.registerHandle(
+                host, port, handle, pk,
+                sign = { msg -> im.sign(msg) },
+            )
+            when (rc) {
+                HandleProtocol.Result.Ok -> {
+                    profile.markRegistered(host)
+                    connect()
+                    onResult(null)
+                }
+                is HandleProtocol.Result.Conflict ->
+                    onResult("Name '$handle' is taken on $host. Change your display name in Profile.")
+                is HandleProtocol.Result.Invalid ->
+                    onResult("Invalid name (${rc.reason}). Use 3-32 letters/digits, start with a letter.")
+                is HandleProtocol.Result.ServerError ->
+                    onResult("Server rejected: ${rc.reason}")
+                is HandleProtocol.Result.Network ->
+                    onResult("Cannot reach $host: ${rc.cause.message ?: "network error"}")
+            }
+        }
     }
 
     /** Suspend search across all rooms. Used by the search dialog. */

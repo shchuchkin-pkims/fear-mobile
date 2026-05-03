@@ -205,15 +205,22 @@ class ComposeMainActivity : ComponentActivity() {
                         onOpenProfile = { profileOpen = true },
                     )
 
-                    // Register-on-this-server prompt (Phase B-1: local-only flag).
+                    // Register-on-this-server prompt. Phase B-2: actually
+                    // sends REGISTER_HANDLE to the relay; on success the
+                    // viewModel marks it registered + initiates connect.
                     val regHost = pendingRegisterHost
                     if (regHost != null) {
                         RegisterServerDialog(
                             handlePreview = "@${profileState.displayName}@$regHost",
                             server = regHost,
                             onConfirm = {
-                                pendingRegisterHost = null
-                                viewModel.connect()  // markRegistered happens inside
+                                viewModel.tryRegisterAndConnect(regHost) { err ->
+                                    pendingRegisterHost = null
+                                    if (err != null) {
+                                        Toast.makeText(this@ComposeMainActivity,
+                                            err, Toast.LENGTH_LONG).show()
+                                    }
+                                }
                             },
                             onCancel = { pendingRegisterHost = null },
                         )

@@ -89,6 +89,11 @@ object Common {
     const val MSG_TYPE_KEY_RESPONSE: Byte = 16
     const val MSG_TYPE_MEDIA_RELAY: Byte = 17
 
+    // Handle registry (Phase B-2). See server_db.h for payload spec.
+    const val MSG_TYPE_REGISTER_HANDLE: Byte = 20
+    const val MSG_TYPE_LOOKUP_HANDLE:   Byte = 21
+    const val MSG_TYPE_HANDLE_RESULT:   Byte = 22
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32
