@@ -7,26 +7,24 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Per-user identity profile. Two layers:
+ * User-facing profile state. Two layers, intentionally distinct:
  *
- *  1. **displayName** — global, "who am I" name. Set once at first launch
- *     (or via the Profile screen later) and reused on every server. Backed
- *     by `profile.displayName` in SharedPreferences `fear_profile`.
+ *  1. **displayName** — global "what to call me", shown next to my messages.
+ *     Set once at first launch (Onboarding) and editable from the Profile
+ *     screen. Has no server-side meaning. Backed by `profile.displayName`.
  *
- *  2. **registered servers** — set of server hosts where the user has
- *     already claimed `@displayName@host`. Stored as a CSV in
- *     `profile.registeredServers`. The first time the user tries to
- *     connect to a fresh server we prompt to register; subsequent
- *     connections to the same server are silent.
+ *  2. **handles** — per-server claimed nicknames in `nickname@server` form.
+ *     A handle is reserved by a real REGISTER_HANDLE round-trip with the
+ *     relay (see HandleProtocol) and only after the server confirms is the
+ *     entry persisted here. Multiple servers, multiple nicknames.
  *
- * For Phase B-1 (no server-side handle protocol yet) the "registration"
- * is purely a local marker: marking the server registered just records the
- * intent. When Phase B-2 ships REGISTER_HANDLE on the server, this same
- * flag will be set only after the server confirms the handle is reserved.
+ * On disk: SharedPreferences `fear_profile`. Handles serialised as a CSV of
+ * `servernickname` records (the U+0001 separator can't appear in
+ * either field — server is hostname/IP, nickname is [A-Za-z0-9._-]).
  *
- * Migration: legacy prefs `fear_prefs/connect.name` is back-fed into
- * `profile.displayName` on first read so existing installs don't lose
- * the name they already typed.
+ * Migration: legacy `connect.name` → `displayName`. Phase B-1's
+ * `registeredServers` flag is dropped — having a handle now requires a
+ * real server claim, not just a local marker.
  */
 class ProfileStore private constructor(
     private val prefs: SharedPreferences,
@@ -42,55 +40,58 @@ class ProfileStore private constructor(
         _state.value = _state.value.copy(displayName = trimmed)
     }
 
-    /** Mark the user as registered (handle claimed) on `serverHost`. */
-    fun markRegistered(serverHost: String) {
-        val updated = _state.value.registeredServers + serverHost
-        persistRegistered(updated)
-        _state.value = _state.value.copy(registeredServers = updated)
+    /** Persist a successfully-registered handle. */
+    fun setHandle(serverHost: String, nickname: String) {
+        val updated = _state.value.handles + (serverHost to nickname)
+        persistHandles(updated)
+        _state.value = _state.value.copy(handles = updated)
     }
 
-    /** Forget registration — used when display name changes (re-register required). */
-    fun forgetRegistration(serverHost: String) {
-        val updated = _state.value.registeredServers - serverHost
-        persistRegistered(updated)
-        _state.value = _state.value.copy(registeredServers = updated)
+    /** Drop a handle locally. Server-side reservation is not released. */
+    fun removeHandle(serverHost: String) {
+        val updated = _state.value.handles - serverHost
+        persistHandles(updated)
+        _state.value = _state.value.copy(handles = updated)
     }
 
-    fun isRegistered(serverHost: String): Boolean =
-        _state.value.registeredServers.contains(serverHost)
+    fun handleAt(serverHost: String): String? = _state.value.handles[serverHost]
 
-    /** Compose-friendly handle representation: `@evgenii@fear-project.ru`. */
-    fun handleAtServer(serverHost: String): String? {
-        val name = _state.value.displayName
-        return if (name.isBlank() || !isRegistered(serverHost)) null
-        else "@$name@$serverHost"
+    /** Convenience: human-readable form `nickname@server` (no leading @). */
+    fun handleString(serverHost: String): String? {
+        val nick = handleAt(serverHost) ?: return null
+        return "$nick@$serverHost"
     }
 
-    private fun persistRegistered(set: Set<String>) {
-        prefs.edit().putString(KEY_REGISTERED, set.joinToString(",")).apply()
+    private fun persistHandles(map: Map<String, String>) {
+        val csv = map.entries.joinToString(",") { (s, n) -> "$s$n" }
+        prefs.edit().putString(KEY_HANDLES, csv).apply()
     }
 
     private fun load(): ProfileState {
         val explicit = prefs.getString(KEY_NAME, null)
         val migrated = explicit ?: legacyPrefs.getString(LEGACY_NAME_KEY, null)
-        // Persist the migration so subsequent reads don't depend on legacy file.
         if (explicit == null && migrated != null) {
             prefs.edit().putString(KEY_NAME, migrated).apply()
         }
 
-        val registeredCsv = prefs.getString(KEY_REGISTERED, null) ?: ""
-        val registered = registeredCsv.split(',').filter { it.isNotBlank() }.toSet()
+        val csv = prefs.getString(KEY_HANDLES, null) ?: ""
+        val handles = csv.split(',').mapNotNull { rec ->
+            if (rec.isBlank()) null
+            else rec.split('', limit = 2).let { p ->
+                if (p.size == 2 && p[0].isNotEmpty() && p[1].isNotEmpty()) p[0] to p[1] else null
+            }
+        }.toMap()
 
         return ProfileState(
             displayName = migrated.orEmpty(),
-            registeredServers = registered,
+            handles     = handles,
         )
     }
 
     companion object {
         private const val PREFS_NAME       = "fear_profile"
         private const val KEY_NAME         = "profile.displayName"
-        private const val KEY_REGISTERED   = "profile.registeredServers"
+        private const val KEY_HANDLES      = "profile.handles"      // servernick,servernick
         private const val LEGACY_PREFS     = "fear_prefs"
         private const val LEGACY_NAME_KEY  = "connect.name"
 
@@ -108,6 +109,8 @@ class ProfileStore private constructor(
 }
 
 data class ProfileState(
+    /** Global "what to call me" — shown next to messages. Not bound to a server. */
     val displayName: String = "",
-    val registeredServers: Set<String> = emptySet(),
+    /** Server hostname → claimed nickname. Populated after server confirms REGISTER_HANDLE. */
+    val handles: Map<String, String> = emptyMap(),
 )

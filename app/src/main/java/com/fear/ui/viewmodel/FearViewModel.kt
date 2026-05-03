@@ -214,9 +214,8 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         if (f.name != name) {
             _form.update { it.copy(name = name) }
         }
-        // First connect to this server marks it as registered locally; once
-        // Phase B-2 ships REGISTER_HANDLE this becomes a real server claim.
-        profile.markRegistered(f.host)
+        // Note: connecting to a server no longer "claims" the user's display
+        // name there — handles are an opt-in registration via ProfileScreen.
 
         _uiState.update { it.copy(isConnecting = true, errorBanner = null) }
 
@@ -265,41 +264,50 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * First-time-on-server flow: try the real REGISTER_HANDLE round-trip with
-     * the relay (Phase B-2). On success, persist the local 'registered' flag
-     * (so we don't ask again) and proceed to connect. On any failure, return
-     * the message so the UI can surface it.
+     * Reserve `nickname` on the relay at `host:port`. On success, persist the
+     * `host → nickname` mapping in ProfileStore. The result is *always*
+     * delivered on the Main thread so UI callbacks (Toast, dialog state)
+     * are safe to use directly.
      *
-     * `onResult(null)` = success, otherwise = error to display.
+     * Note: this no longer auto-triggers Connect. Registration is an
+     * independent action — chat messages just travel under `displayName`.
      */
-    fun tryRegisterAndConnect(host: String, onResult: (String?) -> Unit) {
+    fun registerHandle(
+        host: String,
+        port: Int,
+        nickname: String,
+        onResult: (String?) -> Unit,   // null = success, else error message
+    ) {
         val app = getApplication<Application>()
-        viewModelScope.launch(Dispatchers.IO) {
-            val im = IdentityManager(app)
-            if (!im.hasIdentity()) im.generateIdentity()
-            val pk = im.getPublicKey() ?: return@launch onResult("No identity yet")
-            val handle = profile.state.value.displayName.trim()
-            if (handle.isEmpty()) return@launch onResult("Set a display name first")
-            val port = _form.value.port
-
-            val rc = HandleProtocol.registerHandle(
-                host, port, handle, pk,
-                sign = { msg -> im.sign(msg) },
-            )
+        viewModelScope.launch {
+            val rc = try {
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    val im = IdentityManager(app)
+                    if (!im.hasIdentity()) im.generateIdentity()
+                    val pk = im.getPublicKey()
+                        ?: return@withContext HandleProtocol.Result.ServerError("no identity")
+                    HandleProtocol.registerHandle(
+                        host, port, nickname.trim(), pk,
+                        sign = { msg -> im.sign(msg) },
+                    )
+                }
+            } catch (e: Exception) {
+                HandleProtocol.Result.Network(e)
+            }
+            // Back on Main: safe to touch state / show Toast.
             when (rc) {
                 HandleProtocol.Result.Ok -> {
-                    profile.markRegistered(host)
-                    connect()
+                    profile.setHandle(host, nickname.trim())
                     onResult(null)
                 }
                 is HandleProtocol.Result.Conflict ->
-                    onResult("Name '$handle' is taken on $host. Change your display name in Profile.")
+                    onResult("Nickname '${nickname}' is taken on $host. Try another.")
                 is HandleProtocol.Result.Invalid ->
-                    onResult("Invalid name (${rc.reason}). Use 3-32 letters/digits, start with a letter.")
+                    onResult("Invalid nickname: ${rc.reason}. Use 3-32 letters/digits, start with a letter.")
                 is HandleProtocol.Result.ServerError ->
                     onResult("Server rejected: ${rc.reason}")
                 is HandleProtocol.Result.Network ->
-                    onResult("Cannot reach $host: ${rc.cause.message ?: "network error"}")
+                    onResult("Cannot reach $host:$port — ${rc.cause.message ?: "network error"}")
             }
         }
     }

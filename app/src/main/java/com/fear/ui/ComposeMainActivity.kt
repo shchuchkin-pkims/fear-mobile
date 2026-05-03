@@ -33,7 +33,6 @@ import com.fear.ui.components.CallOverlay
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.PasswordPromptDialog
 import com.fear.ui.components.QrShowDialog
-import com.fear.ui.components.RegisterServerDialog
 import com.fear.ui.components.SearchDialog
 import com.fear.ui.components.UpdateDialog
 import com.fear.ui.screens.OnboardingScreen
@@ -94,9 +93,6 @@ class ComposeMainActivity : ComponentActivity() {
                 var importQrPasswordOpen by remember { mutableStateOf<String?>(null) }
                 var searchOpen by remember { mutableStateOf(false) }
                 var profileOpen by remember { mutableStateOf(false) }
-                /** When non-null, shows the "first time on this server" prompt
-                 *  carrying the host the user is trying to connect to. */
-                var pendingRegisterHost by remember { mutableStateOf<String?>(null) }
                 val profileState by viewModel.profileState.collectAsState()
                 val context = androidx.compose.ui.platform.LocalContext.current
 
@@ -168,15 +164,16 @@ class ComposeMainActivity : ComponentActivity() {
                 } else if (profileOpen) {
                     val im = remember { com.fear.IdentityManager(applicationContext) }
                     val pk = im.getPublicKey()
-                    val handles = profileState.registeredServers
-                        .map { "@${profileState.displayName}@$it" }
+                    var registerHandleHost by remember { mutableStateOf<String?>(null) }
                     ProfileScreen(
                         displayName = profileState.displayName,
                         setDisplayName = { viewModel.profile.setDisplayName(it) },
-                        handles = handles,
+                        handles = profileState.handles,
                         fpshort = pk?.let { im.fpshort(it) },
                         fullFingerprint = pk?.let { im.fingerprint(it) },
                         onBack = { profileOpen = false },
+                        onAddHandle = { registerHandleHost = form.host },
+                        onRemoveHandle = { server -> viewModel.profile.removeHandle(server) },
                         onExportIdentity = {
                             profileOpen = false
                             exportSaveLauncher.launch("fear-identity-backup.fbk")
@@ -186,6 +183,28 @@ class ComposeMainActivity : ComponentActivity() {
                             qrPasswordOpen = true
                         },
                     )
+                    val regHost = registerHandleHost
+                    if (regHost != null) {
+                        com.fear.ui.components.RegisterHandleDialog(
+                            serverHost = regHost,
+                            initialNickname = profileState.displayName.lowercase()
+                                .filter { it.isLetterOrDigit() || it in ".-_" },
+                            onDismiss = { registerHandleHost = null },
+                            onSubmit = { nick ->
+                                viewModel.registerHandle(regHost, form.port, nick) { err ->
+                                    if (err == null) {
+                                        registerHandleHost = null
+                                        Toast.makeText(this@ComposeMainActivity,
+                                            "Registered $nick@$regHost",
+                                            Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        Toast.makeText(this@ComposeMainActivity,
+                                            err, Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            },
+                        )
+                    }
                 } else if (!state.isConnected) {
                     ConnectScreen(
                         form = form,
@@ -193,38 +212,10 @@ class ComposeMainActivity : ComponentActivity() {
                         isConnecting = state.isConnecting,
                         errorBanner = state.errorBanner,
                         onUpdate = { viewModel.updateForm { _ -> it } },
-                        onConnect = {
-                            // First time on this server → require register-confirm.
-                            if (!viewModel.profile.isRegistered(form.host)) {
-                                pendingRegisterHost = form.host
-                            } else {
-                                viewModel.connect()
-                            }
-                        },
+                        onConnect = { viewModel.connect() },
                         onDismissError = viewModel::dismissError,
                         onOpenProfile = { profileOpen = true },
                     )
-
-                    // Register-on-this-server prompt. Phase B-2: actually
-                    // sends REGISTER_HANDLE to the relay; on success the
-                    // viewModel marks it registered + initiates connect.
-                    val regHost = pendingRegisterHost
-                    if (regHost != null) {
-                        RegisterServerDialog(
-                            handlePreview = "@${profileState.displayName}@$regHost",
-                            server = regHost,
-                            onConfirm = {
-                                viewModel.tryRegisterAndConnect(regHost) { err ->
-                                    pendingRegisterHost = null
-                                    if (err != null) {
-                                        Toast.makeText(this@ComposeMainActivity,
-                                            err, Toast.LENGTH_LONG).show()
-                                    }
-                                }
-                            },
-                            onCancel = { pendingRegisterHost = null },
-                        )
-                    }
                 } else {
                     ChatScreen(
                         state = state,

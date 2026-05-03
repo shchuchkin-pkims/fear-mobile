@@ -17,11 +17,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -49,26 +49,27 @@ import androidx.compose.ui.unit.sp
 import com.fear.ui.theme.LocalFearColors
 
 /**
- * "My Profile" — Telegram-style header with monogram + name + handle, then
- * action rows (edit name, export identity, show QR).
+ * "My Profile". Two distinct identity layers shown separately:
  *
- * Args are flat by intent — the screen has no view-model of its own; the
- * host activity owns ProfileStore and Identity I/O and passes callbacks in.
+ *   • Display name — global, just the label next to my chat messages.
+ *   • Handles      — per-server `nickname@server` claims registered on the
+ *                    relay (Phase B-2). User adds these explicitly via
+ *                    "Register handle on a server".
  *
- *   `displayName` / `setDisplayName`  – ProfileStore.displayName
- *   `handles`                         – list of "@name@server" strings
- *   `fpshort` / `fullFingerprint`     – derived from identity_pk
- *   `onExportIdentity` / `onShowQr`   – reuse existing flows in ComposeMainActivity
+ * Plus the cryptographic identity (BLAKE2b fingerprint of identity_pk)
+ * and backup actions (Export / Show QR).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(
     displayName: String,
     setDisplayName: (String) -> Unit,
-    handles: List<String>,
+    handles: Map<String, String>,             // server → nickname
     fpshort: String?,
     fullFingerprint: String?,
     onBack: () -> Unit,
+    onAddHandle: () -> Unit,
+    onRemoveHandle: (server: String) -> Unit,
     onExportIdentity: () -> Unit,
     onShowQr: () -> Unit,
 ) {
@@ -102,7 +103,7 @@ fun ProfileScreen(
                  fontWeight = FontWeight.SemiBold)
         }
 
-        // ── Header: avatar + name + primary id ──────────────────
+        // ── Header: avatar + display name + fpshort ────────────
         Column(
             modifier = Modifier.fillMaxWidth().padding(top = 18.dp, bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -161,27 +162,43 @@ fun ProfileScreen(
                 }
             }
 
-            // Primary identifier shown right under the name.
+            // Cryptographic short id under the name.
             if (fpshort != null) {
                 Text("$displayName#$fpshort",
                      color = colors.textSecondary, fontSize = 13.sp)
             }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Display name is just a label shown next to your messages.",
+                color = colors.textSecondary, fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 24.dp),
+            )
         }
 
         HorizontalDivider(color = colors.border)
 
         // ── Handles section ─────────────────────────────────────
-        SectionLabel("Handles")
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Nicknames on servers", color = colors.textSecondary,
+                 fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                 modifier = Modifier.weight(1f))
+            TextButton(onClick = onAddHandle) { Text("Register…") }
+        }
         if (handles.isEmpty()) {
             Text(
-                "No server handles registered yet. Connect to a server " +
-                    "and you'll be offered to register @${displayName.ifBlank { "you" }}@<server>.",
+                "No nicknames registered. Tap 'Register…' above to claim " +
+                    "`yournickname@yourserver` so others can find you.",
                 color = colors.textSecondary, fontSize = 12.sp,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
             )
         } else {
-            for (h in handles) {
-                CopyableRow(label = h, ctx = ctx)
+            for ((server, nick) in handles) {
+                HandleRow(server = server, nickname = nick,
+                          onRemove = { onRemoveHandle(server) })
             }
         }
 
@@ -248,22 +265,27 @@ private fun ActionRow(label: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun CopyableRow(label: String, ctx: android.content.Context) {
+private fun HandleRow(server: String, nickname: String, onRemove: () -> Unit) {
     val colors = LocalFearColors.current
+    val ctx = LocalContext.current
+    val full = "$nickname@$server"
     Row(
         modifier = Modifier.fillMaxWidth()
-            .clickable {
-                val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                    as android.content.ClipboardManager
-                cm.setPrimaryClip(android.content.ClipData.newPlainText("handle", label))
-                android.widget.Toast.makeText(ctx, "Copied", android.widget.Toast.LENGTH_SHORT).show()
-            }
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label, color = colors.textPrimary, fontSize = 14.sp,
-             modifier = Modifier.weight(1f))
-        Icon(Icons.Filled.ContentCopy, "Copy",
-             tint = colors.textSecondary, modifier = Modifier.size(16.dp))
+        Column(Modifier.weight(1f).clickable {
+            val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("handle", full))
+            android.widget.Toast.makeText(ctx, "Copied", android.widget.Toast.LENGTH_SHORT).show()
+        }) {
+            Text(full, color = colors.textPrimary, fontSize = 14.sp)
+            Text("Tap to copy", color = colors.textSecondary, fontSize = 11.sp)
+        }
+        IconButton(onClick = onRemove) {
+            Icon(Icons.Filled.Delete, "Remove from device",
+                 tint = colors.textSecondary, modifier = Modifier.size(18.dp))
+        }
     }
 }
