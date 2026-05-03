@@ -100,6 +100,23 @@ class IdentityManager(private val context: Context) {
     }
 
     /**
+     * Short fingerprint per §1 of the architecture doc: first 4 bytes of
+     * BLAKE2b(identity_pk) as 8 lowercase hex chars. Used to disambiguate
+     * users with the same display name (`evgenii#a3b9c1d2`).
+     */
+    fun fpshort(pk: ByteArray): String {
+        val hash = ByteArray(4)
+        ls.cryptoGenericHash(hash, 4, pk, pk.size.toLong(), null, 0)
+        return hash.joinToString("") { "%02x".format(it) }
+    }
+
+    /** Convenience: name#fpshort or null if no identity. */
+    fun shortIdentity(displayName: String): String? {
+        val pk = publicKey ?: return null
+        return "$displayName#${fpshort(pk)}"
+    }
+
+    /**
      * Build the payload for MSG_TYPE_SIGNED_TEXT.
      * Format: [pk(32)][sig(64)][text]
      */

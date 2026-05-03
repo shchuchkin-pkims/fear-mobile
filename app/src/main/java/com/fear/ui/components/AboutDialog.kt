@@ -19,7 +19,12 @@ import androidx.compose.ui.unit.sp
 import com.fear.ui.theme.LocalFearColors
 
 @Composable
-fun AboutDialog(version: String, onDismiss: () -> Unit) {
+fun AboutDialog(
+    version: String,
+    myIdentity: String? = null,        // "name#fpshort", null if no identity yet
+    fullFingerprint: String? = null,   // colon-separated 8-byte form for verification
+    onDismiss: () -> Unit,
+) {
     val ctx = LocalContext.current
     val colors = LocalFearColors.current
     AlertDialog(
@@ -33,6 +38,19 @@ fun AboutDialog(version: String, onDismiss: () -> Unit) {
                     fontSize = 13.sp,
                 )
                 Text("Version $version", color = colors.textSecondary, fontSize = 12.sp)
+
+                if (myIdentity != null) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("You", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    CopyableText(myIdentity, fontSize = 14.sp, weight = FontWeight.SemiBold, ctx = ctx)
+                    if (!fullFingerprint.isNullOrEmpty()) {
+                        Text(
+                            "fingerprint: $fullFingerprint",
+                            color = colors.textSecondary,
+                            fontSize = 11.sp,
+                        )
+                    }
+                }
 
                 Spacer(Modifier.height(12.dp))
                 Text(
@@ -55,6 +73,28 @@ fun AboutDialog(version: String, onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("Close") }
+        },
+    )
+}
+
+@Composable
+private fun CopyableText(
+    text: String,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    weight: FontWeight,
+    ctx: Context,
+) {
+    val colors = LocalFearColors.current
+    Text(
+        text = text,
+        color = colors.textPrimary,
+        fontSize = fontSize,
+        fontWeight = weight,
+        modifier = Modifier.clickable {
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+                as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("FEAR identity", text))
+            android.widget.Toast.makeText(ctx, "Copied", android.widget.Toast.LENGTH_SHORT).show()
         },
     )
 }

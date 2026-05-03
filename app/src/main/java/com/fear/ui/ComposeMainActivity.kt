@@ -271,7 +271,18 @@ class ComposeMainActivity : ComponentActivity() {
                     }
 
                     if (aboutOpen) {
-                        AboutDialog(BuildConfig.VERSION_NAME) { aboutOpen = false }
+                        // Compute identity strings on each open — cheap (BLAKE2b on 32 bytes).
+                        val im = remember { IdentityManager(applicationContext) }
+                        val pk = im.getPublicKey()
+                        val displayName = viewModel.userName().ifBlank { form.name }
+                        val shortId = if (pk != null) "$displayName#${im.fpshort(pk)}" else null
+                        val fullFp  = if (pk != null) im.fingerprint(pk) else null
+                        AboutDialog(
+                            version = BuildConfig.VERSION_NAME,
+                            myIdentity = shortId,
+                            fullFingerprint = fullFp,
+                            onDismiss = { aboutOpen = false },
+                        )
                     }
 
                     // QR display (after successful identity export OR via Show-QR menu)
