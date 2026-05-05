@@ -17,6 +17,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -39,6 +40,7 @@ import com.fear.ui.screens.ContactsScreen
 import com.fear.ui.screens.OnboardingScreen
 import com.fear.ui.screens.ProfileScreen
 import com.fear.ui.components.AddContactDialog
+import com.fear.ui.components.PeerProfileDialog
 import com.fear.Common
 import com.fear.IdentityBackup
 import kotlinx.coroutines.launch
@@ -97,6 +99,8 @@ class ComposeMainActivity : ComponentActivity() {
                 var profileOpen by remember { mutableStateOf(false) }
                 var contactsOpen by remember { mutableStateOf(false) }
                 var addContactOpen by remember { mutableStateOf(false) }
+                var peerProfile by remember { mutableStateOf<com.fear.ui.viewmodel.FearViewModel.PeerInfo?>(null) }
+                val peerLookupScope = rememberCoroutineScope()
                 val profileState by viewModel.profileState.collectAsState()
                 val contacts by viewModel.contactsFlow.collectAsState(initial = emptyList())
                 val context = androidx.compose.ui.platform.LocalContext.current
@@ -163,7 +167,7 @@ class ComposeMainActivity : ComponentActivity() {
                 if (profileState.displayName.isBlank()) {
                     // First-launch onboarding: pick a display name and that's it.
                     OnboardingScreen(initialName = form.name) { name ->
-                        viewModel.profile.setDisplayName(name)
+                        viewModel.setDisplayName(name)
                         viewModel.updateForm { it.copy(name = name) }
                     }
                 } else if (contactsOpen) {
@@ -204,7 +208,7 @@ class ComposeMainActivity : ComponentActivity() {
                     var registerHandleHost by remember { mutableStateOf<String?>(null) }
                     ProfileScreen(
                         displayName = profileState.displayName,
-                        setDisplayName = { viewModel.profile.setDisplayName(it) },
+                        setDisplayName = { viewModel.setDisplayName(it) },
                         handles = profileState.handles,
                         fpshort = pk?.let { im.fpshort(it) },
                         fullFingerprint = pk?.let { im.fingerprint(it) },
@@ -266,7 +270,37 @@ class ComposeMainActivity : ComponentActivity() {
                             filePicker.launch(arrayOf("*/*"))
                         },
                         onBack         = viewModel::closeActiveChat,
+                        onSenderTap    = { name ->
+                            peerLookupScope.launch {
+                                peerProfile = viewModel.lookupPeer(name)
+                            }
+                        },
                     )
+
+                    peerProfile?.let { info ->
+                        PeerProfileDialog(
+                            info = info,
+                            onDismiss = { peerProfile = null },
+                            onAddContact = { p ->
+                                if (p.identityPkB64 != null) {
+                                    viewModel.addContactRaw(
+                                        identityPkB64 = p.identityPkB64,
+                                        displayName   = p.displayName,
+                                        handle        = p.handle,
+                                        server        = p.server,
+                                    )
+                                }
+                            },
+                            onOpenChat = { p ->
+                                viewModel.openDmWithPk(
+                                    identityPkB64 = p.identityPkB64!!,
+                                    displayName   = p.displayName,
+                                    handle        = p.handle,
+                                    server        = p.server,
+                                )
+                            },
+                        )
+                    }
 
                     if (menuOpen) {
                         MenuSheet(

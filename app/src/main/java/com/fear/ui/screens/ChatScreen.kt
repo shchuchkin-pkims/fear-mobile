@@ -69,6 +69,7 @@ fun ChatScreen(
     onVideoCall: () -> Unit,
     onAttach: () -> Unit,
     onBack: () -> Unit,
+    onSenderTap: (String) -> Unit = {},
 ) {
     val colors = LocalFearColors.current
 
@@ -88,6 +89,7 @@ fun ChatScreen(
             onVideoCall = onVideoCall,
             onAttach = onAttach,
             onBack = onBack,
+            onSenderTap = onSenderTap,
         )
     }
 }
@@ -158,6 +160,7 @@ private fun ChatPane(
     onVideoCall: () -> Unit,
     onAttach: () -> Unit,
     onBack: () -> Unit,
+    onSenderTap: (String) -> Unit = {},
 ) {
     val colors = LocalFearColors.current
     val listState = rememberLazyListState()
@@ -211,7 +214,7 @@ private fun ChatPane(
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
             ) {
                 items(messages, key = { "${it.timestamp}-${it.sender}" }) { msg ->
-                    MessageBubble(msg)
+                    MessageBubble(msg, onSenderClick = onSenderTap)
                 }
             }
         }

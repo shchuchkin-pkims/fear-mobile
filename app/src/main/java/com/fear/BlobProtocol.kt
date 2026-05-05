@@ -117,7 +117,7 @@ object BlobProtocol {
     ): Pair<Byte, ByteArray>? {
         val sock = Socket()
         sock.use { s ->
-            s.connect(InetSocketAddress(host, port), timeoutMs)
+            s.connect(InetSocketAddress(host.trim(), port), timeoutMs)
             s.soTimeout = timeoutMs
 
             val room  = "__blobs__".toByteArray(Charsets.UTF_8)

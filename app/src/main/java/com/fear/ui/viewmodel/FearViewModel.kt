@@ -51,10 +51,15 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     /** True iff we're inside the JOIN attempt of an AUTO connect — used to fall
      *  back to CREATE if JOIN times out. */
     private var pendingAutoJoin = false
+    // True while we're tearing down one room and re-joining another (DM open).
+    // Suppresses the brief onDisconnected→ConnectScreen flash and keeps the
+    // chat UI visible with a "switching room" status.
+    @Volatile private var switchingRoom = false
 
     private val listener = object : FearClient.FearClientListener {
         override fun onConnected() {
             pendingAutoJoin = false
+            switchingRoom = false
             saveFormToPrefs()
             val f = _form.value
             _uiState.update {
@@ -87,6 +92,12 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         override fun onDisconnected() {
             seenPeers.clear()
             reportedCount = 0
+            // During a planned room switch (openDmWith), suppress the
+            // disconnect flash — the next onConnected will repaint.
+            if (switchingRoom) {
+                _uiState.update { it.copy(statusText = "switching room…") }
+                return
+            }
             _uiState.update {
                 it.copy(
                     isConnected = false,
@@ -172,6 +183,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             )
             if (ignored.any { error.contains(it) }) return
             pendingAutoJoin = false
+            switchingRoom = false
             _uiState.update { it.copy(errorBanner = error.trim(), isConnecting = false) }
         }
 
@@ -203,6 +215,75 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateForm(transform: (ConnectFormState) -> ConnectFormState) {
         _form.update(transform)
+    }
+
+    /**
+     * Information surfaced when the user taps a peer in chat — gathered
+     * from whatever sources currently know about the peer:
+     *   - identity_pk + verification status come from TOFU `known_keys`
+     *     (populated when SIGNED_TEXT or IDENTITY_ANNOUNCE arrives)
+     *   - handle and stored display name come from the local contact list
+     *     (populated by an explicit Add Contact)
+     *
+     * The screen-name shown alongside is whatever the message frame carried.
+     * If we never received a signed message from this peer the pk is null
+     * and the dialog falls back to the wire name only.
+     */
+    data class PeerInfo(
+        val displayName: String,
+        val identityPkB64: String?,
+        val fpshort: String?,
+        val fullFingerprint: String?,
+        val handle: String?,
+        val server: String?,
+        val verified: Boolean,
+        val isContact: Boolean,
+    )
+
+    /** Best-effort lookup; returns null on system / empty senders. */
+    suspend fun lookupPeer(senderName: String): PeerInfo? {
+        val sender = senderName.trim()
+        if (sender.isEmpty() || sender == "system" || sender == "server") return null
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val im  = IdentityManager(app)
+            val known = im.loadKnownKeys().firstOrNull { it.name == sender }
+
+            val pkB64    = known?.pk?.let {
+                android.util.Base64.encodeToString(it,
+                    android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+            }
+            val fpshort  = known?.pk?.let { im.fpshort(it) }
+            val fullFp   = known?.pk?.let { im.fingerprint(it) }
+            val contact  = pkB64?.let { contactsRepo.all().firstOrNull { c -> c.identityPkB64 == it } }
+
+            PeerInfo(
+                displayName     = contact?.displayName?.takeIf { it.isNotBlank() } ?: sender,
+                identityPkB64   = pkB64,
+                fpshort         = fpshort,
+                fullFingerprint = fullFp,
+                handle          = contact?.handle,
+                server          = contact?.server,
+                verified        = known?.verified == true || contact?.verified == true,
+                isContact       = contact != null,
+            )
+        }
+    }
+
+    /**
+     * Persist a new display name and, if a session is active, push it to
+     * FearClient so the next outgoing frame carries it. Peers receive an
+     * IDENTITY_ANNOUNCE so their cached (identity_pk → display name)
+     * mapping refreshes without waiting for the next message from us.
+     */
+    fun setDisplayName(newName: String) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty()) return
+        profile.setDisplayName(trimmed)
+        // Mirror into the form so re-connect path uses the latest value.
+        _form.update { if (it.name != trimmed) it.copy(name = trimmed) else it }
+        // Live-update the active session.
+        client.setClientName(trimmed)
     }
 
     fun connect() {
@@ -372,6 +453,37 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Save a peer we already have a public key for (e.g. learned over TOFU)
+     * directly into contacts. Used by the in-chat peer profile dialog when
+     * the user taps 'Add to contacts' — bypasses the network LOOKUP_HANDLE
+     * round-trip because the identity pk is already known.
+     */
+    fun addContactRaw(
+        identityPkB64: String,
+        displayName: String,
+        handle: String?,
+        server: String?,
+    ) {
+        viewModelScope.launch {
+            val current = form.value
+            val endpoint = if (handle != null && server != null)
+                ContactsRepository.ServerEndpoint(server, current.port)
+            else null
+            contactsRepo.upsert(
+                ContactEntity(
+                    identityPkB64 = identityPkB64,
+                    displayName   = displayName,
+                    handle        = handle,
+                    server        = server,
+                    addedAt       = System.currentTimeMillis(),
+                    verified      = false,
+                ),
+                endpoint,
+            )
+        }
+    }
+
+    /**
      * Open a 1-on-1 chat with `contact`: compute the deterministic DM
      * room_id, set it on the form, and connect via AUTO mode (JOIN if the
      * other peer already created the room, CREATE otherwise).
@@ -379,6 +491,41 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
      * Server stays the same as the form's current `host:port` — DMs live
      * on whichever relay both sides happen to share.
      */
+    /**
+     * Open a DM with someone we know by pk but might not have as a contact —
+     * used by the in-chat profile dialog. Saves them to contacts first if
+     * not already present so the chat list shows a meaningful title next time.
+     */
+    fun openDmWithPk(
+        identityPkB64: String,
+        displayName: String,
+        handle: String?,
+        server: String?,
+    ) {
+        viewModelScope.launch {
+            // Best-effort upsert; ignore errors so the chat still opens.
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                try {
+                    val existing = contactsRepo.all().firstOrNull {
+                        it.identityPkB64 == identityPkB64
+                    }
+                    if (existing == null) {
+                        addContactRaw(identityPkB64, displayName, handle, server)
+                    }
+                } catch (_: Exception) { /* non-fatal */ }
+            }
+            val ce = ContactEntity(
+                identityPkB64 = identityPkB64,
+                displayName   = displayName,
+                handle        = handle,
+                server        = server,
+                addedAt       = System.currentTimeMillis(),
+                verified      = false,
+            )
+            openDmWith(ce)
+        }
+    }
+
     fun openDmWith(contact: ContactEntity) {
         val app = getApplication<Application>()
         val im = IdentityManager(app)
@@ -390,6 +537,23 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         val dmId = im.dmRoomId(otherPk) ?: run {
             _uiState.update { it.copy(errorBanner = "No identity to open DM.") }
             return
+        }
+        // Mark this as a planned room switch so onDisconnected doesn't flash
+        // the user back to the connect screen for the ~5s the AUTO JOIN
+        // timeout takes when no one else is in the DM yet.
+        if (_uiState.value.isConnected) switchingRoom = true
+        _uiState.update {
+            it.copy(
+                activeChatId = dmId,
+                isConnecting = true,
+                messages     = emptyList(),
+                statusText   = "switching room…",
+                chats        = listOf(ChatEntry(
+                    id = dmId,
+                    title = contact.displayName.ifBlank { dmId },
+                    preview = "",
+                    lastActivity = Instant.now())),
+            )
         }
         _form.update { it.copy(room = dmId, mode = ConnectMode.AUTO) }
         connect()

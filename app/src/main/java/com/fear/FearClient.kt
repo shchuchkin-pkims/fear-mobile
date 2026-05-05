@@ -224,6 +224,29 @@ class FearClient(
     fun getIdentityManager(): IdentityManager? = identityManager
 
     /**
+     * Update the display name used in outbound frames without dropping the
+     * session. If the new name differs from the current one and a peer is
+     * still connected, an IDENTITY_ANNOUNCE is broadcast so participants
+     * refresh their cached (identity_pk → name) mapping immediately.
+     *
+     * No-op when the name is unchanged or empty (server enforces uniqueness
+     * per room, so renaming to a name another peer holds would be rejected
+     * — the caller should validate beforehand).
+     */
+    fun setClientName(newName: String) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty() || trimmed == clientName) return
+        Log.i("FearClient", "setClientName: '$clientName' → '$trimmed'")
+        clientName = trimmed
+        if (isConnected) {
+            CoroutineScope(Dispatchers.IO).launch {
+                val s = socket ?: return@launch
+                sendIdentityAnnounce(s)
+            }
+        }
+    }
+
+    /**
      * Reload identity from disk and re-send IDENTITY_ANNOUNCE if connected.
      * Call this after generating a new identity key while already connected.
      */

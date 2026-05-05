@@ -1,7 +1,9 @@
 package com.fear.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,7 +28,11 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 @Composable
-fun MessageBubble(msg: ChatMessage, modifier: Modifier = Modifier) {
+fun MessageBubble(
+    msg: ChatMessage,
+    modifier: Modifier = Modifier,
+    onSenderClick: ((String) -> Unit)? = null,
+) {
     val colors = LocalFearColors.current
     val timeFmt = DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault())
 
@@ -52,7 +58,11 @@ fun MessageBubble(msg: ChatMessage, modifier: Modifier = Modifier) {
         verticalAlignment = Alignment.Top,
     ) {
         if (!msg.fromSelf) {
-            Avatar(seed = msg.sender, size = 32.dp)
+            val avatarMod = if (onSenderClick != null && msg.sender.isNotEmpty())
+                Modifier.clickable { onSenderClick(msg.sender) } else Modifier
+            Box(modifier = avatarMod) {
+                Avatar(seed = msg.sender, size = 32.dp)
+            }
             Spacer(Modifier.width(8.dp))
         }
 
@@ -64,11 +74,14 @@ fun MessageBubble(msg: ChatMessage, modifier: Modifier = Modifier) {
                 .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
             if (!msg.fromSelf && msg.sender.isNotEmpty()) {
+                val nameMod = if (onSenderClick != null)
+                    Modifier.clickable { onSenderClick(msg.sender) } else Modifier
                 Text(
                     text = msg.sender,
                     color = senderColor(msg.sender),
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 12.sp,
+                    modifier = nameMod,
                 )
             }
             Text(

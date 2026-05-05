@@ -58,6 +58,7 @@ object HandleProtocol {
         sign: (ByteArray) -> ByteArray?,
         timeoutMs: Int = 8000,
     ): Result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        android.util.Log.i("HandleProtocol", "registerHandle host=$host port=$port handle=$handle")
         try {
             require(identityPk.size == 32) { "identity_pk must be 32 bytes" }
             val handleBytes = handle.toByteArray(Charsets.UTF_8)
@@ -79,6 +80,7 @@ object HandleProtocol {
                 ?: return@withContext Result.Network(java.io.IOException("no reply"))
             parseRegisterReply(reply)
         } catch (e: Exception) {
+            android.util.Log.w("HandleProtocol", "registerHandle network: ${e.javaClass.simpleName}: ${e.message}", e)
             Result.Network(e)
         }
     }
@@ -117,7 +119,7 @@ object HandleProtocol {
     ): ByteArray? {
         val sock = Socket()
         sock.use { s ->
-            s.connect(InetSocketAddress(host, port), timeoutMs)
+            s.connect(InetSocketAddress(host.trim(), port), timeoutMs)
             s.soTimeout = timeoutMs
 
             // The relay needs a non-empty room/name in the frame for parsing
