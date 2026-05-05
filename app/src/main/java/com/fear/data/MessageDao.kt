@@ -45,6 +45,16 @@ interface MessageDao {
     """)
     suspend fun chatSummaries(): List<ChatSummaryRow>
 
+    /** Stream of room-id summaries so the unified sidebar updates live as
+     *  new messages land. Same shape as chatSummaries() but observable. */
+    @Query("""
+        SELECT roomId, MAX(ts) AS lastTs
+        FROM messages
+        GROUP BY roomId
+        ORDER BY lastTs DESC
+    """)
+    fun observeChatSummaries(): Flow<List<ChatSummaryRow>>
+
     /** FTS-free fallback search until §17 wires up FTS5. Case-insensitive LIKE. */
     @Query("""
         SELECT * FROM messages

@@ -51,41 +51,68 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Phase B-5: unified Telegram-style chat list shown in the sidebar.
-     * Combines saved contacts (each becomes a DM entry with the
-     * deterministic dm:... room id) with the currently-joined group room
-     * (when not itself a DM). Sorted newest-first by last activity.
+     * Combines:
+     *   - every saved contact → a DM entry with the deterministic dm:...
+     *     room id (last activity = newest DM message or contact addedAt);
+     *   - every group room we have local history for → a GROUP entry
+     *     (last activity = newest message in that room);
+     *   - the currently-joined group room (even if it has no history yet).
+     * Sorted newest-first by last activity. Updates live via the message
+     * dao's observeChatSummaries() so a new message bumps its room to top.
      */
     val chatList: StateFlow<List<ChatEntry>> =
-        combine(contactsFlow, uiState, _form) { contacts, ui, f ->
+        combine(
+            contactsFlow,
+            uiState,
+            _form,
+            dao.observeChatSummaries(),
+        ) { contacts, ui, f, summaries ->
             val im = IdentityManager(app)
+            val lastTsByRoom: Map<String, Long> =
+                summaries.associate { it.roomId to it.lastTs }
+
+            // ---- DM entries (one per contact) -----------------------------
             val dmEntries = contacts.mapNotNull { c ->
                 val pkBytes = try {
                     android.util.Base64.decode(c.identityPkB64,
                         android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
                 } catch (_: Exception) { return@mapNotNull null }
                 val dmId = im.dmRoomId(pkBytes) ?: return@mapNotNull null
+                val historyTs = lastTsByRoom[dmId]
                 ChatEntry(
                     id = dmId,
                     title = c.displayName.ifBlank { c.handle ?: "?" },
                     preview = c.handle?.let { h ->
                         if (c.server != null) "@$h@${c.server}" else "@$h"
                     } ?: "",
-                    lastActivity = Instant.ofEpochMilli(c.addedAt),
+                    lastActivity = Instant.ofEpochMilli(historyTs ?: c.addedAt),
                     kind = ChatKind.DM,
                     peerPkB64 = c.identityPkB64,
                 )
             }
-            val activeGroup =
-                if (ui.isConnected && f.room.isNotBlank() && !f.room.startsWith("dm:"))
-                    listOf(ChatEntry(
-                        id = f.room,
-                        title = f.room,
-                        preview = "",
-                        lastActivity = Instant.now(),
-                        kind = ChatKind.GROUP,
-                    ))
-                else emptyList()
-            (dmEntries + activeGroup).sortedByDescending { it.lastActivity }
+
+            // ---- Group entries: every room with history that's not a DM,
+            // plus the currently-joined group room (in case it has no
+            // history yet, e.g. just connected to "guest"). -----------------
+            val historicalGroups = summaries
+                .map { it.roomId }
+                .filter { !it.startsWith("dm:") }
+                .toMutableSet()
+            if (ui.isConnected && f.room.isNotBlank() && !f.room.startsWith("dm:")) {
+                historicalGroups.add(f.room)
+            }
+            val groupEntries = historicalGroups.map { roomId ->
+                val ts = lastTsByRoom[roomId]
+                ChatEntry(
+                    id = roomId,
+                    title = roomId,
+                    preview = "",
+                    lastActivity = ts?.let { Instant.ofEpochMilli(it) } ?: Instant.now(),
+                    kind = ChatKind.GROUP,
+                )
+            }
+
+            (dmEntries + groupEntries).sortedByDescending { it.lastActivity }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val seenPeers = mutableSetOf<String>()

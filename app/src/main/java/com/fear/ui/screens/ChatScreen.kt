@@ -28,12 +28,15 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -61,6 +64,7 @@ import com.fear.ui.components.ChatListRow
 import com.fear.ui.components.MessageBubble
 import com.fear.ui.theme.LocalFearColors
 import com.fear.ui.viewmodel.ChatEntry
+import com.fear.ui.viewmodel.ChatKind
 import com.fear.ui.viewmodel.ChatUiState
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -153,17 +157,26 @@ private fun SidebarOnly(
                          color = colors.textSecondary)
                 }
             } else {
+                val dms    = chats.filter { it.kind == ChatKind.DM }
+                val groups = chats.filter { it.kind == ChatKind.GROUP }
+                var dmExpanded    by remember { mutableStateOf(true) }
+                var groupExpanded by remember { mutableStateOf(true) }
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(
-                        items = chats,
-                        key   = { c: ChatEntry -> c.id },
-                    ) { chat ->
-                        ChatListRow(
-                            entry = chat,
-                            selected = chat.id == activeChatId,
-                            onClick = { onChatSelected(chat) },
-                        )
-                    }
+                    sectionHeader(
+                        label = "Контакты",
+                        count = dms.size,
+                        expanded = dmExpanded,
+                        onToggle = { dmExpanded = !dmExpanded },
+                    )
+                    if (dmExpanded) chatItems(dms, activeChatId, onChatSelected)
+
+                    sectionHeader(
+                        label = "Группы",
+                        count = groups.size,
+                        expanded = groupExpanded,
+                        onToggle = { groupExpanded = !groupExpanded },
+                    )
+                    if (groupExpanded) chatItems(groups, activeChatId, onChatSelected)
                 }
             }
         }
@@ -177,6 +190,59 @@ private fun SidebarOnly(
         ) {
             Icon(Icons.Filled.Add, contentDescription = "New chat",
                  tint = androidx.compose.ui.graphics.Color.White)
+        }
+    }
+}
+
+private fun LazyListScope.sectionHeader(
+    label: String,
+    count: Int,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) = item(key = "hdr-$label") {
+    val colors = LocalFearColors.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+            contentDescription = if (expanded) "Свернуть" else "Развернуть",
+            tint = colors.textSecondary,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = "$label  ($count)",
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+            modifier = Modifier.weight(1f),
+        )
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
+private fun LazyListScope.chatItems(
+    chats: List<ChatEntry>,
+    activeChatId: String?,
+    onChatSelected: (ChatEntry) -> Unit,
+) {
+    if (chats.isEmpty()) {
+        item(key = "empty-${chats.hashCode()}") {
+            // Empty placeholder for the section so the toggle still gives
+            // meaningful feedback. Subtle text, no gap.
+        }
+    } else {
+        items(items = chats, key = { c: ChatEntry -> c.id }) { chat ->
+            ChatListRow(
+                entry = chat,
+                selected = chat.id == activeChatId,
+                onClick = { onChatSelected(chat) },
+            )
         }
     }
 }
