@@ -127,11 +127,17 @@ class IdentityManager(private val context: Context) {
      * wire and is opaque to onlookers. Prefixed with "dm:" so the UI can
      * tell DMs from user-named group rooms at a glance.
      */
-    fun dmRoomId(otherPk: ByteArray): String? {
+    fun dmRoomId(otherPk: ByteArray): String? = pmRoomId(otherPk)
+
+    /**
+     * Детерминированный room_id для личного 1-на-1 чата (Phase B-5+).
+     * Префикс "pm:" + base64url(blake2b(min(pk_a,pk_b)||max(pk_a,pk_b),16)).
+     * Обе стороны вычисляют одинаковое значение без координации.
+     */
+    fun pmRoomId(otherPk: ByteArray): String? {
         val mine = publicKey ?: return null
         require(otherPk.size == Common.IDENTITY_PK_BYTES) { "other pk wrong size" }
 
-        // Sort the two pk byte-arrays lexicographically.
         val (lo, hi) = if (compareUnsigned(mine, otherPk) <= 0) mine to otherPk
                        else                                      otherPk to mine
         val concat = ByteArray(64).apply {
@@ -144,7 +150,45 @@ class IdentityManager(private val context: Context) {
             digest,
             android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
         )
-        return "dm:$b64"
+        return "pm:$b64"
+    }
+
+    /**
+     * Детерминированный 32-байтовый AES-256-GCM ключ ЛС-комнаты.
+     * Считается так же как identity_pm_room_key() в C-библиотеке:
+     *   shared = X25519(my_x_sk, their_x_pk)
+     *   K_pm   = BLAKE2b(key=shared, data="fear.pm.v1.key"||lo||hi, len=32)
+     * Никто, кроме обладателей обоих identity_sk, не может его вычислить.
+     */
+    fun pmRoomKey(otherPk: ByteArray): ByteArray? {
+        val myPk = publicKey ?: return null
+        val mySk = secretKey ?: return null
+        require(otherPk.size == Common.IDENTITY_PK_BYTES) { "other pk wrong size" }
+
+        val myXSk = ByteArray(32)
+        val theirXPk = ByteArray(32)
+        if (!ls.convertSecretKeyEd25519ToCurve25519(myXSk, mySk)) return null
+        if (!ls.convertPublicKeyEd25519ToCurve25519(theirXPk, otherPk)) return null
+
+        val shared = ByteArray(32)
+        if (!ls.cryptoScalarMult(shared, myXSk, theirXPk)) return null
+
+        val (lo, hi) = if (compareUnsigned(myPk, otherPk) <= 0) myPk to otherPk
+                       else                                     otherPk to myPk
+        val ctx  = "fear.pm.v1.key".toByteArray(Charsets.US_ASCII)
+        val info = ByteArray(ctx.size + 64)
+        System.arraycopy(ctx, 0, info, 0, ctx.size)
+        System.arraycopy(lo,  0, info, ctx.size,      32)
+        System.arraycopy(hi,  0, info, ctx.size + 32, 32)
+
+        val out = ByteArray(32)
+        ls.cryptoGenericHash(out, 32,
+                             info, info.size.toLong(),
+                             shared, shared.size)
+        // Best-effort wipe.
+        java.util.Arrays.fill(myXSk, 0)
+        java.util.Arrays.fill(shared, 0)
+        return out
     }
 
     private fun compareUnsigned(a: ByteArray, b: ByteArray): Int {

@@ -77,10 +77,10 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                     android.util.Base64.decode(c.identityPkB64,
                         android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
                 } catch (_: Exception) { return@mapNotNull null }
-                val dmId = im.dmRoomId(pkBytes) ?: return@mapNotNull null
-                val historyTs = lastTsByRoom[dmId]
+                val pmId = im.pmRoomId(pkBytes) ?: return@mapNotNull null
+                val historyTs = lastTsByRoom[pmId]
                 ChatEntry(
-                    id = dmId,
+                    id = pmId,
                     title = c.displayName.ifBlank { c.handle ?: "?" },
                     preview = c.handle?.let { h ->
                         if (c.server != null) "@$h@${c.server}" else "@$h"
@@ -96,9 +96,9 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             // history yet, e.g. just connected to "guest"). -----------------
             val historicalGroups = summaries
                 .map { it.roomId }
-                .filter { !it.startsWith("dm:") }
+                .filter { !it.let { it.startsWith("pm:") || it.startsWith("dm:") } }
                 .toMutableSet()
-            if (ui.isConnected && f.room.isNotBlank() && !f.room.startsWith("dm:")) {
+            if (ui.isConnected && f.room.isNotBlank() && !f.room.let { it.startsWith("pm:") || it.startsWith("dm:") }) {
                 historicalGroups.add(f.room)
             }
             val groupEntries = historicalGroups.map { roomId ->
@@ -172,7 +172,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             // на ConnectScreen уже выбранную обычную (групповую) комнату
             // из prefs — это то, что пользователь видел в форме до того
             // как открыл ЛС. По умолчанию prefs хранит "guest".
-            if (_form.value.room.startsWith("dm:")) {
+            if (_form.value.room.let { it.startsWith("pm:") || it.startsWith("dm:") }) {
                 val saved = prefs.getString(KEY_ROOM, "guest") ?: "guest"
                 _form.update { it.copy(room = saved) }
             }
@@ -612,28 +612,37 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             contact.identityPkB64,
             android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
         )
-        val dmId = im.dmRoomId(otherPk) ?: run {
-            _uiState.update { it.copy(errorBanner = "No identity to open DM.") }
+        val pmId = im.pmRoomId(otherPk) ?: run {
+            _uiState.update { it.copy(errorBanner = "Нет identity для открытия ЛС.") }
             return
         }
-        // Mark this as a planned room switch so onDisconnected doesn't flash
-        // the user back to the connect screen for the ~5s the AUTO JOIN
-        // timeout takes when no one else is in the DM yet.
+        // Детерминированный ключ ЛС-комнаты через X25519 ECDH — одинаковый
+        // у обоих собеседников, поэтому никакой гонки JOIN/CREATE нет.
+        val key32 = im.pmRoomKey(otherPk) ?: run {
+            _uiState.update { it.copy(errorBanner = "Не удалось вычислить ключ ЛС.") }
+            return
+        }
+        val keyB64 = android.util.Base64.encodeToString(
+            key32,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+        )
+        java.util.Arrays.fill(key32, 0)
+
         if (_uiState.value.isConnected) switchingRoom = true
         _uiState.update {
             it.copy(
-                activeChatId = dmId,
+                activeChatId = pmId,
                 isConnecting = true,
                 messages     = emptyList(),
                 statusText   = "switching room…",
                 chats        = listOf(ChatEntry(
-                    id = dmId,
-                    title = contact.displayName.ifBlank { dmId },
+                    id = pmId,
+                    title = contact.displayName.ifBlank { pmId },
                     preview = "",
                     lastActivity = Instant.now())),
             )
         }
-        _form.update { it.copy(room = dmId, mode = ConnectMode.AUTO) }
+        _form.update { it.copy(room = pmId, key = keyB64, mode = ConnectMode.MANUAL_KEY) }
         connect()
     }
 
@@ -753,7 +762,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         // Не сохраняем dm:* как «комнату по умолчанию» — это комната ЛС,
         // которую пользователь открыл из сайдбара, а ConnectScreen
         // должен запоминать последнюю обычную (групповую) комнату.
-        val roomToSave = if (f.room.startsWith("dm:")) "guest" else f.room
+        val roomToSave = if (f.room.let { it.startsWith("pm:") || it.startsWith("dm:") }) "guest" else f.room
         prefs.edit()
             .putString(KEY_HOST, f.host)
             .putInt(KEY_PORT, f.port)
