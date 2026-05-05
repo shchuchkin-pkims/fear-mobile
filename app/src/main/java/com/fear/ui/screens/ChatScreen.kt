@@ -25,11 +25,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -56,13 +60,16 @@ import com.fear.ui.components.Avatar
 import com.fear.ui.components.ChatListRow
 import com.fear.ui.components.MessageBubble
 import com.fear.ui.theme.LocalFearColors
+import com.fear.ui.viewmodel.ChatEntry
 import com.fear.ui.viewmodel.ChatUiState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     state: ChatUiState,
-    onChatSelected: (String) -> Unit,
+    chatList: List<ChatEntry>,
+    onChatSelected: (ChatEntry) -> Unit,
+    onAddNew: () -> Unit,
     onSendMessage: (String) -> Unit,
     onMenuClick: () -> Unit,
     onAudioCall: () -> Unit,
@@ -76,11 +83,18 @@ fun ChatScreen(
     // Phone-first layout: when a chat is open, show chat full screen.
     // Side panel will come back for tablets in a later session.
     if (state.activeChatId == null) {
-        SidebarOnly(state = state, onChatSelected = onChatSelected, onMenuClick = onMenuClick)
+        SidebarOnly(
+            chats = chatList,
+            activeChatId = state.activeChatId,
+            onChatSelected = onChatSelected,
+            onMenuClick = onMenuClick,
+            onAddNew = onAddNew,
+        )
     } else {
-        val activeChat = state.chats.firstOrNull { it.id == state.activeChatId }
+        val activeChat = chatList.firstOrNull { it.id == state.activeChatId }
+            ?: state.chats.firstOrNull { it.id == state.activeChatId }
         ChatPane(
-            chatTitle = activeChat?.title ?: "",
+            chatTitle = activeChat?.title ?: state.activeChatId,
             statusText = state.statusText,
             messages = state.messages,
             onSendMessage = onSendMessage,
@@ -96,55 +110,73 @@ fun ChatScreen(
 
 @Composable
 private fun SidebarOnly(
-    state: ChatUiState,
-    onChatSelected: (String) -> Unit,
+    chats: List<ChatEntry>,
+    activeChatId: String?,
+    onChatSelected: (ChatEntry) -> Unit,
     onMenuClick: () -> Unit,
+    onAddNew: () -> Unit,
 ) {
     val colors = LocalFearColors.current
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(colors.background)
             .statusBarsPadding()
             .navigationBarsPadding(),
     ) {
-        // Header (search + hamburger)
-        Row(
-            modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(onClick = onMenuClick) {
-                Icon(Icons.Filled.MoreVert, contentDescription = "Menu", tint = colors.textSecondary)
-            }
-            // Search placeholder (functional next session)
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(36.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(colors.surface)
-                    .padding(horizontal = 14.dp),
-                contentAlignment = Alignment.CenterStart,
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Header (search + hamburger)
+            Row(
+                modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Search", color = colors.textSecondary, fontSize = 13.sp)
-            }
-        }
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        if (state.chats.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No chats yet — tap ⋮ to connect", color = colors.textSecondary)
-            }
-        } else {
-            LazyColumn {
-                items(state.chats, key = { it.id }) { chat ->
-                    ChatListRow(
-                        entry = chat,
-                        selected = chat.id == state.activeChatId,
-                        onClick = { onChatSelected(chat.id) },
-                    )
+                IconButton(onClick = onMenuClick) {
+                    Icon(Icons.Filled.MoreVert, contentDescription = "Menu", tint = colors.textSecondary)
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(36.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(colors.surface)
+                        .padding(horizontal = 14.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Text("Search", color = colors.textSecondary, fontSize = 13.sp)
                 }
             }
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+            if (chats.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No chats yet — tap + to start one",
+                         color = colors.textSecondary)
+                }
+            } else {
+                LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    items(
+                        items = chats,
+                        key   = { c: ChatEntry -> c.id },
+                    ) { chat ->
+                        ChatListRow(
+                            entry = chat,
+                            selected = chat.id == activeChatId,
+                            onClick = { onChatSelected(chat) },
+                        )
+                    }
+                }
+            }
+        }
+
+        FloatingActionButton(
+            onClick = onAddNew,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp),
+            containerColor = colors.accent,
+        ) {
+            Icon(Icons.Filled.Add, contentDescription = "New chat",
+                 tint = androidx.compose.ui.graphics.Color.White)
         }
     }
 }

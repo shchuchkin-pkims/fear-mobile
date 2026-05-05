@@ -19,12 +19,21 @@ data class ConnectFormState(
     val mode: ConnectMode = ConnectMode.AUTO, // one-button connect: tries JOIN, falls back to CREATE
 )
 
+enum class ChatKind {
+    GROUP,                  // multi-user room — icon 👥
+    DM,                     // 1-on-1 with a contact — icon 👤, id starts with "dm:"
+}
+
 data class ChatEntry(
     val id: String,
     val title: String,
     val preview: String = "",
     val lastActivity: Instant = Instant.EPOCH,
     val unread: Int = 0,
+    val kind: ChatKind = ChatKind.GROUP,
+    /** For DM entries: the contact pk (URL-safe b64) so the row can drive
+     *  openDmWithPk without re-parsing the dm id. Null for GROUP rooms. */
+    val peerPkB64: String? = null,
 )
 
 data class ChatMessage(

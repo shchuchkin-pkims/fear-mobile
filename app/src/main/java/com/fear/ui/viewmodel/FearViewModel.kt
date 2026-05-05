@@ -16,8 +16,12 @@ import com.fear.data.MessageEntity
 import com.fear.data.ProfileStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.Instant
@@ -44,6 +48,45 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _form = MutableStateFlow(loadFormFromPrefs())
     val form: StateFlow<ConnectFormState> = _form.asStateFlow()
+
+    /**
+     * Phase B-5: unified Telegram-style chat list shown in the sidebar.
+     * Combines saved contacts (each becomes a DM entry with the
+     * deterministic dm:... room id) with the currently-joined group room
+     * (when not itself a DM). Sorted newest-first by last activity.
+     */
+    val chatList: StateFlow<List<ChatEntry>> =
+        combine(contactsFlow, uiState, _form) { contacts, ui, f ->
+            val im = IdentityManager(app)
+            val dmEntries = contacts.mapNotNull { c ->
+                val pkBytes = try {
+                    android.util.Base64.decode(c.identityPkB64,
+                        android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+                } catch (_: Exception) { return@mapNotNull null }
+                val dmId = im.dmRoomId(pkBytes) ?: return@mapNotNull null
+                ChatEntry(
+                    id = dmId,
+                    title = c.displayName.ifBlank { c.handle ?: "?" },
+                    preview = c.handle?.let { h ->
+                        if (c.server != null) "@$h@${c.server}" else "@$h"
+                    } ?: "",
+                    lastActivity = Instant.ofEpochMilli(c.addedAt),
+                    kind = ChatKind.DM,
+                    peerPkB64 = c.identityPkB64,
+                )
+            }
+            val activeGroup =
+                if (ui.isConnected && f.room.isNotBlank() && !f.room.startsWith("dm:"))
+                    listOf(ChatEntry(
+                        id = f.room,
+                        title = f.room,
+                        preview = "",
+                        lastActivity = Instant.now(),
+                        kind = ChatKind.GROUP,
+                    ))
+                else emptyList()
+            (dmEntries + activeGroup).sortedByDescending { it.lastActivity }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val seenPeers = mutableSetOf<String>()
     private var reportedCount = 0

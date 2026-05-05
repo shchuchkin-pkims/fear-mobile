@@ -258,9 +258,31 @@ class ComposeMainActivity : ComponentActivity() {
                         onOpenProfile = { profileOpen = true },
                     )
                 } else {
+                    val chatListState by viewModel.chatList.collectAsState()
                     ChatScreen(
                         state = state,
-                        onChatSelected = viewModel::openChat,
+                        chatList = chatListState,
+                        onChatSelected = { entry ->
+                            // DM entry → reconnect to that DM room (handles
+                            // contact-not-yet-saved via openDmWithPk).
+                            // GROUP entry → just open the active chat pane.
+                            if (entry.kind == com.fear.ui.viewmodel.ChatKind.DM
+                                && entry.peerPkB64 != null) {
+                                viewModel.openDmWithPk(
+                                    identityPkB64 = entry.peerPkB64,
+                                    displayName   = entry.title,
+                                    handle        = null,
+                                    server        = null,
+                                )
+                            } else {
+                                viewModel.openChat(entry.id)
+                            }
+                        },
+                        onAddNew       = {
+                            // Two ways to start a new chat: Add contact (DM)
+                            // or Connect to a named room.
+                            contactsOpen = true
+                        },
                         onSendMessage  = viewModel::sendMessage,
                         onMenuClick    = { menuOpen = true },
                         onAudioCall    = { startAudioCall() },

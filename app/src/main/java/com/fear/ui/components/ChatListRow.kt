@@ -3,6 +3,7 @@ package com.fear.ui.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,6 +12,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -21,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.fear.ui.theme.LocalFearColors
 import com.fear.ui.viewmodel.ChatEntry
+import com.fear.ui.viewmodel.ChatKind
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -46,7 +52,29 @@ fun ChatListRow(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = entry.title, size = 48.dp)
+        Box {
+            Avatar(seed = entry.title, size = 48.dp)
+            // Small overlay badge in the corner that distinguishes a DM
+            // (👤) from a group room (👥). Uses Material icons because the
+            // Avatar already uses an initial, so the badge is the type cue.
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .size(18.dp)
+                    .clip(CircleShape)
+                    .background(colors.surface)
+                    .padding(2.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (entry.kind == ChatKind.DM)
+                        Icons.Filled.Person else Icons.Filled.Group,
+                    contentDescription = if (entry.kind == ChatKind.DM) "Direct" else "Group",
+                    tint = colors.textSecondary,
+                    modifier = Modifier.size(12.dp),
+                )
+            }
+        }
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
