@@ -168,6 +168,14 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 _uiState.update { it.copy(statusText = "switching room…") }
                 return
             }
+            // Если текущая комната это DM, после отключения возвращаем
+            // на ConnectScreen уже выбранную обычную (групповую) комнату
+            // из prefs — это то, что пользователь видел в форме до того
+            // как открыл ЛС. По умолчанию prefs хранит "guest".
+            if (_form.value.room.startsWith("dm:")) {
+                val saved = prefs.getString(KEY_ROOM, "guest") ?: "guest"
+                _form.update { it.copy(room = saved) }
+            }
             _uiState.update {
                 it.copy(
                     isConnected = false,
@@ -742,10 +750,14 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun saveFormToPrefs() {
         val f = _form.value
+        // Не сохраняем dm:* как «комнату по умолчанию» — это комната ЛС,
+        // которую пользователь открыл из сайдбара, а ConnectScreen
+        // должен запоминать последнюю обычную (групповую) комнату.
+        val roomToSave = if (f.room.startsWith("dm:")) "guest" else f.room
         prefs.edit()
             .putString(KEY_HOST, f.host)
             .putInt(KEY_PORT, f.port)
-            .putString(KEY_ROOM, f.room)
+            .putString(KEY_ROOM, roomToSave)
             .putString(KEY_NAME, f.name)
             .apply()
     }
