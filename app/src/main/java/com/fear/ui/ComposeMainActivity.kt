@@ -33,7 +33,10 @@ import com.fear.ui.components.AboutDialog
 import com.fear.ui.components.CallOverlay
 import com.fear.ThemeManager
 import com.fear.ui.components.IdentityBackupSheet
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.fear.ui.components.MenuSheet
+import com.fear.ui.components.NewChatSheet
 import com.fear.ui.components.PasswordPromptDialog
 import com.fear.ui.components.QrShowDialog
 import com.fear.ui.components.SearchDialog
@@ -133,6 +136,12 @@ class ComposeMainActivity : ComponentActivity() {
                 /* Long-press на элементе сайдбара → диалог подтверждения
                  * удаления чата. */
                 var pendingDelete by remember { mutableStateOf<com.fear.ui.viewmodel.ChatEntry?>(null) }
+                /* Сайдбарный "+" → bottom-sheet с тремя вариантами:
+                 *  Add contact / Join room / Create new room. */
+                var newChatSheetOpen by remember { mutableStateOf(false) }
+                /* Когда не null — открыт диалог ввода имени комнаты для
+                 * Join (false) или Create (true). */
+                var roomNamePrompt by remember { mutableStateOf<Boolean?>(null) }
                 var peerProfile by remember { mutableStateOf<com.fear.ui.viewmodel.FearViewModel.PeerInfo?>(null) }
                 val peerLookupScope = rememberCoroutineScope()
                 val profileState by viewModel.profileState.collectAsState()
@@ -294,11 +303,7 @@ class ComposeMainActivity : ComponentActivity() {
                             }
                         },
                         onChatLongPressed = { entry -> pendingDelete = entry },
-                        onAddNew       = {
-                            // Two ways to start a new chat: Add contact (DM)
-                            // or Connect to a named room.
-                            contactsOpen = true
-                        },
+                        onAddNew       = { newChatSheetOpen = true },
                         onSendMessage  = viewModel::sendMessage,
                         onMenuClick    = { menuOpen = true },
                         onAudioCall    = { startAudioCall() },
@@ -387,6 +392,72 @@ class ComposeMainActivity : ComponentActivity() {
                                     handle        = p.handle,
                                     server        = p.server,
                                 )
+                            },
+                        )
+                    }
+
+                    if (newChatSheetOpen) {
+                        NewChatSheet(
+                            onDismiss     = { newChatSheetOpen = false },
+                            onAddContact  = { contactsOpen = true },
+                            onJoinRoom    = { roomNamePrompt = false },
+                            onCreateRoom  = { roomNamePrompt = true },
+                        )
+                    }
+
+                    roomNamePrompt?.let { isCreate ->
+                        var roomName by remember { mutableStateOf("") }
+                        androidx.compose.material3.AlertDialog(
+                            onDismissRequest = { roomNamePrompt = null },
+                            title = { androidx.compose.material3.Text(
+                                if (isCreate) "Create new room" else "Join room") },
+                            text = {
+                                androidx.compose.foundation.layout.Column(
+                                    verticalArrangement =
+                                        androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
+                                ) {
+                                    androidx.compose.material3.Text(
+                                        if (isCreate)
+                                            "Pick a room name. A fresh encryption key " +
+                                            "will be generated and shared with anyone " +
+                                            "who joins later."
+                                        else
+                                            "Enter the name of an existing room. The " +
+                                            "encryption key will be fetched from a " +
+                                            "participant who is already inside.",
+                                        fontSize = 13.sp,
+                                    )
+                                    androidx.compose.material3.OutlinedTextField(
+                                        value = roomName,
+                                        onValueChange = { roomName = it },
+                                        singleLine = true,
+                                        label = { androidx.compose.material3.Text("Room name") },
+                                    )
+                                }
+                            },
+                            confirmButton = {
+                                androidx.compose.material3.TextButton(
+                                    enabled = roomName.isNotBlank(),
+                                    onClick = {
+                                        val target = roomName.trim()
+                                        roomNamePrompt = null
+                                        viewModel.openGroupRoom(
+                                            target,
+                                            if (isCreate)
+                                                com.fear.ui.viewmodel.ConnectMode.CREATE_ROOM
+                                            else
+                                                com.fear.ui.viewmodel.ConnectMode.JOIN_ROOM,
+                                        )
+                                    },
+                                ) {
+                                    androidx.compose.material3.Text(
+                                        if (isCreate) "Create" else "Join")
+                                }
+                            },
+                            dismissButton = {
+                                androidx.compose.material3.TextButton(onClick = { roomNamePrompt = null }) {
+                                    androidx.compose.material3.Text("Cancel")
+                                }
                             },
                         )
                     }

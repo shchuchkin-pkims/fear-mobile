@@ -665,7 +665,20 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun openGroupRoom(roomId: String) {
+    fun openGroupRoom(roomId: String) = openGroupRoom(roomId, ConnectMode.AUTO)
+
+    /**
+     * Switch the active chat to a group room.
+     *
+     * The default ([ConnectMode.AUTO]) is used when the user just taps a
+     * room in their sidebar — the relay decides whether to join an
+     * existing room or create a new one.
+     *
+     * The explicit [ConnectMode.JOIN_ROOM] / [ConnectMode.CREATE_ROOM]
+     * variants are used by the "+" → "Join room" / "Create new room"
+     * sheet on the sidebar so the user's intent is explicit.
+     */
+    fun openGroupRoom(roomId: String, mode: ConnectMode) {
         val current = _form.value.room
         if (current == roomId && _uiState.value.isConnected) {
             openChat(roomId)
@@ -685,7 +698,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                     lastActivity = Instant.now(), kind = ChatKind.GROUP)),
             )
         }
-        _form.update { it.copy(room = roomId, key = "", mode = ConnectMode.AUTO) }
+        _form.update { it.copy(room = roomId, key = "", mode = mode) }
         connect()
     }
 
