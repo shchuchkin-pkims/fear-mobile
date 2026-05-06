@@ -201,6 +201,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         override fun onConnected() {
             pendingAutoJoin = false
             switchingRoom = false
+            intendedConnected = true
             saveFormToPrefs()
             val f = _form.value
             _uiState.update {
@@ -487,27 +488,43 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Состояние клиентского сокета. UI использует чтобы понять, нужен
-     *  ли повторный коннект после возврата из background-а (Doze
-     *  обычно рвёт TCP). */
+    /** Состояние клиентского сокета. */
     fun isClientConnected(): Boolean = client.isConnected()
 
+    /** True пока пользователь намеренно «онлайн» — выключается только
+     *  явным нажатием Disconnect. Doze может уронить сокет за время
+     *  блокировки экрана, и onDisconnected очистит state.isConnected;
+     *  по этому флагу onResume понимает, что нужен reconnect. */
+    @Volatile private var intendedConnected = false
+
     /**
-     * Если в state мы помечены как «подключены», но реальный TCP-сокет
-     * уже мёртв (Doze, переключение Wi-Fi/LTE, разблокировка экрана
-     * после долгого простоя), запускаем тихий reconnect к той же
-     * комнате. Вызывается из ComposeMainActivity при ON_RESUME.
+     * Вызывается из ComposeMainActivity при ON_RESUME. Если пользователь
+     * подразумевает, что он подключён (intendedConnected=true), но
+     * реальный TCP-сокет уже мёртв — тихо переподключаемся к той же
+     * комнате. Покрывает сценарий «заблокировал экран на минуту → Doze
+     * порвал TCP → разблокировал экран».
      */
     fun reconnectIfDropped() {
-        if (_uiState.value.isConnected && !client.isConnected()) {
-            android.util.Log.i(TAG, "reconnectIfDropped: socket dead, reconnecting to ${_form.value.room}")
-            // Ставим флаг переключения, чтобы UI не мигнул на ConnectScreen.
+        if (intendedConnected && !client.isConnected()) {
+            val room = _form.value.room
+            android.util.Log.i(TAG, "reconnectIfDropped: socket dead, reconnecting to $room")
             switchingRoom = true
+            // Возвращаем UI в чат-режим до того, как стартанём connect,
+            // иначе пользователь успеет увидеть ConnectScreen.
+            _uiState.update {
+                it.copy(
+                    isConnected = true,
+                    isConnecting = true,
+                    activeChatId = it.activeChatId ?: room,
+                    statusText = "reconnecting…",
+                )
+            }
             connect()
         }
     }
 
     fun disconnect() {
+        intendedConnected = false
         viewModelScope.launch(Dispatchers.IO) { client.disconnect() }
     }
 
