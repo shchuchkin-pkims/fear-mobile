@@ -275,7 +275,7 @@ class ComposeMainActivity : ComponentActivity() {
                                     server        = null,
                                 )
                             } else {
-                                viewModel.openChat(entry.id)
+                                viewModel.openGroupRoom(entry.id)
                             }
                         },
                         onAddNew       = {

@@ -433,6 +433,36 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Тап на групповую комнату в сайдбаре. Если уже подключены к этой
+     * комнате — просто переключаем UI (openChat). Иначе — реконнект в
+     * режиме AUTO (JOIN с фолбэком на CREATE), чтобы сокет действительно
+     * оказался в нужной комнате на сервере.
+     */
+    fun openGroupRoom(roomId: String) {
+        val current = _form.value.room
+        if (current == roomId && _uiState.value.isConnected) {
+            openChat(roomId)
+            return
+        }
+        // Помечаем переход как «switching» чтобы UI не мигнул на ConnectScreen
+        // во время короткого reconnect-а.
+        if (_uiState.value.isConnected) switchingRoom = true
+        _uiState.update {
+            it.copy(
+                activeChatId = roomId,
+                isConnecting = true,
+                messages     = emptyList(),
+                statusText   = "switching room…",
+                chats        = listOf(ChatEntry(
+                    id = roomId, title = roomId, preview = "",
+                    lastActivity = Instant.now(), kind = ChatKind.GROUP)),
+            )
+        }
+        _form.update { it.copy(room = roomId, key = "", mode = ConnectMode.AUTO) }
+        connect()
+    }
+
+    /**
      * Reserve `nickname` on the relay at `host:port`. On success, persist the
      * `host → nickname` mapping in ProfileStore. The result is *always*
      * delivered on the Main thread so UI callbacks (Toast, dialog state)
