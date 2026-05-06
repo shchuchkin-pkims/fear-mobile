@@ -287,6 +287,11 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             for (c in contacts) {
                 if (c.isNotBlank() && c != _form.value.name) seenPeers.add(c)
             }
+            // Снимаем актуальный список и кладём в state — заголовку чата
+            // (групповая комната) нужно показать всех присутствующих, а не
+            // только тех, от кого мы получили сообщения.
+            val unique = contacts.filter { it.isNotBlank() }.distinct()
+            _uiState.update { it.copy(participants = unique) }
             recomputeStatus()
         }
 
@@ -354,10 +359,13 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun recomputeStatus() {
         val total = maxOf(reportedCount, seenPeers.size + 1)
+        val isPm  = _form.value.room.startsWith("pm:") || _form.value.room.startsWith("dm:")
         val text = when {
             !_uiState.value.isConnected -> ""
-            total <= 1 -> "just you online"
-            else       -> "$total online"
+            isPm && total >= 2 -> "online"
+            isPm               -> "offline"
+            total <= 1         -> "just you online"
+            else               -> "$total online"
         }
         _uiState.update { it.copy(statusText = text) }
     }
@@ -509,6 +517,59 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
      * режиме AUTO (JOIN с фолбэком на CREATE), чтобы сокет действительно
      * оказался в нужной комнате на сервере.
      */
+    /**
+     * Перейти к конкретному сообщению в локальной истории. Используется
+     * SearchDialog: тап по найденному результату должен открыть нужную
+     * комнату и прокрутить чат к сообщению с этим timestamp.
+     *
+     * Для PM-комнат (`pm:` / `dm:`) ищет соответствующий контакт по
+     * совпадению pmRoomId и зовёт [openDmWithPk]; для групповых —
+     * [openGroupRoom]. После переключения комнаты state.pendingScrollToTs
+     * подхватывается ChatPane-ом, который скроллит список к найденному
+     * сообщению.
+     */
+    fun jumpToMessage(roomId: String, ts: Long) {
+        val current = _form.value.room
+        if (current == roomId && _uiState.value.isConnected) {
+            _uiState.update { it.copy(pendingScrollToTs = ts) }
+            return
+        }
+        if (roomId.startsWith("pm:") || roomId.startsWith("dm:")) {
+            // Найдём соответствующий контакт по совпадению идентификатора.
+            viewModelScope.launch(Dispatchers.IO) {
+                val app = getApplication<Application>()
+                val im  = IdentityManager(app)
+                val match = contactsRepo.all().firstOrNull { c ->
+                    val pkBytes = try {
+                        android.util.Base64.decode(c.identityPkB64,
+                            android.util.Base64.URL_SAFE or
+                            android.util.Base64.NO_WRAP or
+                            android.util.Base64.NO_PADDING)
+                    } catch (_: Exception) { return@firstOrNull false }
+                    im.pmRoomId(pkBytes) == roomId
+                }
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    if (match != null) {
+                        _uiState.update { it.copy(pendingScrollToTs = ts) }
+                        openDmWith(match)
+                    } else {
+                        _uiState.update { it.copy(errorBanner =
+                            "Не нашли контакт для этой ЛС-комнаты.") }
+                    }
+                }
+            }
+        } else {
+            _uiState.update { it.copy(pendingScrollToTs = ts) }
+            openGroupRoom(roomId)
+        }
+    }
+
+    /** Сбрасывает целевой timestamp прокрутки — вызывается ChatPane-ом
+     *  после успешного scrollToItem. */
+    fun clearScrollTarget() {
+        _uiState.update { it.copy(pendingScrollToTs = null) }
+    }
+
     fun openGroupRoom(roomId: String) {
         val current = _form.value.room
         if (current == roomId && _uiState.value.isConnected) {

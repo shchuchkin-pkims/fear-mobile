@@ -81,6 +81,8 @@ fun ChatScreen(
     onAttach: () -> Unit,
     onBack: () -> Unit,
     onSenderTap: (String) -> Unit = {},
+    onHeaderTap: (ChatEntry) -> Unit = {},
+    onScrollHandled: () -> Unit = {},
 ) {
     val colors = LocalFearColors.current
 
@@ -97,10 +99,13 @@ fun ChatScreen(
     } else {
         val activeChat = chatList.firstOrNull { it.id == state.activeChatId }
             ?: state.chats.firstOrNull { it.id == state.activeChatId }
+            ?: ChatEntry(id = state.activeChatId, title = state.activeChatId)
         ChatPane(
-            chatTitle = activeChat?.title ?: state.activeChatId,
+            chatTitle = activeChat.title,
             statusText = state.statusText,
             messages = state.messages,
+            pendingScrollToTs = state.pendingScrollToTs,
+            onScrollHandled = onScrollHandled,
             onSendMessage = onSendMessage,
             onMenuClick = onMenuClick,
             onAudioCall = onAudioCall,
@@ -108,6 +113,7 @@ fun ChatScreen(
             onAttach = onAttach,
             onBack = onBack,
             onSenderTap = onSenderTap,
+            onHeaderTap = { onHeaderTap(activeChat) },
         )
     }
 }
@@ -252,6 +258,8 @@ private fun ChatPane(
     chatTitle: String,
     statusText: String,
     messages: List<com.fear.ui.viewmodel.ChatMessage>,
+    pendingScrollToTs: Long?,
+    onScrollHandled: () -> Unit,
     onSendMessage: (String) -> Unit,
     onMenuClick: () -> Unit,
     onAudioCall: () -> Unit,
@@ -259,13 +267,29 @@ private fun ChatPane(
     onAttach: () -> Unit,
     onBack: () -> Unit,
     onSenderTap: (String) -> Unit = {},
+    onHeaderTap: () -> Unit = {},
 ) {
     val colors = LocalFearColors.current
     val listState = rememberLazyListState()
 
-    // Auto-scroll to bottom when a new message arrives.
+    // Auto-scroll to bottom when a new message arrives — но не если ждём
+    // прокрутку к найденному через поиск сообщению.
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+        if (pendingScrollToTs == null && messages.isNotEmpty())
+            listState.animateScrollToItem(messages.size - 1)
+    }
+
+    // Если SearchDialog попросил прокрутить к конкретному ts — найдём
+    // его индекс и прыгнем туда. Если сообщение ещё не в текущем
+    // messages (история ещё грузится), повторим попытку, когда
+    // messages.size изменится.
+    LaunchedEffect(pendingScrollToTs, messages.size) {
+        val target = pendingScrollToTs ?: return@LaunchedEffect
+        val idx = messages.indexOfFirst { it.timestamp.toEpochMilli() == target }
+        if (idx >= 0) {
+            listState.animateScrollToItem(idx)
+            onScrollHandled()
+        }
     }
 
     Column(
@@ -284,11 +308,23 @@ private fun ChatPane(
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back",
                      tint = colors.textSecondary)
             }
-            Avatar(seed = chatTitle, size = 36.dp)
-            Spacer(Modifier.width(10.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(chatTitle, color = colors.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                Text(statusText, color = colors.textSecondary, fontSize = 12.sp)
+            // Аватар + название + статус — единая кликабельная зона.
+            // Тап → onHeaderTap (профиль собеседника для ЛС, список
+            // участников для группы).
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onHeaderTap)
+                    .padding(start = 4.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Avatar(seed = chatTitle, size = 36.dp)
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(chatTitle, color = colors.textPrimary,
+                         fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                    Text(statusText, color = colors.textSecondary, fontSize = 12.sp)
+                }
             }
             IconButton(onClick = onAudioCall) { Icon(Icons.Filled.Call, "Audio call", tint = colors.textSecondary) }
             IconButton(onClick = onVideoCall) { Icon(Icons.Filled.Videocam, "Video call", tint = colors.textSecondary) }

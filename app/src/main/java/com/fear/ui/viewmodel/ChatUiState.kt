@@ -60,4 +60,11 @@ data class ChatUiState(
     val statusText: String = "",
     val errorBanner: String? = null,
     val call: CallState = CallState(),
+    /** Если установлено — UI чата должен прокрутить список к сообщению с
+     *  этим timestamp и кратко подсветить его. Используется при переходе
+     *  по результату поиска. После применения сбрасывается ViewModel-ом. */
+    val pendingScrollToTs: Long? = null,
+    /** Список participants комнаты, последние известные значения от
+     *  сервера. Используется заголовком чата для группового профиля. */
+    val participants: List<String> = emptyList(),
 )

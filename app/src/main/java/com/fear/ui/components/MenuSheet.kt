@@ -19,9 +19,6 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Backup
-import androidx.compose.material.icons.filled.Restore
-import androidx.compose.material.icons.filled.QrCode
-import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Person
@@ -48,10 +45,7 @@ fun MenuSheet(
     onToggleTheme: () -> Unit,
     onCheckUpdates: () -> Unit,
     onAbout: () -> Unit,
-    onExportIdentity: () -> Unit,
-    onImportIdentity: () -> Unit,
-    onShowQr: () -> Unit,
-    onImportQr: () -> Unit,
+    onIdentityBackup: () -> Unit,
     onClearHistory: () -> Unit,
     onSearch: () -> Unit,
     onProfile: () -> Unit,
@@ -84,17 +78,8 @@ fun MenuSheet(
             MenuItem(Icons.Filled.VpnKey, "Trusted keys", colors.textPrimary) {
                 onTrustedKeys(); onDismiss()
             }
-            MenuItem(Icons.Filled.Backup, "Export identity…", colors.textPrimary) {
-                onExportIdentity(); onDismiss()
-            }
-            MenuItem(Icons.Filled.Restore, "Import identity…", colors.textPrimary) {
-                onImportIdentity(); onDismiss()
-            }
-            MenuItem(Icons.Filled.QrCode, "Show identity as QR…", colors.textPrimary) {
-                onShowQr(); onDismiss()
-            }
-            MenuItem(Icons.Filled.QrCodeScanner, "Import identity from QR…", colors.textPrimary) {
-                onImportQr(); onDismiss()
+            MenuItem(Icons.Filled.Backup, "Identity & backup…", colors.textPrimary) {
+                onIdentityBackup(); onDismiss()
             }
             MenuItem(
                 if (colors.isDark) Icons.Filled.LightMode else Icons.Filled.DarkMode,

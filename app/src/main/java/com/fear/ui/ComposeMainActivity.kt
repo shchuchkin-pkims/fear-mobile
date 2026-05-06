@@ -31,6 +31,7 @@ import com.fear.TrustedKeysActivity
 import com.fear.VideoCallActivity
 import com.fear.ui.components.AboutDialog
 import com.fear.ui.components.CallOverlay
+import com.fear.ui.components.IdentityBackupSheet
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.PasswordPromptDialog
 import com.fear.ui.components.QrShowDialog
@@ -103,6 +104,13 @@ class ComposeMainActivity : ComponentActivity() {
                  * запускается и из ProfileScreen, и из ConnectScreen. */
                 var registerHandleHost by remember { mutableStateOf<String?>(null) }
                 var addContactOpen by remember { mutableStateOf(false) }
+                /* Sub-sheet for identity backup actions (export/import .fbk,
+                 * show/import QR). Replaces four separate menu items with
+                 * one entry point. */
+                var identityBackupOpen by remember { mutableStateOf(false) }
+                /* Открыт диалог со списком участников групповой комнаты,
+                 * показывается по тапу на header в групповом чате. */
+                var groupInfoVisible by remember { mutableStateOf(false) }
                 var peerProfile by remember { mutableStateOf<com.fear.ui.viewmodel.FearViewModel.PeerInfo?>(null) }
                 val peerLookupScope = rememberCoroutineScope()
                 val profileState by viewModel.profileState.collectAsState()
@@ -282,7 +290,42 @@ class ComposeMainActivity : ComponentActivity() {
                                 peerProfile = viewModel.lookupPeer(name)
                             }
                         },
+                        onHeaderTap    = { entry ->
+                            if (entry.kind == com.fear.ui.viewmodel.ChatKind.DM) {
+                                // ЛС → профиль собеседника. Имя ищем по
+                                // самому свежему стороннему сообщению, либо
+                                // по самому первому участнику.
+                                val peerName = state.participants.firstOrNull {
+                                    it.isNotBlank() && it != form.name
+                                } ?: state.messages.firstOrNull { !it.fromSelf }?.sender
+                                if (peerName != null) {
+                                    peerLookupScope.launch {
+                                        peerProfile = viewModel.lookupPeer(peerName)
+                                    }
+                                }
+                            } else {
+                                // Группа → диалог со списком участников.
+                                groupInfoVisible = true
+                            }
+                        },
+                        onScrollHandled = { viewModel.clearScrollTarget() },
                     )
+
+                    if (groupInfoVisible) {
+                        val activeTitle = chatListState.firstOrNull {
+                            it.id == state.activeChatId
+                        }?.title ?: state.activeChatId.orEmpty()
+                        com.fear.ui.components.GroupParticipantsDialog(
+                            roomTitle = activeTitle,
+                            participants = state.participants,
+                            onPeerTap = { name ->
+                                peerLookupScope.launch {
+                                    peerProfile = viewModel.lookupPeer(name)
+                                }
+                            },
+                            onDismiss = { groupInfoVisible = false },
+                        )
+                    }
 
                     peerProfile?.let { info ->
                         PeerProfileDialog(
@@ -319,25 +362,7 @@ class ComposeMainActivity : ComponentActivity() {
                             onToggleTheme = { darkOverride = !effectiveDark },
                             onCheckUpdates = { triggerUpdateCheck { updateInfo = it } },
                             onAbout = { aboutOpen = true },
-                            onExportIdentity = {
-                                exportSaveLauncher.launch("fear-identity-backup.fbk")
-                            },
-                            onImportIdentity = {
-                                importOpenLauncher.launch(arrayOf("*/*"))
-                            },
-                            onShowQr = { qrPasswordOpen = true },
-                            onImportQr = {
-                                qrScanLauncher.launch(
-                                    com.journeyapps.barcodescanner.ScanOptions().apply {
-                                        setDesiredBarcodeFormats(
-                                            com.journeyapps.barcodescanner.ScanOptions.QR_CODE
-                                        )
-                                        setPrompt("Scan FEAR identity QR")
-                                        setBeepEnabled(false)
-                                        setOrientationLocked(false)
-                                    }
-                                )
-                            },
+                            onIdentityBackup = { identityBackupOpen = true },
                             onClearHistory = {
                                 viewModel.clearHistory()
                                 Toast.makeText(this@ComposeMainActivity,
@@ -349,9 +374,43 @@ class ComposeMainActivity : ComponentActivity() {
                         )
                     }
 
+                    if (identityBackupOpen) {
+                        IdentityBackupSheet(
+                            onDismiss = { identityBackupOpen = false },
+                            onExportIdentity = {
+                                identityBackupOpen = false
+                                exportSaveLauncher.launch("fear-identity-backup.fbk")
+                            },
+                            onImportIdentity = {
+                                identityBackupOpen = false
+                                importOpenLauncher.launch(arrayOf("*/*"))
+                            },
+                            onShowQr = {
+                                identityBackupOpen = false
+                                qrPasswordOpen = true
+                            },
+                            onImportQr = {
+                                identityBackupOpen = false
+                                qrScanLauncher.launch(
+                                    com.journeyapps.barcodescanner.ScanOptions().apply {
+                                        setDesiredBarcodeFormats(
+                                            com.journeyapps.barcodescanner.ScanOptions.QR_CODE
+                                        )
+                                        setPrompt("Scan FEAR identity QR")
+                                        setBeepEnabled(false)
+                                        setOrientationLocked(false)
+                                    }
+                                )
+                            },
+                        )
+                    }
+
                     if (searchOpen) {
                         SearchDialog(
                             onSearch = { needle -> viewModel.searchMessages(needle) },
+                            onOpenMessage = { msg ->
+                                viewModel.jumpToMessage(msg.roomId, msg.ts)
+                            },
                             onDismiss = { searchOpen = false },
                         )
                     }

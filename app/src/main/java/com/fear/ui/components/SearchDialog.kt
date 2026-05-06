@@ -1,6 +1,7 @@
 package com.fear.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -8,15 +9,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -24,13 +29,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.fear.data.MessageEntity
+import com.fear.ui.theme.LocalFearColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -40,19 +46,21 @@ import java.util.Locale
 
 /**
  * Full-screen search over local message history. As the user types, hits a
- * Room LIKE query (debounced 200ms) and renders the top N matches sorted
- * newest-first. Tapping a hit dismisses; integration with chat-jumping
- * comes when there's more than one room (Phase B).
+ * Room LIKE query (debounced 200 ms) and renders the top N matches.
+ * Tapping a hit calls [onOpenMessage] so the host can switch to the
+ * corresponding chat and scroll to that message.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SearchDialog(
     onSearch: suspend (String) -> List<MessageEntity>,
+    onOpenMessage: (MessageEntity) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val colors = LocalFearColors.current
     var query   by remember { mutableStateOf("") }
     var results by remember { mutableStateOf(emptyList<MessageEntity>()) }
 
-    // Debounced search — don't hammer Room on every keystroke.
     LaunchedEffect(query) {
         if (query.length < 2) { results = emptyList(); return@LaunchedEffect }
         delay(200)
@@ -70,59 +78,89 @@ fun SearchDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xFF101216))
+                .background(colors.background)
                 .statusBarsPadding()
                 .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
                 OutlinedTextField(
                     value = query,
                     onValueChange = { query = it },
-                    label = { Text("Search messages…") },
+                    label = { Text("Поиск сообщений…") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor      = colors.textPrimary,
+                        unfocusedTextColor    = colors.textPrimary,
+                        focusedBorderColor    = colors.accent,
+                        unfocusedBorderColor  = colors.border,
+                        focusedLabelColor     = colors.accent,
+                        unfocusedLabelColor   = colors.textSecondary,
+                        cursorColor           = colors.accent,
+                    ),
                 )
                 Spacer(Modifier.height(6.dp))
-                if (query.length < 2) {
-                    Text("Type at least 2 characters",
-                         color = Color(0xFFB0B7BE), fontSize = 12.sp)
-                } else {
-                    Text("${results.size} match${if (results.size == 1) "" else "es"}",
-                         color = Color(0xFFB0B7BE), fontSize = 12.sp)
-                }
+                Text(
+                    text = if (query.length < 2)
+                        "Введите не менее двух символов"
+                    else
+                        "${results.size} совпадений",
+                    color = colors.textSecondary, fontSize = 12.sp,
+                )
                 Spacer(Modifier.height(6.dp))
                 LazyColumn(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     items(results, key = { it.id }) { msg ->
-                        SearchResultRow(msg)
-                        HorizontalDivider(color = Color(0xFF22252B))
+                        SearchResultRow(
+                            msg = msg,
+                            onClick = {
+                                onOpenMessage(msg)
+                                onDismiss()
+                            },
+                        )
+                        HorizontalDivider(color = colors.border)
                     }
                 }
                 OutlinedButton(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Close") }
+                ) {
+                    Text("Закрыть", color = colors.textPrimary)
+                }
             }
         }
     }
 }
 
 @Composable
-private fun SearchResultRow(msg: MessageEntity) {
+private fun SearchResultRow(
+    msg: MessageEntity,
+    onClick: () -> Unit,
+) {
+    val colors = LocalFearColors.current
     val time = remember(msg.ts) {
-        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(msg.ts))
+        SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date(msg.ts))
     }
-    Column(modifier = Modifier
-        .fillMaxWidth()
-        .padding(vertical = 6.dp, horizontal = 4.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp, horizontal = 6.dp),
+    ) {
         Text(
-            "${msg.senderName}  ·  ${msg.roomId}  ·  $time",
-            color = Color(0xFFB0B7BE), fontSize = 11.sp,
+            text = "${msg.senderName} · ${msg.roomId} · $time",
+            color = colors.textSecondary, fontSize = 11.sp,
         )
-        Text(msg.text, color = Color.White, fontSize = 14.sp,
-             fontWeight = FontWeight.Normal)
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = msg.text,
+            color = colors.textPrimary, fontSize = 14.sp,
+            fontWeight = FontWeight.Normal,
+        )
     }
 }
