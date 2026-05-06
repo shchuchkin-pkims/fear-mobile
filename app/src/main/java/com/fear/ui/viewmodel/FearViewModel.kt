@@ -49,6 +49,77 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     private val _form = MutableStateFlow(loadFormFromPrefs())
     val form: StateFlow<ConnectFormState> = _form.asStateFlow()
 
+    /** Состояние регистрации текущей идентичности на выбранном сервере. */
+    enum class RegStatus { Unknown, Probing, Registered, NotRegistered, Error }
+    data class RegState(
+        val host: String = "",
+        val status: RegStatus = RegStatus.Unknown,
+        val handle: String? = null,
+    )
+    private val _regState = MutableStateFlow(RegState())
+    val regState: StateFlow<RegState> = _regState.asStateFlow()
+    private var regProbeJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Запускает проверку регистрации идентичности на `host:port`.
+     * Сначала смотрит в локальный ProfileStore (мгновенный ответ), затем
+     * через 350мс делает фоновый MSG_TYPE_LOOKUP_HANDLE_BY_PK к серверу,
+     * чтобы поймать регистрацию, сохранённую с другого устройства
+     * (после импорта identity). Старые probe-задачи отменяются — UI
+     * никогда не получает устаревший статус.
+     */
+    fun probeRegistration(host: String, port: Int) {
+        val h = host.trim()
+        if (h.isEmpty() || port <= 0) {
+            _regState.value = RegState()
+            return
+        }
+        // Step 1: snap to whatever ProfileStore already knows for this host.
+        val cached = profile.handleAt(h)
+        _regState.value = if (cached != null)
+            RegState(h, RegStatus.Registered, cached)
+        else
+            RegState(h, RegStatus.Probing, null)
+
+        // Step 2: debounced server probe.
+        regProbeJob?.cancel()
+        regProbeJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(350)
+            val app = getApplication<Application>()
+            val pk = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                val im = IdentityManager(app)
+                if (!im.hasIdentity()) im.generateIdentity()
+                im.getPublicKey()
+            } ?: run {
+                _regState.value = RegState(h, RegStatus.Error, null)
+                return@launch
+            }
+            val rc = HandleProtocol.lookupHandleByPk(h, port, pk)
+            // If the user already moved on to another host, drop this reply.
+            if (_regState.value.host != h) return@launch
+            when (rc) {
+                is HandleProtocol.HandleLookupResult.Found -> {
+                    profile.setHandle(h, rc.handle)
+                    _regState.value = RegState(h, RegStatus.Registered, rc.handle)
+                }
+                HandleProtocol.HandleLookupResult.NotFound -> {
+                    profile.removeHandle(h)
+                    _regState.value = RegState(h, RegStatus.NotRegistered, null)
+                }
+                is HandleProtocol.HandleLookupResult.ServerError,
+                is HandleProtocol.HandleLookupResult.Network -> {
+                    // Не блокируем пользователя из-за временных проблем со связью —
+                    // если есть кэш, оставляем его.
+                    val keep = profile.handleAt(h)
+                    _regState.value = if (keep != null)
+                        RegState(h, RegStatus.Registered, keep)
+                    else
+                        RegState(h, RegStatus.Error, null)
+                }
+            }
+        }
+    }
+
     /**
      * Phase B-5: unified Telegram-style chat list shown in the sidebar.
      * Combines:

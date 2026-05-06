@@ -42,6 +42,16 @@ object HandleProtocol {
         data class Network(val cause: Throwable) : LookupResult()
     }
 
+    /** Reverse-lookup result for [lookupHandleByPk]. */
+    sealed class HandleLookupResult {
+        /** Server has a handle registered for this pk. */
+        data class Found(val handle: String) : HandleLookupResult()
+        /** No handle is registered for this pk on this server. */
+        object NotFound : HandleLookupResult()
+        data class ServerError(val reason: String) : HandleLookupResult()
+        data class Network(val cause: Throwable) : HandleLookupResult()
+    }
+
     private val ls: LazySodiumAndroid = LazySodiumAndroid(SodiumAndroid())
 
     /**
@@ -82,6 +92,30 @@ object HandleProtocol {
         } catch (e: Exception) {
             android.util.Log.w("HandleProtocol", "registerHandle network: ${e.javaClass.simpleName}: ${e.message}", e)
             Result.Network(e)
+        }
+    }
+
+    /**
+     * Reverse lookup — given an [identityPk], ask the relay which handle is
+     * registered for it (if any). Used by ConnectScreen after identity
+     * import (.fbk / QR) so the user is not prompted to register a name
+     * that already belongs to them on the server.
+     */
+    suspend fun lookupHandleByPk(
+        host: String,
+        port: Int,
+        identityPk: ByteArray,
+        timeoutMs: Int = 5000,
+    ): HandleLookupResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+            require(identityPk.size == 32) { "identity_pk must be 32 bytes" }
+            val reply = roundtrip(host, port,
+                                  Common.MSG_TYPE_LOOKUP_HANDLE_BY_PK,
+                                  identityPk, timeoutMs)
+                ?: return@withContext HandleLookupResult.Network(java.io.IOException("no reply"))
+            parseHandleLookupReply(reply)
+        } catch (e: Exception) {
+            HandleLookupResult.Network(e)
         }
     }
 
@@ -198,6 +232,34 @@ object HandleProtocol {
             1 -> Result.Conflict(reason.ifEmpty { "handle taken" })
             2 -> Result.Invalid(reason.ifEmpty { "invalid handle" })
             else -> Result.ServerError(reason.ifEmpty { "server error" })
+        }
+    }
+
+    /**
+     * Parse the HANDLE_RESULT reply for [MSG_TYPE_LOOKUP_HANDLE_BY_PK].
+     * On status=0 the payload tail is `[handle_len(1)][handle UTF-8]`
+     * (NOT pk(32) like the regular LOOKUP_HANDLE reply).
+     */
+    private fun parseHandleLookupReply(payload: ByteArray): HandleLookupResult {
+        if (payload.isEmpty()) return HandleLookupResult.ServerError("empty reply")
+        val status = payload[0].toInt() and 0xFF
+        val reasonLen = if (payload.size > 1) payload[1].toInt() and 0xFF else 0
+        return when (status) {
+            0 -> {
+                val tailOff = 2 + reasonLen
+                if (payload.size <= tailOff) return HandleLookupResult.ServerError("short ok")
+                val handleLen = payload[tailOff].toInt() and 0xFF
+                if (payload.size < tailOff + 1 + handleLen)
+                    return HandleLookupResult.ServerError("truncated handle")
+                val h = String(payload, tailOff + 1, handleLen, Charsets.UTF_8)
+                HandleLookupResult.Found(h)
+            }
+            1 -> HandleLookupResult.NotFound
+            else -> {
+                val reason = if (reasonLen > 0) String(payload, 2, reasonLen, Charsets.UTF_8)
+                             else "server error"
+                HandleLookupResult.ServerError(reason)
+            }
         }
     }
 

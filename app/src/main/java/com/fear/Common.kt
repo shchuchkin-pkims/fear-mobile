@@ -99,6 +99,10 @@ object Common {
     const val MSG_TYPE_BLOB_GET:        Byte = 24
     const val MSG_TYPE_BLOB_RESULT:     Byte = 25
 
+    // Reverse handle lookup by pk (Phase B-7). Used after identity import
+    // to discover any handle previously claimed for this pk on the server.
+    const val MSG_TYPE_LOOKUP_HANDLE_BY_PK: Byte = 26
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32

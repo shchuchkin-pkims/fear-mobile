@@ -98,6 +98,10 @@ class ComposeMainActivity : ComponentActivity() {
                 var searchOpen by remember { mutableStateOf(false) }
                 var profileOpen by remember { mutableStateOf(false) }
                 var contactsOpen by remember { mutableStateOf(false) }
+                /* Когда не null — открыт диалог регистрации handle для
+                 * указанного сервера. Делаем общим для всех экранов:
+                 * запускается и из ProfileScreen, и из ConnectScreen. */
+                var registerHandleHost by remember { mutableStateOf<String?>(null) }
                 var addContactOpen by remember { mutableStateOf(false) }
                 var peerProfile by remember { mutableStateOf<com.fear.ui.viewmodel.FearViewModel.PeerInfo?>(null) }
                 val peerLookupScope = rememberCoroutineScope()
@@ -205,7 +209,6 @@ class ComposeMainActivity : ComponentActivity() {
                 } else if (profileOpen) {
                     val im = remember { com.fear.IdentityManager(applicationContext) }
                     val pk = im.getPublicKey()
-                    var registerHandleHost by remember { mutableStateOf<String?>(null) }
                     ProfileScreen(
                         displayName = profileState.displayName,
                         setDisplayName = { viewModel.setDisplayName(it) },
@@ -224,36 +227,18 @@ class ComposeMainActivity : ComponentActivity() {
                             qrPasswordOpen = true
                         },
                     )
-                    val regHost = registerHandleHost
-                    if (regHost != null) {
-                        com.fear.ui.components.RegisterHandleDialog(
-                            serverHost = regHost,
-                            initialNickname = profileState.displayName.lowercase()
-                                .filter { it.isLetterOrDigit() || it in ".-_" },
-                            onDismiss = { registerHandleHost = null },
-                            onSubmit = { nick ->
-                                viewModel.registerHandle(regHost, form.port, nick) { err ->
-                                    if (err == null) {
-                                        registerHandleHost = null
-                                        Toast.makeText(this@ComposeMainActivity,
-                                            "Registered $nick@$regHost",
-                                            Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        Toast.makeText(this@ComposeMainActivity,
-                                            err, Toast.LENGTH_LONG).show()
-                                    }
-                                }
-                            },
-                        )
-                    }
                 } else if (!state.isConnected) {
+                    val regState by viewModel.regState.collectAsState()
                     ConnectScreen(
                         form = form,
                         displayName = profileState.displayName,
                         isConnecting = state.isConnecting,
                         errorBanner = state.errorBanner,
+                        regState = regState,
                         onUpdate = { viewModel.updateForm { _ -> it } },
                         onConnect = { viewModel.connect() },
+                        onRegister = { registerHandleHost = form.host },
+                        onProbeServer = { host, port -> viewModel.probeRegistration(host, port) },
                         onDismissError = viewModel::dismissError,
                         onOpenProfile = { profileOpen = true },
                     )
@@ -494,6 +479,36 @@ class ComposeMainActivity : ComponentActivity() {
                         val title = state.activeChatId.orEmpty().ifEmpty { "Call" }
                         CallOverlay(state.call, title) { viewModel.endAudioCall() }
                     }
+                }
+
+                /* Диалог регистрации handle. Открывается из ProfileScreen
+                 * («Add server handle»), из ConnectScreen («Register»),
+                 * и в потенциальных будущих сценариях — общий для всех. */
+                val regHost = registerHandleHost
+                if (regHost != null) {
+                    com.fear.ui.components.RegisterHandleDialog(
+                        serverHost = regHost,
+                        initialNickname = profileState.displayName.lowercase()
+                            .filter { it.isLetterOrDigit() || it in ".-_" },
+                        onDismiss = { registerHandleHost = null },
+                        onSubmit = { nick ->
+                            viewModel.registerHandle(regHost, form.port, nick) { err ->
+                                if (err == null) {
+                                    registerHandleHost = null
+                                    /* После успешной регистрации перепроверяем
+                                     * статус, чтобы UI Connect-экрана сразу
+                                     * активировал кнопку Connect. */
+                                    viewModel.probeRegistration(regHost, form.port)
+                                    Toast.makeText(this@ComposeMainActivity,
+                                        "Registered $nick@$regHost",
+                                        Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(this@ComposeMainActivity,
+                                        err, Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        },
+                    )
                 }
             }
         }
