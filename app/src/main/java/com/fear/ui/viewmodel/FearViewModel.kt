@@ -607,21 +607,31 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     fun openDmWith(contact: ContactEntity) {
         val app = getApplication<Application>()
         val im = IdentityManager(app)
+        Log.i(TAG, "openDmWith: hasIdentity=${im.hasIdentity()}, contact=${contact.displayName}")
         if (!im.hasIdentity()) im.generateIdentity()
-        val otherPk = android.util.Base64.decode(
-            contact.identityPkB64,
-            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
-        )
+        val otherPk = try {
+            android.util.Base64.decode(
+                contact.identityPkB64,
+                android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "openDmWith: bad pk for ${contact.displayName}", e)
+            _uiState.update { it.copy(errorBanner = "Битый pk у контакта.") }
+            return
+        }
+        Log.i(TAG, "openDmWith: otherPk size=${otherPk.size}")
         val pmId = im.pmRoomId(otherPk) ?: run {
+            Log.e(TAG, "openDmWith: pmRoomId вернул null")
             _uiState.update { it.copy(errorBanner = "Нет identity для открытия ЛС.") }
             return
         }
-        // Детерминированный ключ ЛС-комнаты через X25519 ECDH — одинаковый
-        // у обоих собеседников, поэтому никакой гонки JOIN/CREATE нет.
+        Log.i(TAG, "openDmWith: pmId=$pmId")
         val key32 = im.pmRoomKey(otherPk) ?: run {
+            Log.e(TAG, "openDmWith: pmRoomKey вернул null")
             _uiState.update { it.copy(errorBanner = "Не удалось вычислить ключ ЛС.") }
             return
         }
+        Log.i(TAG, "openDmWith: K_pm computed, size=${key32.size}")
         val keyB64 = android.util.Base64.encodeToString(
             key32,
             android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,

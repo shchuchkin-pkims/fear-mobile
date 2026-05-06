@@ -37,6 +37,12 @@ class FearClient(
     private var socket: Socket? = null
     private var receiveJob: Job? = null
     @Volatile private var isConnected = false
+    // Каждый вызов connect() инкрементит sessionId. Все notify-методы и
+    // disconnect() проверяют, что событие принадлежит активной сессии,
+    // иначе игнорируют — иначе старый receive-loop, отвалившийся при
+    // reconnect-е, мог бы вызвать onDisconnected поверх свежего
+    // onConnected и сбросить UI на ConnectScreen.
+    @Volatile private var sessionId: Long = 0L
     @Volatile var isInForeground = true
     @Volatile var lastContacts: List<String> = emptyList()
 
@@ -100,6 +106,9 @@ class FearClient(
     fun connect(host: String, port: Int, room: String, name: String,
                 keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY,
                 joinTimeoutMs: Int = 30000) {
+        // Новая сессия — все notify*, относящиеся к старому socket-у,
+        // будут отброшены, чтобы не сбрасывать UI после reconnect.
+        val mySession = ++sessionId
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 // Close any previous connection before starting a new one
@@ -167,7 +176,7 @@ class FearClient(
                         "[join] Room key received!", System.currentTimeMillis()))
                 }
 
-                notifyConnected()
+                notifyConnected(mySession)
 
                 // Send registration message (empty text) so server registers us
                 sendRegistrationMessage(s)
@@ -176,10 +185,10 @@ class FearClient(
                 sendIdentityAnnounce(s)
 
                 // Start receiving messages
-                startReceiving()
+                startReceiving(mySession)
 
             } catch (e: Exception) {
-                notifyError("Connection failed: ${e.message}")
+                notifyError("Connection failed: ${e.message}", mySession)
             }
         }
     }
@@ -262,15 +271,19 @@ class FearClient(
         }
     }
 
-    fun disconnect() {
+    fun disconnect() = disconnect(sessionId)
+
+    private fun disconnect(forSession: Long) {
         CoroutineScope(Dispatchers.IO).launch {
+            // Отбрасываем устаревший сигнал от старого receive-loop'а.
+            if (forSession != sessionId) return@launch
             receiveJob?.cancel()
             socket?.close()
             socket = null
             isConnected = false
             serverHost = ""
             serverPort = 0
-            notifyDisconnected()
+            notifyDisconnected(forSession)
         }
     }
 
@@ -846,19 +859,21 @@ class FearClient(
 
     // --- Receive loop ---
 
-    private fun startReceiving() {
+    private fun startReceiving(forSession: Long = sessionId) {
         receiveJob = CoroutineScope(Dispatchers.IO).launch {
             val socket = socket ?: return@launch
 
-            while (isConnected && !socket.isClosed) {
+            while (isConnected && !socket.isClosed && forSession == sessionId) {
                 try {
                     if (!receiveMessage(socket)) break
                 } catch (e: Exception) {
-                    if (isConnected) notifyError("Receive error: ${e.message}")
+                    if (isConnected) notifyError("Receive error: ${e.message}", forSession)
                     break
                 }
             }
-            disconnect()
+            // Если этот receive-loop принадлежал устаревшей сессии (нас
+            // переподключили), не дёргаем UI — он уже видит новый socket.
+            if (forSession == sessionId) disconnect(forSession)
         }
     }
 
@@ -1250,11 +1265,13 @@ class FearClient(
 
     // --- Notification helpers ---
 
-    private fun notifyConnected() {
+    private fun notifyConnected(forSession: Long = sessionId) {
+        if (forSession != sessionId) return
         handler.post { listener.onConnected() }
     }
 
-    private fun notifyDisconnected() {
+    private fun notifyDisconnected(forSession: Long = sessionId) {
+        if (forSession != sessionId) return
         handler.post { listener.onDisconnected() }
     }
 
@@ -1289,7 +1306,8 @@ class FearClient(
         handler.post { listener.onFileTransferError(filename, error) }
     }
 
-    private fun notifyError(error: String) {
+    private fun notifyError(error: String, forSession: Long = sessionId) {
+        if (forSession != sessionId) return
         handler.post { listener.onError(error) }
     }
 }
