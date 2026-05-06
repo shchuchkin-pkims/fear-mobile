@@ -56,6 +56,15 @@ class ComposeMainActivity : ComponentActivity() {
 
     private val viewModel: FearViewModel by viewModels()
 
+    override fun onResume() {
+        super.onResume()
+        // После возврата из background (например после блокировки
+        // экрана) Android Doze обычно убивает наш TCP-сокет, но в
+        // ChatUiState.isConnected по-прежнему true — UI остаётся в
+        // активном чате, а сообщения не доходят. Тихо переподключаемся.
+        viewModel.reconnectIfDropped()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -315,9 +324,25 @@ class ComposeMainActivity : ComponentActivity() {
                         val activeTitle = chatListState.firstOrNull {
                             it.id == state.activeChatId
                         }?.title ?: state.activeChatId.orEmpty()
+                        // Fallback: если сервер ещё не прислал USER_LIST,
+                        // соберём участников из видимых сообщений и добавим
+                        // самого пользователя — это всё равно даст
+                        // полезный список вместо пустоты.
+                        val displayed = run {
+                            val fromMessages = state.messages
+                                .asSequence()
+                                .filter { !it.isSystem && it.sender.isNotBlank()
+                                          && it.sender != "system" }
+                                .map { it.sender }
+                                .toSet()
+                            val all = (state.participants.toSet()
+                                       + fromMessages
+                                       + form.name).filter { it.isNotBlank() }
+                            all.distinct().sorted()
+                        }
                         com.fear.ui.components.GroupParticipantsDialog(
                             roomTitle = activeTitle,
-                            participants = state.participants,
+                            participants = displayed,
                             onPeerTap = { name ->
                                 peerLookupScope.launch {
                                     peerProfile = viewModel.lookupPeer(name)

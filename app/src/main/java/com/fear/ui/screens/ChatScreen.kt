@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -19,6 +21,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -279,6 +282,17 @@ private fun ChatPane(
             listState.animateScrollToItem(messages.size - 1)
     }
 
+    // Telegram-style: при появлении клавиатуры прокручиваем к последнему
+    // сообщению, чтобы оно не оставалось «под» клавиатурой. Слушаем
+    // изменения IME inset через WindowInsets.ime.
+    val imeBottom = WindowInsets.ime
+        .getBottom(androidx.compose.ui.platform.LocalDensity.current)
+    LaunchedEffect(imeBottom) {
+        if (imeBottom > 0 && pendingScrollToTs == null && messages.isNotEmpty()) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
+    }
+
     // Если SearchDialog попросил прокрутить к конкретному ts — найдём
     // его индекс и прыгнем туда. Если сообщение ещё не в текущем
     // messages (история ещё грузится), повторим попытку, когда
@@ -347,7 +361,13 @@ private fun ChatPane(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
             ) {
-                items(messages, key = { "${it.timestamp}-${it.sender}" }) { msg ->
+                // Используем индекс как часть ключа: timestamp+sender может
+                // совпадать у системных сообщений, отправленных в одну
+                // миллисекунду (например, «Disconnected.» и «switching room…»),
+                // и LazyColumn падает с IllegalArgumentException.
+                itemsIndexed(messages, key = { i, m ->
+                    "$i-${m.timestamp}-${m.sender}-${m.text.hashCode()}"
+                }) { _, msg ->
                     MessageBubble(msg, onSenderClick = onSenderTap)
                 }
             }

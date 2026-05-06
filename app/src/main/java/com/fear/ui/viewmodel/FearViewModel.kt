@@ -487,6 +487,26 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Состояние клиентского сокета. UI использует чтобы понять, нужен
+     *  ли повторный коннект после возврата из background-а (Doze
+     *  обычно рвёт TCP). */
+    fun isClientConnected(): Boolean = client.isConnected()
+
+    /**
+     * Если в state мы помечены как «подключены», но реальный TCP-сокет
+     * уже мёртв (Doze, переключение Wi-Fi/LTE, разблокировка экрана
+     * после долгого простоя), запускаем тихий reconnect к той же
+     * комнате. Вызывается из ComposeMainActivity при ON_RESUME.
+     */
+    fun reconnectIfDropped() {
+        if (_uiState.value.isConnected && !client.isConnected()) {
+            android.util.Log.i(TAG, "reconnectIfDropped: socket dead, reconnecting to ${_form.value.room}")
+            // Ставим флаг переключения, чтобы UI не мигнул на ConnectScreen.
+            switchingRoom = true
+            connect()
+        }
+    }
+
     fun disconnect() {
         viewModelScope.launch(Dispatchers.IO) { client.disconnect() }
     }
