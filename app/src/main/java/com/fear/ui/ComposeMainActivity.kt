@@ -31,6 +31,7 @@ import com.fear.TrustedKeysActivity
 import com.fear.VideoCallActivity
 import com.fear.ui.components.AboutDialog
 import com.fear.ui.components.CallOverlay
+import com.fear.ThemeManager
 import com.fear.ui.components.IdentityBackupSheet
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.PasswordPromptDialog
@@ -83,8 +84,17 @@ class ComposeMainActivity : ComponentActivity() {
         }
 
         setContent {
-            // App-wide theme override (null = follow system, true/false = forced).
-            var darkOverride by remember { mutableStateOf<Boolean?>(null) }
+            // Тема персистируется через ThemeManager, чтобы другие activity
+            // (например TrustedKeysActivity) подхватывали выбор пользователя.
+            // null = follow system; true/false = принудительная.
+            val initialOverride = remember {
+                when (ThemeManager.getTheme(this@ComposeMainActivity)) {
+                    ThemeManager.THEME_DARK  -> true
+                    ThemeManager.THEME_LIGHT -> false
+                    else                      -> null
+                }
+            }
+            var darkOverride by remember { mutableStateOf(initialOverride) }
             val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
             val effectiveDark = darkOverride ?: systemDark
 
@@ -384,7 +394,15 @@ class ComposeMainActivity : ComponentActivity() {
                             onTrustedKeys = {
                                 startActivity(Intent(this@ComposeMainActivity, TrustedKeysActivity::class.java))
                             },
-                            onToggleTheme = { darkOverride = !effectiveDark },
+                            onToggleTheme = {
+                                val next = !effectiveDark
+                                darkOverride = next
+                                ThemeManager.setTheme(
+                                    this@ComposeMainActivity,
+                                    if (next) ThemeManager.THEME_DARK
+                                    else      ThemeManager.THEME_LIGHT,
+                                )
+                            },
                             onCheckUpdates = { triggerUpdateCheck { updateInfo = it } },
                             onAbout = { aboutOpen = true },
                             onIdentityBackup = { identityBackupOpen = true },
