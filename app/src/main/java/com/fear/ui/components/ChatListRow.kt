@@ -1,7 +1,7 @@
 package com.fear.ui.components
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,11 +32,13 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun ChatListRow(
     entry: ChatEntry,
     selected: Boolean,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalFearColors.current
@@ -48,7 +50,10 @@ fun ChatListRow(
         modifier = modifier
             .fillMaxWidth()
             .background(bg)
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick     = onClick,
+                onLongClick = onLongClick,
+            )
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

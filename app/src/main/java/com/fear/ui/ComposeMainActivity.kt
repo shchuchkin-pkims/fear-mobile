@@ -130,6 +130,9 @@ class ComposeMainActivity : ComponentActivity() {
                 /* Открыт диалог со списком участников групповой комнаты,
                  * показывается по тапу на header в групповом чате. */
                 var groupInfoVisible by remember { mutableStateOf(false) }
+                /* Long-press на элементе сайдбара → диалог подтверждения
+                 * удаления чата. */
+                var pendingDelete by remember { mutableStateOf<com.fear.ui.viewmodel.ChatEntry?>(null) }
                 var peerProfile by remember { mutableStateOf<com.fear.ui.viewmodel.FearViewModel.PeerInfo?>(null) }
                 val peerLookupScope = rememberCoroutineScope()
                 val profileState by viewModel.profileState.collectAsState()
@@ -290,6 +293,7 @@ class ComposeMainActivity : ComponentActivity() {
                                 viewModel.openGroupRoom(entry.id)
                             }
                         },
+                        onChatLongPressed = { entry -> pendingDelete = entry },
                         onAddNew       = {
                             // Two ways to start a new chat: Add contact (DM)
                             // or Connect to a named room.
@@ -383,6 +387,43 @@ class ComposeMainActivity : ComponentActivity() {
                                     handle        = p.handle,
                                     server        = p.server,
                                 )
+                            },
+                        )
+                    }
+
+                    pendingDelete?.let { entry ->
+                        val isPm = entry.kind == com.fear.ui.viewmodel.ChatKind.DM
+                        androidx.compose.material3.AlertDialog(
+                            onDismissRequest = { pendingDelete = null },
+                            title = { androidx.compose.material3.Text("Delete chat") },
+                            text = {
+                                androidx.compose.material3.Text(
+                                    if (isPm)
+                                        "Delete chat with \"${entry.title}\"? " +
+                                        "Local message history will be erased and " +
+                                        "the contact will be removed from your address book. " +
+                                        "This does not affect the conversation on their side."
+                                    else
+                                        "Delete local history for room '${entry.title}'? " +
+                                        "Messages on the server and on other " +
+                                        "participants' devices remain intact."
+                                )
+                            },
+                            confirmButton = {
+                                androidx.compose.material3.TextButton(onClick = {
+                                    viewModel.deleteChat(entry)
+                                    pendingDelete = null
+                                }) {
+                                    androidx.compose.material3.Text(
+                                        "Delete",
+                                        color = androidx.compose.ui.graphics.Color(0xFFE57373),
+                                    )
+                                }
+                            },
+                            dismissButton = {
+                                androidx.compose.material3.TextButton(onClick = { pendingDelete = null }) {
+                                    androidx.compose.material3.Text("Cancel")
+                                }
                             },
                         )
                     }

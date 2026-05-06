@@ -76,6 +76,7 @@ fun ChatScreen(
     state: ChatUiState,
     chatList: List<ChatEntry>,
     onChatSelected: (ChatEntry) -> Unit,
+    onChatLongPressed: (ChatEntry) -> Unit = {},
     onAddNew: () -> Unit,
     onSendMessage: (String) -> Unit,
     onMenuClick: () -> Unit,
@@ -96,6 +97,7 @@ fun ChatScreen(
             chats = chatList,
             activeChatId = state.activeChatId,
             onChatSelected = onChatSelected,
+            onChatLongPressed = onChatLongPressed,
             onMenuClick = onMenuClick,
             onAddNew = onAddNew,
         )
@@ -126,6 +128,7 @@ private fun SidebarOnly(
     chats: List<ChatEntry>,
     activeChatId: String?,
     onChatSelected: (ChatEntry) -> Unit,
+    onChatLongPressed: (ChatEntry) -> Unit,
     onMenuClick: () -> Unit,
     onAddNew: () -> Unit,
 ) {
@@ -177,7 +180,7 @@ private fun SidebarOnly(
                         expanded = dmExpanded,
                         onToggle = { dmExpanded = !dmExpanded },
                     )
-                    if (dmExpanded) chatItems(dms, activeChatId, onChatSelected)
+                    if (dmExpanded) chatItems(dms, activeChatId, onChatSelected, onChatLongPressed)
 
                     sectionHeader(
                         label = "Группы",
@@ -185,7 +188,7 @@ private fun SidebarOnly(
                         expanded = groupExpanded,
                         onToggle = { groupExpanded = !groupExpanded },
                     )
-                    if (groupExpanded) chatItems(groups, activeChatId, onChatSelected)
+                    if (groupExpanded) chatItems(groups, activeChatId, onChatSelected, onChatLongPressed)
                 }
             }
         }
@@ -239,6 +242,7 @@ private fun LazyListScope.chatItems(
     chats: List<ChatEntry>,
     activeChatId: String?,
     onChatSelected: (ChatEntry) -> Unit,
+    onChatLongPressed: ((ChatEntry) -> Unit)? = null,
 ) {
     if (chats.isEmpty()) {
         item(key = "empty-${chats.hashCode()}") {
@@ -251,6 +255,7 @@ private fun LazyListScope.chatItems(
                 entry = chat,
                 selected = chat.id == activeChatId,
                 onClick = { onChatSelected(chat) },
+                onLongClick = onChatLongPressed?.let { { it(chat) } },
             )
         }
     }

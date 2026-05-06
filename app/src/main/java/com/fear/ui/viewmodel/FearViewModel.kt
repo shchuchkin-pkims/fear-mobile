@@ -618,6 +618,53 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(pendingScrollToTs = null) }
     }
 
+    /**
+     * Полное удаление чата из локального состояния. Вызывается из long-press
+     * на элементе сайдбара. Для PM-комнаты удаляет соответствующий контакт
+     * (и обновляет blob на сервере), для group — просто стирает локальную
+     * историю; запись в сайдбаре исчезнет, потому что chatList строится
+     * как объединение contacts × messageDao.observeChatSummaries().
+     *
+     * Если удаляется текущая активная комната — отключаемся, чтобы UI не
+     * показывал чат, которого больше нет в списке.
+     */
+    fun deleteChat(entry: ChatEntry) {
+        val roomId = entry.id
+        val isPm   = roomId.startsWith("pm:") || roomId.startsWith("dm:")
+        val activeIsThis = (_uiState.value.activeChatId == roomId)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            // Локальная история комнаты.
+            try { dao.clearRoom(roomId) } catch (_: Exception) { /* non-fatal */ }
+
+            if (isPm) {
+                // Удаляем контакт. ContactsRepository сам пересоберёт blob
+                // и отправит на сервер при наличии endpoint-а.
+                val pk = entry.peerPkB64
+                if (pk != null) {
+                    val ep = ContactsRepository.ServerEndpoint(
+                        _form.value.host, _form.value.port)
+                    try { contactsRepo.delete(pk, ep) } catch (_: Exception) {}
+                }
+            }
+
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                if (activeIsThis) {
+                    intendedConnected = false
+                    client.disconnect()
+                    _uiState.update {
+                        it.copy(
+                            activeChatId = null,
+                            messages = emptyList(),
+                            statusText = "",
+                            participants = emptyList(),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun openGroupRoom(roomId: String) {
         val current = _form.value.room
         if (current == roomId && _uiState.value.isConnected) {
