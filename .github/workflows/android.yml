@@ -1,0 +1,78 @@
+name: Build Android APK
+
+# Builds the F.E.A.R. Android client. The CI runner does not own the
+# release keystore, so we ship a debug-signed APK — installable on any
+# device but not co-installable with a previously installed release-signed
+# build (Android refuses to overlay different signatures). Users who want
+# the release-signed APK should install the .apk attached to the matching
+# GitHub Release by the project maintainer.
+#
+# Triggers:
+#   - push to main or dev — builds and uploads the APK as a build artifact
+#     (kept for 90 days, link in the run page);
+#   - tag v* — additionally attaches the APK to the matching GitHub Release;
+#   - workflow_dispatch — "Run workflow" button in Actions.
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Android (Gradle / debug-signed APK)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Stage APK
+        run: |
+          set -e
+          tag="${{ github.ref_name }}"
+          sha=$(echo "${{ github.sha }}" | cut -c1-7)
+          name="fear-android-${tag//\//_}-${sha}.apk"
+          mkdir -p release
+          cp app/build/outputs/apk/debug/app-debug.apk "release/${name}"
+          echo "APK_NAME=${name}" >> "$GITHUB_ENV"
+          ls -la release/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: release/${{ env.APK_NAME }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/${{ env.APK_NAME }}
