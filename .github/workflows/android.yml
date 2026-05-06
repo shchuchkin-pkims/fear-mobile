@@ -57,7 +57,11 @@ jobs:
           set -e
           tag="${{ github.ref_name }}"
           sha=$(echo "${{ github.sha }}" | cut -c1-7)
-          name="fear-android-${tag//\//_}-${sha}.apk"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            name="fear-android-${tag}.apk"
+          else
+            name="fear-android-${tag//\//_}-${sha}.apk"
+          fi
           mkdir -p release
           cp app/build/outputs/apk/debug/app-debug.apk "release/${name}"
           echo "APK_NAME=${name}" >> "$GITHUB_ENV"
