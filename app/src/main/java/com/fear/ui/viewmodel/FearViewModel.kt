@@ -164,7 +164,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
             // ---- Group entries: every room with history that's not a DM,
             // plus the currently-joined group room (in case it has no
-            // history yet, e.g. just connected to "guest"). -----------------
+            // history yet, e.g. just connected to "general"). -----------------
             val historicalGroups = summaries
                 .map { it.roomId }
                 .filter { !it.let { it.startsWith("pm:") || it.startsWith("dm:") } }
@@ -242,9 +242,9 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             // Если текущая комната это DM, после отключения возвращаем
             // на ConnectScreen уже выбранную обычную (групповую) комнату
             // из prefs — это то, что пользователь видел в форме до того
-            // как открыл ЛС. По умолчанию prefs хранит "guest".
+            // как открыл ЛС. По умолчанию prefs хранит "general".
             if (_form.value.room.let { it.startsWith("pm:") || it.startsWith("dm:") }) {
-                val saved = prefs.getString(KEY_ROOM, "guest") ?: "guest"
+                val saved = prefs.getString(KEY_ROOM, "general") ?: "general"
                 _form.update { it.copy(room = saved) }
             }
             _uiState.update {
@@ -934,7 +934,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         // Не сохраняем dm:* как «комнату по умолчанию» — это комната ЛС,
         // которую пользователь открыл из сайдбара, а ConnectScreen
         // должен запоминать последнюю обычную (групповую) комнату.
-        val roomToSave = if (f.room.let { it.startsWith("pm:") || it.startsWith("dm:") }) "guest" else f.room
+        val roomToSave = if (f.room.let { it.startsWith("pm:") || it.startsWith("dm:") }) "general" else f.room
         prefs.edit()
             .putString(KEY_HOST, f.host)
             .putInt(KEY_PORT, f.port)

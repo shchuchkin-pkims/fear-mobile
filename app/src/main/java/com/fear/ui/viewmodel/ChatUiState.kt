@@ -13,7 +13,7 @@ enum class ConnectMode {
 data class ConnectFormState(
     val host: String = "fear-project.ru",
     val port: Int = 8888,
-    val room: String = "guest",            // default public testing room
+    val room: String = "general",          // default public room (general channel)
     val name: String = "",
     val key: String = "",
     val mode: ConnectMode = ConnectMode.AUTO, // one-button connect: tries JOIN, falls back to CREATE
