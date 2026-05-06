@@ -202,6 +202,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             pendingAutoJoin = false
             switchingRoom = false
             intendedConnected = true
+            connectedAtMs = System.currentTimeMillis()
             saveFormToPrefs()
             val f = _form.value
             _uiState.update {
@@ -358,15 +359,25 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private val client: FearClient = FearClient(app.applicationContext, listener)
 
+    /** Время последнего успешного onConnected, для grace-period в
+     *  recomputeStatus. */
+    @Volatile private var connectedAtMs: Long = 0
+
     private fun recomputeStatus() {
         val total = maxOf(reportedCount, seenPeers.size + 1)
         val isPm  = _form.value.room.startsWith("pm:") || _form.value.room.startsWith("dm:")
+        // Сервер шлёт USER_LIST через несколько мс после успешного
+        // подключения. До его прихода (grace-period 3 секунды) не
+        // показываем «just you online» / «offline» — иначе пользователь
+        // видит «один в комнате» хотя собеседник уже там.
+        val recentlyConnected =
+            (System.currentTimeMillis() - connectedAtMs) < 3_000
         val text = when {
             !_uiState.value.isConnected -> ""
-            isPm && total >= 2 -> "online"
-            isPm               -> "offline"
-            total <= 1         -> "just you online"
-            else               -> "$total online"
+            isPm && total >= 2  -> "online"
+            isPm                -> if (recentlyConnected) "connecting…" else "offline"
+            total <= 1          -> if (recentlyConnected) "online…"      else "just you online"
+            else                -> "$total online"
         }
         _uiState.update { it.copy(statusText = text) }
     }
