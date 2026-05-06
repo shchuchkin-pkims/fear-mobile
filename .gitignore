@@ -93,6 +93,8 @@ lint/tmp/
 *.txt
 !BUILD.md
 !README.md
+# Whitelist build-system files that happen to end in .txt
+!**/CMakeLists.txt
 
 # Mac
 .DS_Store
