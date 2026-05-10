@@ -343,21 +343,36 @@ class ComposeMainActivity : ComponentActivity() {
                         val activeTitle = chatListState.firstOrNull {
                             it.id == state.activeChatId
                         }?.title ?: state.activeChatId.orEmpty()
-                        // Fallback: если сервер ещё не прислал USER_LIST,
-                        // соберём участников из видимых сообщений и добавим
-                        // самого пользователя — это всё равно даст
-                        // полезный список вместо пустоты.
+                        // Source of truth for "who is online right now" is
+                        // state.participants — the live USER_LIST broadcast
+                        // pushed by the server every time someone joins or
+                        // leaves. We only fall back to scraping senders out
+                        // of local history when the server hasn't sent any
+                        // USER_LIST yet (cold-open before first frame), so a
+                        // peer who used to chat here but is currently offline
+                        // does NOT get listed as a participant.
                         val displayed = run {
-                            val fromMessages = state.messages
-                                .asSequence()
-                                .filter { !it.isSystem && it.sender.isNotBlank()
-                                          && it.sender != "system" }
-                                .map { it.sender }
-                                .toSet()
-                            val all = (state.participants.toSet()
-                                       + fromMessages
-                                       + form.name).filter { it.isNotBlank() }
-                            all.distinct().sorted()
+                            if (state.participants.isNotEmpty()) {
+                                // Server already told us who's in the room.
+                                // Make sure self is included even if a race
+                                // delivered USER_LIST before our own join.
+                                (state.participants.toSet() + form.name)
+                                    .filter { it.isNotBlank() }
+                                    .distinct().sorted()
+                            } else {
+                                // Cold open / no broadcast yet — best-effort
+                                // list from message senders + self so the
+                                // dialog isn't completely empty.
+                                val fromMessages = state.messages
+                                    .asSequence()
+                                    .filter { !it.isSystem && it.sender.isNotBlank()
+                                              && it.sender != "system" }
+                                    .map { it.sender }
+                                    .toSet()
+                                (fromMessages + form.name)
+                                    .filter { it.isNotBlank() }
+                                    .distinct().sorted()
+                            }
                         }
                         com.fear.ui.components.GroupParticipantsDialog(
                             roomTitle = activeTitle,
