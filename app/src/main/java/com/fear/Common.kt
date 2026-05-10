@@ -103,6 +103,14 @@ object Common {
     // to discover any handle previously claimed for this pk on the server.
     const val MSG_TYPE_LOOKUP_HANDLE_BY_PK: Byte = 26
 
+    // Phase B-8: room probe + heartbeat.
+    // ROOM_INFO_REQUEST/RESULT lets AUTO connect skip the JOIN→timeout dance
+    // when the room is empty. PING is sent every ~60s while otherwise silent
+    // so the server's idle scan doesn't kick the connection.
+    const val MSG_TYPE_ROOM_INFO_REQUEST: Byte = 27
+    const val MSG_TYPE_ROOM_INFO_RESULT:  Byte = 28
+    const val MSG_TYPE_PING:              Byte = 29
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32

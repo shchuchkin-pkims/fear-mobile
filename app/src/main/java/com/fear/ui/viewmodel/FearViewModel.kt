@@ -32,7 +32,9 @@ private const val KEY_HOST = "connect.host"
 private const val KEY_PORT = "connect.port"
 private const val KEY_ROOM = "connect.room"
 private const val KEY_NAME = "connect.name"
-private const val AUTO_JOIN_TIMEOUT_MS = 5000
+// Phase B-8: AUTO_JOIN_TIMEOUT_MS retired — AUTO is resolved server-side via
+// ROOM_INFO probe inside FearClient.connect, so we no longer wait blindly
+// for a KEY_RESPONSE on a possibly-empty room.
 
 class FearViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -189,9 +191,6 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     private val seenPeers = mutableSetOf<String>()
     private var reportedCount = 0
 
-    /** True iff we're inside the JOIN attempt of an AUTO connect — used to fall
-     *  back to CREATE if JOIN times out. */
-    private var pendingAutoJoin = false
     // True while we're tearing down one room and re-joining another (DM open).
     // Suppresses the brief onDisconnected→ConnectScreen flash and keeps the
     // chat UI visible with a "switching room" status.
@@ -199,7 +198,6 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private val listener = object : FearClient.FearClientListener {
         override fun onConnected() {
-            pendingAutoJoin = false
             switchingRoom = false
             intendedConnected = true
             connectedAtMs = System.currentTimeMillis()
@@ -313,24 +311,10 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
         override fun onError(error: String) {
             Log.w(TAG, "FearClient error: $error")
-            // ANY error during the JOIN leg of an AUTO connect → silently retry
-            // as CREATE. JOIN can fail with "timeout", "Software caused connection
-            // abort", "Connection reset" depending on which layer detects the
-            // missing peer first; treating all of them as "no responder" is safe
-            // because we already passed the TCP-connect phase before pendingAutoJoin
-            // was set (we got onConnected for the TCP layer's sake — wait, no,
-            // pendingAutoJoin is set *before* connect()). To be safe, only retry
-            // if we haven't already reached onConnected.
-            if (pendingAutoJoin) {
-                pendingAutoJoin = false
-                Log.i(TAG, "[auto] JOIN failed ($error) — retrying as CREATE")
-                viewModelScope.launch(Dispatchers.IO) {
-                    val f = _form.value
-                    client.connect(f.host, f.port, f.room, f.name, "",
-                                   FearClient.ConnectMode.CREATE_ROOM)
-                }
-                return
-            }
+            // Phase B-8: AUTO is now resolved server-side via ROOM_INFO probe
+            // before any JOIN/CREATE is attempted, so the old "JOIN timeout
+            // → retry as CREATE" fallback is gone.
+
             // Filter the noisy CLI-style status lines we don't want surfaced.
             val ignored = listOf(
                 "Identity loaded", "Commands:", "[client] connected",
@@ -338,7 +322,6 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 "[join] Key exchange verified", "[join] Room key",
             )
             if (ignored.any { error.contains(it) }) return
-            pendingAutoJoin = false
             switchingRoom = false
             _uiState.update { it.copy(errorBanner = error.trim(), isConnecting = false) }
         }
@@ -480,22 +463,18 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(isConnecting = true, errorBanner = null) }
 
         viewModelScope.launch(Dispatchers.IO) {
-            when (f.mode) {
-                ConnectMode.AUTO -> {
-                    // Try JOIN first with a short timeout; on timeout, listener.onError
-                    // triggers the CREATE retry.
-                    pendingAutoJoin = true
-                    client.connect(f.host, f.port, f.room, f.name, "",
-                                   FearClient.ConnectMode.JOIN_ROOM,
-                                   joinTimeoutMs = AUTO_JOIN_TIMEOUT_MS)
-                }
-                ConnectMode.CREATE_ROOM -> client.connect(
-                    f.host, f.port, f.room, f.name, "", FearClient.ConnectMode.CREATE_ROOM)
-                ConnectMode.JOIN_ROOM   -> client.connect(
-                    f.host, f.port, f.room, f.name, "", FearClient.ConnectMode.JOIN_ROOM)
-                ConnectMode.MANUAL_KEY  -> client.connect(
-                    f.host, f.port, f.room, f.name, f.key, FearClient.ConnectMode.MANUAL_KEY)
+            // Phase B-8: AUTO now uses MSG_TYPE_ROOM_INFO_REQUEST inside
+            // FearClient.connect to ask the server how many members are in
+            // the room before deciding to JOIN or CREATE. No more 5s blind
+            // wait on a fresh room.
+            val clientMode = when (f.mode) {
+                ConnectMode.AUTO        -> FearClient.ConnectMode.AUTO
+                ConnectMode.CREATE_ROOM -> FearClient.ConnectMode.CREATE_ROOM
+                ConnectMode.JOIN_ROOM   -> FearClient.ConnectMode.JOIN_ROOM
+                ConnectMode.MANUAL_KEY  -> FearClient.ConnectMode.MANUAL_KEY
             }
+            val keyArg = if (f.mode == ConnectMode.MANUAL_KEY) f.key else ""
+            client.connect(f.host, f.port, f.room, f.name, keyArg, clientMode)
         }
     }
 

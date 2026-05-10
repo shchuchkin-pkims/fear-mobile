@@ -36,6 +36,7 @@ class FearClient(
 
     private var socket: Socket? = null
     private var receiveJob: Job? = null
+    private var pingJob: Job? = null
     @Volatile private var isConnected = false
     // Каждый вызов connect() инкрементит sessionId. Все notify-методы и
     // disconnect() проверяют, что событие принадлежит активной сессии,
@@ -70,7 +71,7 @@ class FearClient(
     private val handler = Handler(Looper.getMainLooper())
     private var currentFileTransfer: FileTransfer? = null
 
-    enum class ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM }
+    enum class ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM, AUTO }
 
     private var audioCallManager: AudioCallManager? = null
     private var pendingCallRequest: AudioCallRequest? = null
@@ -122,7 +123,11 @@ class FearClient(
                 serverHost = host
                 serverPort = port
 
-                when (mode) {
+                // For non-AUTO modes pre-derive the room key. AUTO postpones
+                // this until the ROOM_INFO probe tells us whether the room is
+                // empty (CREATE — generate fresh key) or populated (JOIN —
+                // wait for KEY_RESPONSE).
+                if (mode != ConnectMode.AUTO) when (mode) {
                     ConnectMode.MANUAL_KEY -> {
                         val key = Common.base64Decode(keyBase64)
                         if (key == null || key.size != Common.CRYPTO_AEAD_AES256GCM_KEYBYTES) {
@@ -143,6 +148,7 @@ class FearClient(
                         // Key will be obtained via ECDH exchange after socket connection
                         roomKey = ByteArray(0)
                     }
+                    ConnectMode.AUTO -> { /* unreachable */ }
                 }
 
                 socket = Socket(host, port)
@@ -159,8 +165,31 @@ class FearClient(
 
                 val s = socket ?: return@launch
 
+                // AUTO: ask the server how many members are in this room.
+                // Empty → generate a fresh key (effectively CREATE);
+                // populated → fall through to the JOIN/ECDH branch.
+                var effectiveMode = mode
+                if (mode == ConnectMode.AUTO) {
+                    val members = probeRoomInfo(s, timeoutMs = 3000)
+                    effectiveMode = if (members != null && members > 0) {
+                        Log.i("FearClient", "[auto] room '$room' has $members member(s) → JOIN")
+                        ConnectMode.JOIN_ROOM
+                    } else {
+                        Log.i("FearClient", "[auto] room '$room' empty (probe=$members) → CREATE")
+                        ConnectMode.CREATE_ROOM
+                    }
+                    if (effectiveMode == ConnectMode.CREATE_ROOM) {
+                        roomKey = ByteArray(Common.CRYPTO_AEAD_AES256GCM_KEYBYTES)
+                        SecureRandom().nextBytes(roomKey)
+                        notifyMessageReceived(Message(room, "system",
+                            "[auto] Created room with new key", System.currentTimeMillis()))
+                    } else {
+                        roomKey = ByteArray(0)
+                    }
+                }
+
                 // If join mode, perform ECDH key exchange before proceeding
-                if (mode == ConnectMode.JOIN_ROOM) {
+                if (effectiveMode == ConnectMode.JOIN_ROOM) {
                     notifyMessageReceived(Message(room, "system",
                         "[join] Requesting room key via ECDH exchange...", System.currentTimeMillis()))
                     val receivedKey = ecdhJoinRoom(s, joinTimeoutMs)
@@ -184,8 +213,9 @@ class FearClient(
                 // Send identity announce if we have a key
                 sendIdentityAnnounce(s)
 
-                // Start receiving messages
+                // Start receiving messages and the heartbeat loop.
                 startReceiving(mySession)
+                startPingLoop(mySession)
 
             } catch (e: Exception) {
                 notifyError("Connection failed: ${e.message}", mySession)
@@ -278,6 +308,7 @@ class FearClient(
             // Отбрасываем устаревший сигнал от старого receive-loop'а.
             if (forSession != sessionId) return@launch
             receiveJob?.cancel()
+            pingJob?.cancel()
             socket?.close()
             socket = null
             isConnected = false
@@ -437,6 +468,90 @@ class FearClient(
         val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
         val frame = buildFrame(roomBytes, nameBytes, zeroNonce, type, payload)
         Common.sendAll(socket, frame)
+    }
+
+    /**
+     * AUTO probe: ask the server how many non-media members are in [currentRoom].
+     * Sends MSG_TYPE_ROOM_INFO_REQUEST and reads the next ROOM_INFO_RESULT
+     * frame; ignores any other frame in between (e.g. a residual broadcast).
+     *
+     * Returns the member count (0 = nobody in the room yet) or null if the
+     * exchange fails / times out — caller treats null as "assume empty,
+     * fall back to CREATE" so a flaky network never blocks AUTO.
+     */
+    private fun probeRoomInfo(socket: Socket, timeoutMs: Int = 3000): Int? {
+        sendServiceFrame(socket, Common.MSG_TYPE_ROOM_INFO_REQUEST, ByteArray(0))
+        val oldTimeout = socket.soTimeout
+        socket.soTimeout = timeoutMs
+        try {
+            repeat(8) {
+                val roomLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, roomLenBuf, 2)) return null
+                val roomLen = Common.readUInt16(roomLenBuf, 0)
+                if (roomLen > Common.MAX_ROOM) return null
+                val roomBuf = ByteArray(roomLen)
+                if (!Common.recvAll(socket, roomBuf, roomLen)) return null
+
+                val nameLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, nameLenBuf, 2)) return null
+                val nameLen = Common.readUInt16(nameLenBuf, 0)
+                if (nameLen > Common.MAX_NAME) return null
+                val nameBuf = ByteArray(nameLen)
+                if (!Common.recvAll(socket, nameBuf, nameLen)) return null
+
+                val nonceLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, nonceLenBuf, 2)) return null
+                val nonceLen = Common.readUInt16(nonceLenBuf, 0)
+                val nonce = ByteArray(nonceLen)
+                if (!Common.recvAll(socket, nonce, nonceLen)) return null
+
+                val typeBuf = ByteArray(1)
+                if (!Common.recvAll(socket, typeBuf, 1)) return null
+
+                val clenBuf = ByteArray(4)
+                if (!Common.recvAll(socket, clenBuf, 4)) return null
+                val clen = Common.readUInt32(clenBuf, 0).toInt()
+                if (clen > Common.MAX_FRAME) return null
+                val payload = ByteArray(clen)
+                if (!Common.recvAll(socket, payload, clen)) return null
+
+                if (typeBuf[0] == Common.MSG_TYPE_ROOM_INFO_RESULT && clen >= 5) {
+                    val count = Common.readUInt32(payload, 1).toInt()
+                    return count
+                }
+                // Otherwise: server-side broadcast snuck in before our reply,
+                // skip and keep reading.
+            }
+            return null
+        } catch (_: java.net.SocketTimeoutException) {
+            return null
+        } catch (_: Exception) {
+            return null
+        } finally {
+            socket.soTimeout = oldTimeout
+        }
+    }
+
+    /**
+     * Application-level heartbeat: send MSG_TYPE_PING every 60s while
+     * connected. Server idle scan kicks anyone silent for 240s, so 60s
+     * gives ~4 missed pings of slack before a real network hiccup turns
+     * into a kick. Cancelled by disconnect().
+     */
+    private fun startPingLoop(forSession: Long) {
+        pingJob?.cancel()
+        pingJob = CoroutineScope(Dispatchers.IO).launch {
+            while (forSession == sessionId && isConnected) {
+                delay(60_000)
+                if (forSession != sessionId || !isConnected) break
+                val s = socket ?: break
+                try {
+                    sendServiceFrame(s, Common.MSG_TYPE_PING, ByteArray(0))
+                } catch (_: Exception) {
+                    break  // socket dead; receive loop will handle reconnect
+                }
+            }
+        }
     }
 
     /**
@@ -948,6 +1063,15 @@ class FearClient(
 
             // Handle KEY_RESPONSE (ignore in normal recv loop, handled by ecdhJoinRoom)
             if (isServiceMessage && msgType == Common.MSG_TYPE_KEY_RESPONSE) {
+                return true
+            }
+
+            // Phase B-8: a stray ROOM_INFO_RESULT can arrive if probe timed
+            // out and we already moved on; just drop it. PING is server-bound
+            // only, so we wouldn't expect to receive one — drop too if seen.
+            if (isServiceMessage &&
+                (msgType == Common.MSG_TYPE_ROOM_INFO_RESULT ||
+                 msgType == Common.MSG_TYPE_PING)) {
                 return true
             }
 
