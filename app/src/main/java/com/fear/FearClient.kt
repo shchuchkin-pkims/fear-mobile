@@ -637,42 +637,67 @@ class FearClient(
                 val boxCipher = payload.copyOfRange(off, off + 32 + Common.CRYPTO_BOX_MACBYTES)
                 off += 32 + Common.CRYPTO_BOX_MACBYTES
 
-                // Check for identity signature (anti-MITM)
+                // Identity signature (anti-MITM) - MANDATORY.
+                // A hostile relay, or any room member that answers KEY_REQUEST
+                // first, can otherwise hand us a room key it already knows and
+                // transparently MITM the conversation. This check used to "fail
+                // open": a missing or invalid signature only produced a system
+                // message and the key was accepted anyway. Anything short of a
+                // verified signature now aborts the join.
                 val remaining = clen - off
                 var sigVerified = false
-                if (remaining >= Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
+                if (remaining < Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
+                    notifyMessageReceived(Message(currentRoom, "system",
+                        "[join] REJECTED: '$senderName' sent an unsigned key response.",
+                        System.currentTimeMillis()))
+                } else {
                     val idPk = payload.copyOfRange(off, off + Common.IDENTITY_PK_BYTES)
                     val sig = payload.copyOfRange(off + Common.IDENTITY_PK_BYTES,
                         off + Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES)
                     val im = identityManager
-                    if (im != null && im.verify(responderPk, sig, idPk)) {
-                        sigVerified = true
+                    if (im == null || !im.verify(responderPk, sig, idPk)) {
+                        notifyMessageReceived(Message(currentRoom, "system",
+                            "[join] REJECTED: signature verification FAILED for '$senderName' - possible MITM.",
+                            System.currentTimeMillis()))
+                    } else {
                         val tofu = im.checkPeerKey(senderName, idPk)
                         val fp = im.fingerprint(idPk)
                         when (tofu) {
                             "verified", "trusted" -> {
+                                sigVerified = true
                                 notifyMessageReceived(Message(currentRoom, "system",
                                     "[join] Key exchange verified: $senderName [$fp]",
                                     System.currentTimeMillis()))
                             }
                             "new" -> {
+                                sigVerified = true
                                 notifyMessageReceived(Message(currentRoom, "system",
                                     "[join] New identity for '$senderName': $fp (trusted on first use)",
                                     System.currentTimeMillis()))
                             }
                             "changed" -> {
+                                // Blocking: a changed identity key is exactly what
+                                // an active MITM looks like, so we must not proceed.
                                 notifyMessageReceived(Message(currentRoom, "system",
-                                    "*** WARNING: Identity key for '$senderName' has CHANGED! ***\n" +
-                                    "*** This could indicate a MITM attack! ***\n" +
-                                    "*** Fingerprint: $fp ***",
+                                    "*** REJECTED: identity key for '$senderName' has CHANGED! ***\n" +
+                                    "*** This could indicate a MITM attack. Fingerprint: $fp ***",
+                                    System.currentTimeMillis()))
+                            }
+                            else -> {
+                                notifyMessageReceived(Message(currentRoom, "system",
+                                    "[join] REJECTED: could not check identity of '$senderName'.",
                                     System.currentTimeMillis()))
                             }
                         }
-                    } else {
-                        notifyMessageReceived(Message(currentRoom, "system",
-                            "[join] WARNING: Signature verification FAILED for '$senderName'!",
-                            System.currentTimeMillis()))
                     }
+                }
+
+                if (!sigVerified) {
+                    notifyMessageReceived(Message(currentRoom, "system",
+                        "[join] Aborting key exchange - room key not accepted.",
+                        System.currentTimeMillis()))
+                    java.util.Arrays.fill(mySk, 0.toByte())
+                    return null
                 }
 
                 // Decrypt room key using crypto_box_open_easy
@@ -686,7 +711,7 @@ class FearClient(
                 java.util.Arrays.fill(mySk, 0.toByte())
 
                 if (ok) {
-                    val verStr = if (sigVerified) " (identity verified)" else " (unsigned)"
+                    val verStr = " (identity verified)"
                     if (BuildConfig.DEBUG) Log.i("FearClient", "[join] Room key received from '$senderName'$verStr")
                     notifyMessageReceived(Message(currentRoom, "system",
                         "[join] Room key received from '$senderName'$verStr",

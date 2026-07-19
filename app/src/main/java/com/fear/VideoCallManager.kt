@@ -143,8 +143,9 @@ class VideoCallManager(
 
         Log.d(TAG, "Initialized: quality=${preset.width}x${preset.height}@${preset.fps}")
         Log.d(TAG, "Local nonce prefix: ${localNoncePrefix.toHex()}")
-        Log.d(TAG, "Audio key[0..3]: ${audioKey!!.take(4).toByteArray().toHex()}")
-        Log.d(TAG, "Video key[0..3]: ${videoKey!!.take(4).toByteArray().toHex()}")
+        // Never log key material: minify is disabled, so these survive into
+        // release builds and land in logcat/bugreports.
+        Log.d(TAG, "Audio/video subkeys derived")
         Log.d(TAG, "Identity: ${if (identityMgr?.hasIdentity() == true) "yes" else "no"}")
     }
 

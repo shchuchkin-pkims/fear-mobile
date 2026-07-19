@@ -199,6 +199,12 @@ object HandleProtocol {
         val nonceLen = readU16(inp);   inp.skipBytes(nonceLen)
         val type = inp.readUnsignedByte().toByte()
         val clen = readU32(inp).toInt()
+        // Bound the allocation: a hostile or spoofed server could otherwise
+        // announce a ~2 GB length and kill the process with OutOfMemoryError,
+        // which is an Error and is not caught by the callers' catch(Exception).
+        if (clen < 0 || clen > Common.MAX_FRAME) {
+            throw java.io.IOException("handle reply too large: $clen")
+        }
         val cipher = ByteArray(clen)
         inp.readFully(cipher)
         if (type != Common.MSG_TYPE_HANDLE_RESULT) {

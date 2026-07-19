@@ -134,6 +134,12 @@ object BlobProtocol {
             val nonceLen = readU16(inp);   inp.skipBytes(nonceLen)
             val replyType = inp.readUnsignedByte().toByte()
             val clen = readU32(inp).toInt()
+            // Bound the allocation: a hostile or spoofed server could otherwise
+            // announce a ~2 GB length and kill the process with OutOfMemoryError,
+            // which is an Error and is not caught by the callers' catch(Exception).
+            if (clen < 0 || clen > Common.MAX_FRAME) {
+                throw java.io.IOException("blob reply too large: $clen")
+            }
             val cipher = ByteArray(clen)
             inp.readFully(cipher)
             return replyType to cipher

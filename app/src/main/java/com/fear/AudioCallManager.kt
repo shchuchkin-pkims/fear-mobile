@@ -230,7 +230,9 @@ class AudioCallManager(
                 }
 
                 println("ACM_DEBUG: Checking if need to reinitialize...")
-                println("ACM_DEBUG: Encryption key (first 8 bytes): ${encryptionKey.take(8).joinToString(" ") { "%02x".format(it) }}")
+                // Never log key material: minify is disabled, so println/Log survive
+                // into release builds and land in logcat/bugreports.
+                println("ACM_DEBUG: Encryption key set (${encryptionKey.size} bytes)")
                 // Update room key if different OR if codecs not initialized
                 if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
                     println("ACM_DEBUG: Initializing with new key... (encoder=${opusEncoder != null}, decoder=${opusDecoder != null})")
