@@ -89,6 +89,11 @@ class FearServer(private val port: Int, private val listener: ServerListener) {
                 continue
             }
 
+            // Bound blocking reads. Without a timeout a peer that connects and
+            // then sends nothing (or half a header) pins its handler thread
+            // forever, and MAX_CLIENTS such connections lock every real user out.
+            try { clientSocket.soTimeout = 240_000 } catch (_: Exception) {}
+
             val session = ClientSession(clientSocket)
             clients.add(session)
             Log.i(TAG, "New connection (${clients.size} total)")

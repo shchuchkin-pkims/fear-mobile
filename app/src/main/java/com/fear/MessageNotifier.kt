@@ -38,11 +38,24 @@ object MessageNotifier {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
         )
 
+        // Shown instead of the real content on a locked screen. Without this the
+        // decrypted message body and sender were rendered on the lock screen,
+        // which hands the plaintext to anyone holding the phone and undoes the
+        // end-to-end encryption at the last step.
+        val publicVersion = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("F.E.A.R.")
+            .setContentText("New message")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(sender)
             .setContentText(text)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion)
             .setContentIntent(pi)
             .setAutoCancel(true)
             .build()
