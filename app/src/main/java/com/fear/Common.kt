@@ -110,6 +110,9 @@ object Common {
     const val MSG_TYPE_ROOM_INFO_REQUEST: Byte = 27
     const val MSG_TYPE_ROOM_INFO_RESULT:  Byte = 28
     const val MSG_TYPE_PING:              Byte = 29
+    /* M10: authorized blob reads - one-shot challenge signed by the owner */
+    const val MSG_TYPE_BLOB_GET_CHALLENGE:    Byte = 30
+    const val MSG_TYPE_BLOB_CHALLENGE_RESULT: Byte = 31
 
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32

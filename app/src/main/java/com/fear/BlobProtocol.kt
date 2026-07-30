@@ -15,8 +15,10 @@ import java.net.Socket
  * chat wire format with placeholder room/name and zero nonce.
  *
  * The relay is just a dumb store — encryption happens client-side
- * (ContactsCipher). Server-side identity_pk only owns the slot; reads
- * are unauthenticated because the cipher already protects confidentiality.
+ * (ContactsCipher). Server-side identity_pk owns the slot for both
+ * directions: writes are signed over (type || cipher), and reads (M10)
+ * require signing a one-shot server challenge, so only the key owner
+ * can download their ciphertext or learn whether a blob exists.
  */
 object BlobProtocol {
 
@@ -80,7 +82,9 @@ object BlobProtocol {
 
     suspend fun get(
         host: String, port: Int,
-        identityPk: ByteArray, type: String,
+        identityPk: ByteArray,
+        sign: (ByteArray) -> ByteArray?,
+        type: String,
         timeoutMs: Int = 10_000,
     ): GetResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         try {
@@ -88,19 +92,46 @@ object BlobProtocol {
             val typeBytes = type.toByteArray(Charsets.UTF_8)
             require(typeBytes.size in 1..255)
 
-            // payload: [pk(32)][type_len(1)][type]
-            val payload = ByteArray(32 + 1 + typeBytes.size)
-            System.arraycopy(identityPk, 0, payload, 0, 32)
-            payload[32] = typeBytes.size.toByte()
-            System.arraycopy(typeBytes, 0, payload, 33, typeBytes.size)
+            // Both rounds must ride one connection: the challenge is bound
+            // to it and consumed by the next BLOB_GET (M10).
+            val sock = Socket()
+            sock.use { s ->
+                s.connect(InetSocketAddress(host.trim(), port), timeoutMs)
+                s.soTimeout = timeoutMs
+                val out = s.getOutputStream()
+                val inp = DataInputStream(s.getInputStream())
 
-            val (replyType, body) = roundtrip(host, port,
-                Common.MSG_TYPE_BLOB_GET, payload, timeoutMs)
-                ?: return@withContext GetResult.Network(java.io.IOException("no reply"))
-            if (replyType != Common.MSG_TYPE_BLOB_RESULT) {
-                return@withContext GetResult.ServerError("unexpected reply type=$replyType")
+                // Round 1: fetch the one-shot challenge
+                out.write(serviceFrame(Common.MSG_TYPE_BLOB_GET_CHALLENGE, ByteArray(0)))
+                out.flush()
+                val (chType, challenge) = readReply(inp)
+                if (chType != Common.MSG_TYPE_BLOB_CHALLENGE_RESULT || challenge.size != 32) {
+                    return@withContext GetResult.ServerError("bad challenge reply type=$chType")
+                }
+
+                // Round 2: sig over (challenge || type) proves we own pk
+                val signed = ByteArray(32 + typeBytes.size)
+                System.arraycopy(challenge, 0, signed, 0, 32)
+                System.arraycopy(typeBytes, 0, signed, 32, typeBytes.size)
+                val sig = sign(signed) ?: return@withContext GetResult.ServerError("sign failed")
+                require(sig.size == Sign.ED25519_BYTES)
+
+                // payload: [pk(32)][sig(64)][type_len(1)][type]
+                val payload = ByteArray(32 + 64 + 1 + typeBytes.size)
+                var o = 0
+                System.arraycopy(identityPk, 0, payload, o, 32); o += 32
+                System.arraycopy(sig,        0, payload, o, 64); o += 64
+                payload[o] = typeBytes.size.toByte(); o += 1
+                System.arraycopy(typeBytes, 0, payload, o, typeBytes.size)
+
+                out.write(serviceFrame(Common.MSG_TYPE_BLOB_GET, payload))
+                out.flush()
+                val (replyType, body) = readReply(inp)
+                if (replyType != Common.MSG_TYPE_BLOB_RESULT) {
+                    return@withContext GetResult.ServerError("unexpected reply type=$replyType")
+                }
+                parseGet(body)
             }
-            parseGet(body)
         } catch (e: Exception) {
             GetResult.Network(e)
         }
@@ -119,31 +150,36 @@ object BlobProtocol {
         sock.use { s ->
             s.connect(InetSocketAddress(host.trim(), port), timeoutMs)
             s.soTimeout = timeoutMs
-
-            val room  = "__blobs__".toByteArray(Charsets.UTF_8)
-            val name  = "__svc__".toByteArray(Charsets.UTF_8)
-            val nonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
-
-            val frame = buildFrame(room, name, nonce, type, payload)
-            s.getOutputStream().write(frame)
+            s.getOutputStream().write(serviceFrame(type, payload))
             s.getOutputStream().flush()
-
-            val inp = DataInputStream(s.getInputStream())
-            val roomLen = readU16(inp);    inp.skipBytes(roomLen)
-            val nameLen = readU16(inp);    inp.skipBytes(nameLen)
-            val nonceLen = readU16(inp);   inp.skipBytes(nonceLen)
-            val replyType = inp.readUnsignedByte().toByte()
-            val clen = readU32(inp).toInt()
-            // Bound the allocation: a hostile or spoofed server could otherwise
-            // announce a ~2 GB length and kill the process with OutOfMemoryError,
-            // which is an Error and is not caught by the callers' catch(Exception).
-            if (clen < 0 || clen > Common.MAX_FRAME) {
-                throw java.io.IOException("blob reply too large: $clen")
-            }
-            val cipher = ByteArray(clen)
-            inp.readFully(cipher)
-            return replyType to cipher
+            return readReply(DataInputStream(s.getInputStream()))
         }
+    }
+
+    /** Wrap a service payload into a chat-format frame with placeholder room/name. */
+    private fun serviceFrame(type: Byte, payload: ByteArray): ByteArray {
+        val room  = "__blobs__".toByteArray(Charsets.UTF_8)
+        val name  = "__svc__".toByteArray(Charsets.UTF_8)
+        val nonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
+        return buildFrame(room, name, nonce, type, payload)
+    }
+
+    /** Read one reply frame, returning its (type, payload). */
+    private fun readReply(inp: DataInputStream): Pair<Byte, ByteArray> {
+        val roomLen = readU16(inp);    inp.skipBytes(roomLen)
+        val nameLen = readU16(inp);    inp.skipBytes(nameLen)
+        val nonceLen = readU16(inp);   inp.skipBytes(nonceLen)
+        val replyType = inp.readUnsignedByte().toByte()
+        val clen = readU32(inp).toInt()
+        // Bound the allocation: a hostile or spoofed server could otherwise
+        // announce a ~2 GB length and kill the process with OutOfMemoryError,
+        // which is an Error and is not caught by the callers' catch(Exception).
+        if (clen < 0 || clen > Common.MAX_FRAME) {
+            throw java.io.IOException("blob reply too large: $clen")
+        }
+        val cipher = ByteArray(clen)
+        inp.readFully(cipher)
+        return replyType to cipher
     }
 
     private fun buildFrame(

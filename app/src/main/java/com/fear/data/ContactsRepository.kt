@@ -58,7 +58,9 @@ class ContactsRepository private constructor(private val ctx: Context) {
         val pk = im.getPublicKey() ?: return -1
         val key = im.deriveSymmetricKey(KDF_CTX) ?: return -1
 
-        val rc = BlobProtocol.get(server.host, server.port, pk, BLOB_TYPE)
+        val rc = BlobProtocol.get(server.host, server.port, pk,
+            sign = { msg -> im.sign(msg) },
+            type = BLOB_TYPE)
         return when (rc) {
             is BlobProtocol.GetResult.Found -> {
                 try {
