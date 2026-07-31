@@ -49,6 +49,9 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: gradle-${{ runner.os }}-
 
+      - name: Run unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
 

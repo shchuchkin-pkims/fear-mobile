@@ -128,6 +128,9 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     testImplementation("junit:junit:4.13.2")
+    // BLAKE2b for JVM unit tests: lazysodium-android needs a device, and an
+    // independent implementation is what makes the frozen vectors meaningful.
+    testImplementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }
