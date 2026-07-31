@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    One participant in the strip along the bottom of a call.
+
+    The frame around the cell is the state: grey for present, green while
+    that person is talking, amber when the user has pinned them to the big
+    view. Tapping the cell pins or unpins.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/thumbFrame"
+    android:layout_width="108dp"
+    android:layout_height="144dp"
+    android:layout_marginEnd="8dp"
+    android:background="#303030"
+    android:padding="2dp"
+    android:clickable="true"
+    android:focusable="true">
+
+    <SurfaceView
+        android:id="@+id/thumbSurface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <TextView
+        android:id="@+id/thumbName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#A0000000"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:paddingStart="6dp"
+        android:paddingEnd="6dp"
+        android:paddingTop="2dp"
+        android:paddingBottom="2dp"
+        android:textColor="#FFFFFF"
+        android:textSize="11sp" />
+</FrameLayout>

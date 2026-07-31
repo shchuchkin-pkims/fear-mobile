@@ -50,6 +50,25 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     private lateinit var toggleCameraButton: Button
     private lateinit var toggleMuteButton: Button
     private lateinit var statsTextView: TextView
+    private lateinit var mainCaption: TextView
+    private lateinit var stripScroll: android.widget.HorizontalScrollView
+    private lateinit var strip: android.widget.LinearLayout
+
+    /** One strip cell per participant, keyed by their sender slot. */
+    private val stripCells = HashMap<Int, View>()
+
+    /* What each cell and the caption currently say.
+     *
+     * Participants are republished several times a second, because who is
+     * speaking changes that often. Writing the same text and the same colour
+     * back into the views on every one of those is not free: it relayouts the
+     * window, a relayout hands every SurfaceView a new surface, and a decoder
+     * configured onto the old one is dead from that moment. Measured at 87
+     * decoder rebuilds in 25 seconds - the picture arrived anyway, in fits.
+     * So nothing is written unless it changed. */
+    private val cellText = HashMap<Int, String>()
+    private val cellColor = HashMap<Int, Int>()
+    private var captionText: String? = null
 
     private var videoCallManager: VideoCallManager? = null
     private var isFrontCamera = true
@@ -92,6 +111,9 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         toggleCameraButton = findViewById(R.id.toggleCameraButton)
         toggleMuteButton = findViewById(R.id.toggleMuteButton)
         statsTextView = findViewById(R.id.statsTextView)
+        mainCaption = findViewById(R.id.mainCaption)
+        stripScroll = findViewById(R.id.stripScroll)
+        strip = findViewById(R.id.strip)
 
         endCallButton.setOnClickListener { endCall() }
         toggleCameraButton.setOnClickListener { toggleCamera() }
@@ -200,36 +222,129 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
             manager.startCall(remoteIp, remotePort, localPort)
         }
 
-        // Set up decoder when surface is ready
+        /* A resize hands the view a new surface, and whoever was drawing on
+         * the old one is drawing nowhere from that moment. Both callbacks
+         * report it, which is why a call with two peers of different shapes
+         * used to lose its picture as soon as the second one announced. */
         remoteSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
-                Log.d(TAG, "Surface created, attaching decoder")
-                manager.attachDecoderSurface(holder.surface)
+                manager.setMainSurface(holder.surface)
             }
 
-            /* A resize gives the view a new surface, and the decoder bound
-             * to the old one is dead from that moment on. Both of these were
-             * empty, which is why a call with two peers of different shapes
-             * lost its picture the moment the second one announced itself. */
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                Log.d(TAG, "Surface changed (${width}x${height}), rebinding decoder")
-                manager.attachDecoderSurface(holder.surface)
+                manager.setMainSurface(holder.surface)
             }
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                Log.d(TAG, "Surface destroyed, releasing decoder")
-                manager.detachDecoderSurface()
+                manager.setMainSurface(null)
             }
         })
 
-        // Also check if surface already exists
         if (remoteSurfaceView.holder.surface.isValid) {
-            Log.d(TAG, "Surface already valid, attaching decoder immediately")
-            manager.attachDecoderSurface(remoteSurfaceView.holder.surface)
+            manager.setMainSurface(remoteSurfaceView.holder.surface)
         }
 
         // Start camera
         startCamera(preset)
+    }
+
+    /**
+     * Redraw the strip for the current participants.
+     *
+     * The person on the big view keeps a cell too, marked rather than
+     * carrying video: they are already on screen, and a second decoder for
+     * the same stream buys nothing but heat. Everyone else gets a cell with
+     * their own picture in it.
+     */
+    private fun updateParticipants(participants: List<VideoCallManager.Participant>) {
+        val manager = videoCallManager ?: return
+
+        val main = participants.firstOrNull { it.main }
+        val wanted = main?.let { if (it.pinned) "\uD83D\uDCCC ${it.name}" else it.name }
+        if (wanted != captionText) {
+            captionText = wanted
+            if (wanted != null) {
+                mainCaption.text = wanted
+                mainCaption.visibility = View.VISIBLE
+            } else {
+                mainCaption.visibility = View.GONE
+            }
+        }
+
+        // Cells for people who have left.
+        val present = participants.map { it.slot }.toSet()
+        for (slot in stripCells.keys.toList()) {
+            if (present.contains(slot)) continue
+            stripCells.remove(slot)?.let { strip.removeView(it) }
+            cellText.remove(slot)
+            cellColor.remove(slot)
+            manager.setThumbSurface(slot, null)
+        }
+
+        /* Shown as soon as anybody is here and never hidden again while the
+         * call lasts. Toggling it destroys every cell's surface and takes the
+         * decoders bound to them with it, which with people joining one after
+         * another meant the strip spent the call rebuilding itself instead of
+         * showing anyone. */
+        if (participants.isNotEmpty() && stripScroll.visibility != View.VISIBLE) {
+            stripScroll.visibility = View.VISIBLE
+        }
+
+        for (p in participants) {
+            val existing = stripCells[p.slot]
+            val cell = existing ?: layoutInflater
+                .inflate(R.layout.item_video_thumb, strip, false)
+                .also { view ->
+                    stripCells[p.slot] = view
+                    strip.addView(view)
+                    view.setOnClickListener { manager.togglePin(p.slot) }
+
+                    val sv = view.findViewById<SurfaceView>(R.id.thumbSurface)
+                    /* A SurfaceView draws in its own layer behind the window,
+                     * and the window here is opaque black. One of them can
+                     * punch through; the rest are simply covered, which is
+                     * why the strip was a row of black rectangles while the
+                     * decoders behind it were happily producing frames.
+                     * Media overlay puts them above that layer. */
+                    sv.setZOrderMediaOverlay(true)
+                    sv.holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(h: SurfaceHolder) {
+                            manager.setThumbSurface(p.slot, h.surface)
+                        }
+                        override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
+                            manager.setThumbSurface(p.slot, h.surface)
+                        }
+                        override fun surfaceDestroyed(h: SurfaceHolder) {
+                            manager.setThumbSurface(p.slot, null)
+                        }
+                    })
+                }
+
+            val text = if (p.pinned) "\uD83D\uDCCC ${p.name}" else p.name
+            if (cellText[p.slot] != text) {
+                cellText[p.slot] = text
+                cell.findViewById<TextView>(R.id.thumbName).text = text
+            }
+
+            // Speaking is marked on the cell rather than only by who is big,
+            // so the strip still says who is talking while somebody is pinned.
+            val color = when {
+                p.pinned -> 0xFFFFC107.toInt()    // chosen by the user
+                p.main -> 0xFF2196F3.toInt()      // on the big view
+                p.speaking -> 0xFF4CAF50.toInt()  // talking
+                else -> 0xFF303030.toInt()
+            }
+            if (cellColor[p.slot] != color) {
+                cellColor[p.slot] = color
+                cell.findViewById<View>(R.id.thumbFrame).setBackgroundColor(color)
+            }
+
+            /* The person on the big view has no second copy of themselves
+             * in the strip - one decoder per participant, and it is drawing
+             * on the big view. Their cell is marked instead. Alpha would have
+             * been the obvious way to say so and does nothing at all to a
+             * SurfaceView, whose layer the view hierarchy does not compose. */
+        }
     }
 
     private fun startCamera(preset: VideoQualityPreset) {
@@ -386,6 +501,10 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
 
     override fun onRemoteVideoFrame(data: ByteArray, width: Int, height: Int) {
         // Handled by SurfaceView directly via VP8 decoder
+    }
+
+    override fun onParticipants(participants: List<VideoCallManager.Participant>) {
+        runOnUiThread { updateParticipants(participants) }
     }
 
     override fun onStatsUpdated(packetsReceived: Int, packetsLost: Int, rttMs: Int) {

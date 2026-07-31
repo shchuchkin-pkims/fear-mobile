@@ -260,6 +260,26 @@ class Vp8Decoder {
         Log.d(TAG, "VP8 decoder started: ${codec?.name}")
     }
 
+    /**
+     * Point an already-running decoder at a different surface.
+     *
+     * This is what makes a speaker view cheap. Rebuilding the decoder to move
+     * a participant between the big view and the strip would throw away its
+     * reference frames, so that participant would show nothing until their
+     * next keyframe - seconds of black every time the speaker changes.
+     * setOutputSurface keeps the decoder and its history.
+     */
+    fun setSurface(surface: Surface): Boolean = synchronized(lock) {
+        val c = codec ?: return false
+        return try {
+            c.setOutputSurface(surface)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setOutputSurface failed: ${e.message}")
+            false
+        }
+    }
+
     private fun tryCreateDecoder(mime: String, surface: Surface, width: Int, height: Int): MediaCodec? {
         return try {
             val format = MediaFormat.createVideoFormat(mime, width, height)

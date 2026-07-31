@@ -6,6 +6,8 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -57,14 +59,18 @@ class VideoCallManager(
         private const val PLAYOUT_PREFILL_FRAMES = 6
         /** Per-sender latency cap, in frames. */
         private const val MAX_PLAYOUT_FRAMES = 20
-        /** How long the window holder may be silent before it can be taken. */
+        /** How long the big view's holder may be silent before it is taken. */
         private const val SPEAKER_QUIET_MS = 700L
-        /** Frames a challenger must deliver to take the window. */
-        private const val SPEAKER_TAKE_FRAMES = 2
-        /** Floor on how often the window may change hands. */
-        private const val SPEAKER_DWELL_MS = 1200L
-        /** A challenger quiet this long stops being one. */
-        private const val SPEAKER_STALE_MS = 400L
+        /** Floor on how often the big view may change hands. */
+        private const val SPEAKER_DWELL_MS = 1500L
+        /** Loudness a voice must reach to count as speech, on a 32768 scale. */
+        private const val SPEECH_FLOOR = 900.0
+        /** Per-frame decay of the smoothed loudness: fast attack, slow fall. */
+        private const val ENERGY_DECAY = 0.86
+        /** How long somebody keeps their speaking mark after falling quiet. */
+        private const val SPEAKING_HOLD_MS = 900L
+        /** How much louder a challenger must be to take the big view. */
+        private const val SPEAKER_MARGIN = 1.6
 
         private const val TAG = "VCM"
 
@@ -83,6 +89,12 @@ class VideoCallManager(
         fun onConnected(peerWidth: Int, peerHeight: Int, peerFps: Int)
         fun onRemoteVideoFrame(data: ByteArray, width: Int, height: Int)
         fun onStatsUpdated(packetsReceived: Int, packetsLost: Int, rttMs: Int)
+
+        /**
+         * Who is in the call and who is on the big view, whenever either
+         * changes. The screen owns the layout; this only reports state.
+         */
+        fun onParticipants(participants: List<Participant>) {}
     }
 
     // Keys. Ours are derived from our own salt, so they need no peer and no
@@ -143,7 +155,50 @@ class VideoCallManager(
 
     // Codecs
     private var vp8Encoder: Vp8Encoder? = null
-    private var vp8Decoder: Vp8Decoder? = null
+    /** One participant, as the call screen needs to draw them. */
+    data class Participant(
+        val slot: Int,
+        val name: String,
+        /** On the big view right now. */
+        val main: Boolean,
+        /** Loud enough to be the one talking. */
+        val speaking: Boolean,
+        /** The user chose them, so the speaker does not take the view back. */
+        val pinned: Boolean,
+    )
+
+    /**
+     * A participant's video: its own decoder, pointed at whichever surface
+     * currently shows them.
+     *
+     * One decoder per participant rather than one per surface. A participant
+     * appears in at most one place at a time - big view or strip - and moving
+     * them is setOutputSurface rather than a rebuild, so a handover costs
+     * nothing and loses no reference frames.
+     */
+    private class PeerVideo {
+        var decoder: Vp8Decoder? = null
+        var surface: Surface? = null
+        var frames: Long = 0
+    }
+
+    /** Guards peerVideo, the surfaces, and who is on the big view. */
+    private val videoLock = Any()
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val peerVideo = HashMap<Int, PeerVideo>()
+    private val peerName = HashMap<Int, String>()
+
+    /** Surfaces the call screen has given us. */
+    private var mainSurface: Surface? = null
+    private val thumbSurface = HashMap<Int, Surface>()
+
+    /** Who is on the big view, who the user pinned there, and who is loudest. */
+    private var mainSlot: Int = -1
+    private var pinnedSlot: Int = -1
+    private var lastSwitchMs: Long = 0
+    private var lastParticipantsKey: String = ""
+
 
     // Audio
     private var opusEncoder: OpusCodec.Encoder? = null
@@ -164,6 +219,10 @@ class VideoCallManager(
         var lastMs: Long = 0
         var prefilled: Boolean = false
         var frames: Long = 0
+        /** Smoothed loudness, fast to rise and slow to fall. */
+        var energy: Double = 0.0
+        /** When this voice was last above the speech floor. */
+        var voiceMs: Long = 0
     }
 
     private val mix = Array(MAX_MIX) { MixSlot() }
@@ -203,13 +262,6 @@ class VideoCallManager(
      * "whoever arrived last" alternates at random and any hold on top of it
      * only sets the period of the flicker.
      */
-    private var decoderSurface: Surface? = null
-    private var dispSlot: Int = -1
-    private var dispLastMs: Long = 0
-    private var dispSwitchMs: Long = 0
-    private var candSlot: Int = -1
-    private var candLastMs: Long = 0
-    private var candFrames: Int = 0
     private val videoStats = HashMap<Int, Long>()
 
     // Identity
@@ -680,31 +732,215 @@ class VideoCallManager(
      * start; with two peers of different shapes it happens again later, and
      * a decoder that did not follow spends the rest of the call throwing.
      */
-    fun attachDecoderSurface(surface: Surface) {
-        if (decoderSurface === surface && vp8Decoder != null) return
-        decoderSurface = surface
-        try { vp8Decoder?.stop() } catch (_: Exception) {}
-        vp8Decoder = null
-        try {
-            vp8Decoder = Vp8Decoder().also {
-                it.start(surface, quality.width, quality.height)
+    fun setMainSurface(surface: Surface?) {
+        synchronized(videoLock) {
+            // surfaceChanged fires for every relayout with the same surface,
+            // and retargeting on each one was enough churn to keep decoders
+            // permanently in pieces.
+            if (mainSurface === surface) return
+            mainSurface = surface
+            retargetLocked()
+        }
+        publishParticipants()
+    }
+
+    /**
+     * A strip cell for `slot`, or null when it goes away. The screen creates
+     * and destroys these as participants come and go.
+     */
+    fun setThumbSurface(slot: Int, surface: Surface?) {
+        synchronized(videoLock) {
+            if (thumbSurface[slot] === surface) return
+            if (surface == null) thumbSurface.remove(slot) else thumbSurface[slot] = surface
+            retargetLocked()
+        }
+        publishParticipants()
+    }
+
+    /**
+     * Pin a participant to the big view, or unpin them if they are already
+     * pinned. A pin outranks the speaker: the point of choosing somebody is
+     * that they stay chosen while other people talk.
+     */
+    fun togglePin(slot: Int) {
+        synchronized(videoLock) {
+            pinnedSlot = if (pinnedSlot == slot) -1 else slot
+            chooseMainLocked(force = true)
+        }
+        publishParticipants()
+    }
+
+    /** Where this participant should be drawing right now. */
+    private fun surfaceForLocked(slot: Int): Surface? =
+        if (slot == mainSlot) mainSurface else thumbSurface[slot]
+
+    /**
+     * Point every decoder at the surface its participant now belongs to.
+     * Cheap by design: setOutputSurface keeps the decoder, so a handover does
+     * not cost the seconds of black that rebuilding would.
+     */
+    private fun retargetLocked() {
+        /*
+         * Whoever is leaving the big view goes first.
+         *
+         * A MediaCodec owns its output surface exclusively: when the next
+         * one connects, the framework disconnects the previous holder and
+         * that codec is finished - "disconnectFromSurface" in the system log,
+         * "Invalid to call at Released state" in ours. Retargeting in
+         * whatever order the map happened to be in meant the arriving
+         * participant regularly claimed the big view before the departing one
+         * had let go, which killed a decoder on most handovers.
+         */
+        val order = peerVideo.entries.sortedBy { (slot, pv) ->
+            if (pv.surface === mainSurface && slot != mainSlot) 0 else 1
+        }
+        for ((slot, pv) in order) {
+            val want = surfaceForLocked(slot)
+            if (want === pv.surface) continue
+            if (want != null && !want.isValid) continue   // gone already
+            val dec = pv.decoder
+            if (want == null) {
+                // Nowhere to draw: keep the decoder, it will be pointed
+                // somewhere again when the screen gives us a surface.
+                pv.surface = null
+                continue
             }
-            Log.d(TAG, "VP8 decoder attached and started")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start VP8 decoder", e)
+            if (dec == null) {
+                pv.surface = want
+                continue
+            }
+            if (dec.setSurface(want)) {
+                pv.surface = want
+            } else {
+                /* The swap was refused - the codec is gone, usually because
+                 * the surface it was configured with was destroyed under it.
+                 * Start over on the new surface and accept the wait for this
+                 * sender's next keyframe, which is now at most three seconds
+                 * away rather than a GOP.
+                 *
+                 * Rebuilt lazily, on the next frame, rather than here: this
+                 * runs on the UI thread while frames arrive on another, and
+                 * building a codec is not something to do under a lock the
+                 * receive path also wants. */
+                Log.w(TAG, "slot $slot: surface swap refused, rebuilding")
+                try { dec.stop() } catch (_: Exception) {}
+                pv.decoder = null
+                pv.surface = want
+            }
         }
     }
 
     /**
-     * The rendering surface is going away. Release the decoder with it and
-     * remember there is nowhere to draw, so nothing rebuilds one onto a
-     * surface that no longer exists.
+     * Decide who is on the big view.
+     *
+     * Pinned wins. Otherwise the loudest voice takes it, but only once the
+     * current holder has been quiet for a moment and no sooner than
+     * SPEAKER_DWELL_MS after the last change - without that floor two people
+     * in a conversation trade the view on every syllable. Nobody speaking
+     * changes nothing: the last speaker stays up, which is what every other
+     * client does and what people expect.
      */
-    fun detachDecoderSurface() {
-        Log.d(TAG, "decoder surface destroyed, releasing decoder")
-        try { vp8Decoder?.stop() } catch (_: Exception) {}
-        vp8Decoder = null
-        decoderSurface = null
+    private fun chooseMainLocked(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+
+        val present = peerVideo.keys.toMutableSet()
+        synchronized(mixLock) { for (m in mix) if (m.slot >= 0) present.add(m.slot) }
+
+        if (pinnedSlot >= 0 && present.contains(pinnedSlot)) {
+            if (mainSlot != pinnedSlot) {
+                mainSlot = pinnedSlot
+                lastSwitchMs = now
+                retargetLocked()
+            }
+            return
+        }
+
+        if (mainSlot >= 0 && !present.contains(mainSlot)) mainSlot = -1
+
+        if (mainSlot < 0) {
+            val first = peerVideo.keys.minOrNull() ?: present.minOrNull()
+            if (first != null) {
+                mainSlot = first
+                lastSwitchMs = now
+                retargetLocked()
+            }
+            return
+        }
+
+        if (!force && now - lastSwitchMs < SPEAKER_DWELL_MS) return
+
+        // Somebody who sends no video would take the big view and leave it
+        // showing nothing, so the choice is between the cameras that are on.
+        val withVideo = peerVideo.keys
+        var loudest = -1
+        var loudestEnergy = 0.0
+        var holderVoiceMs = 0L
+        var holderEnergy = 0.0
+        synchronized(mixLock) {
+            for (m in mix) {
+                if (m.slot < 0) continue
+                if (m.slot == mainSlot) { holderVoiceMs = m.voiceMs; holderEnergy = m.energy }
+                if (!withVideo.contains(m.slot)) continue
+                if (m.energy > loudestEnergy) { loudestEnergy = m.energy; loudest = m.slot }
+            }
+        }
+
+        if (loudest < 0 || loudest == mainSlot) return
+        if (loudestEnergy < SPEECH_FLOOR) return
+        if (now - holderVoiceMs < SPEAKER_QUIET_MS) return
+        /* Clearly louder, not merely louder. Three people in one room hear
+         * each other's speakers, so their levels sit close together and a
+         * bare comparison hands the big view around several times a minute
+         * for no reason a viewer can see - and each handover costs both
+         * decoders a reconnect. */
+        if (loudestEnergy < holderEnergy * SPEAKER_MARGIN) return
+
+        mainSlot = loudest
+        lastSwitchMs = now
+        Log.i(TAG, "speaker: slot $mainSlot (${peerName[mainSlot] ?: "?"})")
+        retargetLocked()
+    }
+
+    /**
+     * Somebody joined or left: pick the big view again and tell the screen.
+     *
+     * Not left to the periodic pass in the play-out thread, because until a
+     * participant is on the big view nothing points a surface at them, and
+     * with only one of them in the call there is no strip to fall back on -
+     * a two-party call would show nothing at all.
+     */
+    private fun refreshParticipants() {
+        synchronized(videoLock) { chooseMainLocked() }
+        publishParticipants()
+    }
+
+    /** Tell the screen who is here, but only when something actually moved. */
+    private fun publishParticipants() {
+        val list = synchronized(videoLock) {
+            val present = peerVideo.keys.toMutableSet()
+            synchronized(mixLock) { for (m in mix) if (m.slot >= 0) present.add(m.slot) }
+            val now = System.currentTimeMillis()
+            val speaking = HashSet<Int>()
+            synchronized(mixLock) {
+                for (m in mix) {
+                    if (m.slot >= 0 && now - m.voiceMs < SPEAKING_HOLD_MS) speaking.add(m.slot)
+                }
+            }
+            present.sorted().map { slot ->
+                Participant(
+                    slot = slot,
+                    name = peerName[slot] ?: "%06x".format(slot),
+                    main = slot == mainSlot,
+                    speaking = speaking.contains(slot),
+                    pinned = slot == pinnedSlot,
+                )
+            }
+        }
+
+        val key = list.joinToString("|") { "${it.slot}:${it.name}:${it.main}:${it.speaking}:${it.pinned}" }
+        if (key == lastParticipantsKey) return
+        lastParticipantsKey = key
+        handler.post { listener.onParticipants(list) }
     }
 
     /**
@@ -865,6 +1101,7 @@ class VideoCallManager(
             val n = Common.AUDIO_FRAME_SAMPLES
             val acc = IntArray(n)
             val out = ByteArray(n * 2)
+            var speakerTick = 0
             while (running.get()) {
                 java.util.Arrays.fill(acc, 0)
                 synchronized(mixLock) {
@@ -880,6 +1117,14 @@ class VideoCallManager(
                         for (i in 0 until len) acc[i] += frame[i].toInt()
                         m.frames++
                     }
+                }
+
+                // Five times a second is plenty to follow a conversation and
+                // cheap enough to do on the thread that is already awake.
+                if (++speakerTick >= 10) {
+                    speakerTick = 0
+                    synchronized(videoLock) { chooseMainLocked() }
+                    publishParticipants()
                 }
 
                 val track = audioTrack
@@ -1043,9 +1288,18 @@ class VideoCallManager(
 
         // Now safe to release codecs and audio
         try { vp8Encoder?.stop() } catch (_: Exception) {}
-        try { vp8Decoder?.stop() } catch (_: Exception) {}
         vp8Encoder = null
-        vp8Decoder = null
+        synchronized(videoLock) {
+            for (pv in peerVideo.values) {
+                try { pv.decoder?.stop() } catch (_: Exception) {}
+                pv.decoder = null
+            }
+            peerVideo.clear()
+            thumbSurface.clear()
+            mainSurface = null
+            mainSlot = -1
+            pinnedSlot = -1
+        }
 
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
@@ -1057,11 +1311,10 @@ class VideoCallManager(
             }
         }
         for ((slot, frames) in videoStats) {
-            Log.i(TAG, "[VIDEO] peer slot $slot frames $frames shown ${if (slot == dispSlot) "yes" else "no"}")
+            Log.i(TAG, "[VIDEO] peer slot $slot (${peerName[slot] ?: "?"}) frames $frames")
         }
         mixTeardown()
         videoStats.clear()
-        dispSlot = -1; candSlot = -1
         try { playThread?.interrupt() } catch (_: Exception) {}
         playThread = null
 
@@ -1308,9 +1561,14 @@ class VideoCallManager(
         val peerIdbind = hello.pk ?: MediaKeys.UNSIGNED_IDBIND
         val status: SenderTable.Status
         val isNew: Boolean
+        val slotIdx: Int
         synchronized(tableLock) {
             val before = table.count()
-            status = table.install(hello.senderSalt, peerIdbind, hello.keyVersion).first
+            // install is idempotent per salt, so a repeat announcement gives
+            // back the slot this sender already holds rather than a new one.
+            val r = table.install(hello.senderSalt, peerIdbind, hello.keyVersion)
+            status = r.first
+            slotIdx = r.second
             isNew = status == SenderTable.Status.OK && table.count() > before
         }
 
@@ -1318,6 +1576,14 @@ class VideoCallManager(
             Log.w(TAG, "HELLO2 not installed: $status")
             return
         }
+
+        // What this participant calls themselves, for their caption. Taken
+        // from every verified announcement, so somebody who rejoins under a
+        // different name is not labelled with the old one.
+        if (slotIdx >= 0) {
+            synchronized(videoLock) { peerName[slotIdx] = hello.name }
+        }
+        refreshParticipants()
 
         if (hello.flags and MediaHello.FLAG_VIDEO != 0) {
             remoteWidth = hello.width
@@ -1426,67 +1692,28 @@ class VideoCallManager(
             } ?: return
             if (pcm.isEmpty()) return
 
+            /*
+             * Loudness, which is what decides the big view.
+             *
+             * Video arrival cannot decide it: nothing gates sending on
+             * speech, every camera streams continuously, so "whoever decoded
+             * last" alternates at random - measured at nine handovers in ten
+             * seconds on the desktop. Speech is a property of the audio.
+             *
+             * Fast attack and slow decay, so a voice takes the view on its
+             * first syllable and does not lose it between words.
+             */
+            var sum = 0.0
+            for (v in pcm) { val d = v.toDouble(); sum += d * d }
+            val rms = kotlin.math.sqrt(sum / pcm.size.coerceAtLeast(1))
+            m.energy = if (rms > m.energy) rms else m.energy * ENERGY_DECAY
+            val nowMs = System.currentTimeMillis()
+            if (rms > SPEECH_FLOOR) m.voiceMs = nowMs
+
             m.ring.addLast(pcm)
-            m.lastMs = System.currentTimeMillis()
+            m.lastMs = nowMs
             // One peer arriving in bursts must not add latency to another.
             while (m.ring.size > MAX_PLAYOUT_FRAMES) m.ring.removeFirst()
-        }
-    }
-
-    /**
-     * Decide whether `slot` should own the window.
-     *
-     * Sticky, not most-recently-arrived: the holder keeps the window while
-     * its pictures keep coming, a challenger has to deliver a couple of
-     * frames after the holder has gone quiet, and no handover may follow
-     * another too closely. Without the dwell floor two cameras streaming at
-     * once simply trade the window back and forth.
-     */
-    private fun shouldShow(slot: Int, now: Long): Boolean {
-        if (dispSlot == slot) { dispLastMs = now; return true }
-
-        if (dispSlot < 0) {
-            dispSlot = slot; dispLastMs = now; dispSwitchMs = now
-            candSlot = -1; candFrames = 0
-            Log.i(TAG, "active speaker: slot $slot")
-            return true
-        }
-
-        // The holder is still talking, or the last handover is too recent.
-        if (now - dispLastMs < SPEAKER_QUIET_MS) return false
-        if (now - dispSwitchMs < SPEAKER_DWELL_MS) return false
-
-        if (candSlot != slot) {
-            // A challenger that has itself gone quiet loses its candidacy,
-            // otherwise two alternating senders reset each other forever and
-            // the window stays frozen on somebody who has left.
-            if (candSlot >= 0 && now - candLastMs < SPEAKER_STALE_MS) return false
-            candSlot = slot; candFrames = 0
-        }
-        candLastMs = now
-        candFrames++
-        if (candFrames < SPEAKER_TAKE_FRAMES) return false
-
-        val was = dispSlot
-        dispSlot = slot; dispLastMs = now; dispSwitchMs = now
-        candSlot = -1; candFrames = 0
-        Log.i(TAG, "active speaker: slot $slot (was $was)")
-
-        // The decoder holds the previous stream's reference frames, so it has
-        // to start over. Costs a wait for that sender's next keyframe.
-        restartDecoder()
-        return true
-    }
-
-    /** Recreate the VP8 decoder on the same surface, discarding its state. */
-    private fun restartDecoder() {
-        val surface = decoderSurface ?: return
-        try { vp8Decoder?.stop() } catch (_: Exception) {}
-        vp8Decoder = try {
-            Vp8Decoder().also { it.start(surface, quality.width, quality.height) }
-        } catch (e: Exception) {
-            Log.e(TAG, "decoder restart failed", e)
-            null
         }
     }
 
@@ -1543,16 +1770,72 @@ class VideoCallManager(
             }
 
             videoStats[slot] = (videoStats[slot] ?: 0L) + 1
+            decodeForPeer(slot, completeFrame)
+        }
+    }
 
-            // One surface, so one participant: feeding every sender into the
-            // single decoder is what made three cameras look broken.
-            if (shouldShow(slot, System.currentTimeMillis())) {
-                // A decoder that was replaced on the last handover, or lost
-                // when one failed to build, is rebuilt here rather than
-                // leaving the call with no picture for the rest of its life.
-                if (vp8Decoder == null && decoderSurface != null) restartDecoder()
-                vp8Decoder?.decode(completeFrame, System.nanoTime() / 1000)
+    /**
+     * Decode one completed picture into its own participant's decoder.
+     *
+     * Per sender rather than shared, for the same reason the Opus decoders
+     * are: VP8 predicts from previous frames, so two streams through one
+     * decoder ruin each other. The decoder is built on first use, when the
+     * screen has told us where this participant draws.
+     */
+    private fun decodeForPeer(slot: Int, frame: ByteArray) {
+        val dec: Vp8Decoder?
+        synchronized(videoLock) {
+            val pv = peerVideo.getOrPut(slot) { PeerVideo() }
+            pv.frames++
+
+            if (pv.decoder == null) {
+                val target = surfaceForLocked(slot)
+                /*
+                 * isValid, not just non-null. A SurfaceView hands its surface
+                 * out and takes it away again on every relayout, and the
+                 * window here rearranges itself each time somebody joins.
+                 * Configuring a codec onto a surface that has already gone
+                 * does not fail: the codec starts, reports itself started,
+                 * and is in Released state by the first frame. That is
+                 * exactly what a strip of black rectangles looked like from
+                 * the inside - two decoders running and 1938 frames dropped
+                 * with "Invalid to call at Released state".
+                 */
+                if (target == null || !target.isValid) {
+                    // The screen will give us a live one; tell it who is here.
+                    handler.post { refreshParticipants() }
+                    return
+                }
+                pv.decoder = try {
+                    Vp8Decoder().also { it.start(target, quality.width, quality.height) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "no decoder for slot $slot", e)
+                    null
+                }
+                pv.surface = if (pv.decoder != null) target else null
+                if (pv.decoder != null) handler.post { refreshParticipants() }
             }
+            dec = pv.decoder
+        }
+
+        if (dec == null) return
+
+        /* Decoding outside the lock, because it can block on the codec and the
+         * UI thread wants this lock to move participants around. */
+        if (dec.decode(frame, System.nanoTime() / 1000)) return
+
+        /* A decoder that refuses a frame is not coming back on its own -
+         * usually its surface went away underneath it. Drop it and let the
+         * next frame build one on whatever surface is live by then. The cost
+         * is a wait for this sender's next keyframe, which is three seconds
+         * at worst now rather than a whole GOP. */
+        synchronized(videoLock) {
+            val pv = peerVideo[slot] ?: return
+            if (pv.decoder !== dec) return   // somebody already replaced it
+            Log.w(TAG, "slot $slot: decode refused, rebuilding")
+            try { pv.decoder?.stop() } catch (_: Exception) {}
+            pv.decoder = null
+            pv.surface = null
         }
     }
 
