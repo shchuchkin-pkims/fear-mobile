@@ -165,6 +165,11 @@ class VideoCallManager(
         val speaking: Boolean,
         /** The user chose them, so the speaker does not take the view back. */
         val pinned: Boolean,
+        /** Their picture's shape, so a cell can be sized to it rather than
+         *  stretching a face to fill whatever box it was given. Zero until
+         *  they have announced it. */
+        val width: Int,
+        val height: Int,
     )
 
     /**
@@ -188,6 +193,22 @@ class VideoCallManager(
 
     private val peerVideo = HashMap<Int, PeerVideo>()
     private val peerName = HashMap<Int, String>()
+    private val peerSize = HashMap<Int, Pair<Int, Int>>()
+
+    /*
+     * The big view has a decoder of its own, fed the same frames as the
+     * participant currently on it.
+     *
+     * Moving one decoder between the strip and the big view is what left a
+     * pinned participant frozen in their own cell: a decoder renders to one
+     * surface, so whichever it was not pointed at kept its last picture.
+     * Two decoders for that one participant costs a decoder and buys every
+     * cell staying live. It also removes the handover race outright, since
+     * no surface ever changes hands - each participant's decoder stays on
+     * its cell for the whole call.
+     */
+    private var mainDecoder: Vp8Decoder? = null
+    private var mainDecoderSlot: Int = -1
 
     /** Surfaces the call screen has given us. */
     private var mainSurface: Surface? = null
@@ -739,7 +760,7 @@ class VideoCallManager(
             // permanently in pieces.
             if (mainSurface === surface) return
             mainSurface = surface
-            retargetLocked()
+            dropMainDecoderLocked()
         }
         publishParticipants()
     }
@@ -770,9 +791,8 @@ class VideoCallManager(
         publishParticipants()
     }
 
-    /** Where this participant should be drawing right now. */
-    private fun surfaceForLocked(slot: Int): Surface? =
-        if (slot == mainSlot) mainSurface else thumbSurface[slot]
+    /** A participant draws in their own cell, and only there. */
+    private fun surfaceForLocked(slot: Int): Surface? = thumbSurface[slot]
 
     /**
      * Point every decoder at the surface its participant now belongs to.
@@ -850,7 +870,7 @@ class VideoCallManager(
             if (mainSlot != pinnedSlot) {
                 mainSlot = pinnedSlot
                 lastSwitchMs = now
-                retargetLocked()
+                dropMainDecoderLocked()
             }
             return
         }
@@ -862,7 +882,7 @@ class VideoCallManager(
             if (first != null) {
                 mainSlot = first
                 lastSwitchMs = now
-                retargetLocked()
+                dropMainDecoderLocked()
             }
             return
         }
@@ -897,6 +917,7 @@ class VideoCallManager(
 
         mainSlot = loudest
         lastSwitchMs = now
+        dropMainDecoderLocked()
         Log.i(TAG, "speaker: slot $mainSlot (${peerName[mainSlot] ?: "?"})")
         retargetLocked()
     }
@@ -914,6 +935,13 @@ class VideoCallManager(
         publishParticipants()
     }
 
+    /** The big view is about to show somebody else; its decoder starts over. */
+    private fun dropMainDecoderLocked() {
+        try { mainDecoder?.stop() } catch (_: Exception) {}
+        mainDecoder = null
+        mainDecoderSlot = -1
+    }
+
     /** Tell the screen who is here, but only when something actually moved. */
     private fun publishParticipants() {
         val list = synchronized(videoLock) {
@@ -927,17 +955,22 @@ class VideoCallManager(
                 }
             }
             present.sorted().map { slot ->
+                val size = peerSize[slot]
                 Participant(
                     slot = slot,
                     name = peerName[slot] ?: "%06x".format(slot),
                     main = slot == mainSlot,
                     speaking = speaking.contains(slot),
                     pinned = slot == pinnedSlot,
+                    width = size?.first ?: 0,
+                    height = size?.second ?: 0,
                 )
             }
         }
 
-        val key = list.joinToString("|") { "${it.slot}:${it.name}:${it.main}:${it.speaking}:${it.pinned}" }
+        val key = list.joinToString("|") {
+            "${it.slot}:${it.name}:${it.main}:${it.speaking}:${it.pinned}:${it.width}x${it.height}"
+        }
         if (key == lastParticipantsKey) return
         lastParticipantsKey = key
         handler.post { listener.onParticipants(list) }
@@ -1295,6 +1328,8 @@ class VideoCallManager(
                 pv.decoder = null
             }
             peerVideo.clear()
+            peerSize.clear()
+            dropMainDecoderLocked()
             thumbSurface.clear()
             mainSurface = null
             mainSlot = -1
@@ -1589,6 +1624,9 @@ class VideoCallManager(
             remoteWidth = hello.width
             remoteHeight = hello.height
             remoteFps = hello.fps
+            if (slotIdx >= 0 && hello.width > 0 && hello.height > 0) {
+                synchronized(videoLock) { peerSize[slotIdx] = hello.width to hello.height }
+            }
             Log.d(TAG, "Peer video: ${remoteWidth}x${remoteHeight}@${remoteFps}")
         }
 
@@ -1816,6 +1854,41 @@ class VideoCallManager(
                 if (pv.decoder != null) handler.post { refreshParticipants() }
             }
             dec = pv.decoder
+        }
+
+        /* The big view, if this is who is on it. Its decoder is separate
+         * because reference frames belong to one stream: pointing it at a new
+         * participant means starting over, which costs a wait for their next
+         * keyframe - at most three seconds - while their cell keeps playing. */
+        val big: Vp8Decoder?
+        synchronized(videoLock) {
+            if (slot != mainSlot) {
+                big = null
+            } else {
+                if (mainDecoderSlot != slot) {
+                    try { mainDecoder?.stop() } catch (_: Exception) {}
+                    mainDecoder = null
+                    mainDecoderSlot = slot
+                }
+                val target = mainSurface
+                if (mainDecoder == null && target != null && target.isValid) {
+                    mainDecoder = try {
+                        Vp8Decoder().also { it.start(target, quality.width, quality.height) }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "no decoder for the big view", e)
+                        null
+                    }
+                }
+                big = mainDecoder
+            }
+        }
+        if (big != null && !big.decode(frame, System.nanoTime() / 1000)) {
+            synchronized(videoLock) {
+                if (mainDecoder === big) {
+                    try { mainDecoder?.stop() } catch (_: Exception) {}
+                    mainDecoder = null
+                }
+            }
         }
 
         if (dec == null) return

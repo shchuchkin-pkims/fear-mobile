@@ -3,7 +3,9 @@ package com.fear
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -29,6 +31,8 @@ import java.util.concurrent.Executors
 class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListener {
 
     companion object {
+        /** Shortest interval between two resizes of the same surface. */
+        private const val REFIT_MIN_MS = 8000L
         private const val TAG = "VideoCallActivity"
         const val EXTRA_REMOTE_IP = "remote_ip"
         const val EXTRA_REMOTE_PORT = "remote_port"
@@ -44,13 +48,29 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         private const val PERMISSION_CODE = 200
     }
 
-    private lateinit var remoteSurfaceView: SurfaceView
+    private lateinit var remoteSurfaceView: android.view.TextureView
     private lateinit var localPreview: PreviewView
     private lateinit var endCallButton: Button
     private lateinit var toggleCameraButton: Button
     private lateinit var toggleMuteButton: Button
     private lateinit var statsTextView: TextView
     private lateinit var mainCaption: TextView
+    private lateinit var mainContainer: android.widget.FrameLayout
+
+    /** Surfaces we made from the views' textures, ours to release. */
+    private var mainSurface: Surface? = null
+    private val thumbSurfaces = HashMap<Int, Surface>()
+
+    /* What each surface is currently sized for, and when it was last resized.
+     *
+     * Resizing a SurfaceView destroys its surface and takes the decoder bound
+     * to it down with it, so this has to be rare. Senders do not make that
+     * easy: the quality controller moves them between 640x480 and 1280x720,
+     * which is a genuine change of shape, and following every one of those
+     * cost 139 decoder rebuilds in half a minute. */
+    private val pendingAspect = HashMap<Int, Pair<Int, Int>>()
+    private val appliedFit = HashMap<Int, String>()
+    private val layoutHooked = HashSet<Int>()
     private lateinit var stripScroll: android.widget.HorizontalScrollView
     private lateinit var strip: android.widget.LinearLayout
 
@@ -112,6 +132,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         toggleMuteButton = findViewById(R.id.toggleMuteButton)
         statsTextView = findViewById(R.id.statsTextView)
         mainCaption = findViewById(R.id.mainCaption)
+        mainContainer = findViewById(R.id.mainContainer)
         stripScroll = findViewById(R.id.stripScroll)
         strip = findViewById(R.id.strip)
 
@@ -226,26 +247,115 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
          * the old one is drawing nowhere from that moment. Both callbacks
          * report it, which is why a call with two peers of different shapes
          * used to lose its picture as soon as the second one announced. */
-        remoteSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                manager.setMainSurface(holder.surface)
+        remoteSurfaceView.surfaceTextureListener =
+            object : android.view.TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(
+                    st: android.graphics.SurfaceTexture, w: Int, h: Int
+                ) {
+                    Log.d(TAG, "main: texture available")
+                    mainSurface?.release()
+                    mainSurface = Surface(st)
+                    manager.setMainSurface(mainSurface)
+                }
+
+                /* A resize is only a resize here: the texture survives it,
+                 * so the decoder attached to it keeps running. */
+                override fun onSurfaceTextureSizeChanged(
+                    st: android.graphics.SurfaceTexture, w: Int, h: Int
+                ) = Unit
+
+                override fun onSurfaceTextureDestroyed(
+                    st: android.graphics.SurfaceTexture
+                ): Boolean {
+                    Log.d(TAG, "main: texture destroyed")
+                    manager.setMainSurface(null)
+                    mainSurface?.release()
+                    mainSurface = null
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) = Unit
             }
 
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                manager.setMainSurface(holder.surface)
-            }
-
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                manager.setMainSurface(null)
-            }
-        })
-
-        if (remoteSurfaceView.holder.surface.isValid) {
-            manager.setMainSurface(remoteSurfaceView.holder.surface)
+        remoteSurfaceView.surfaceTexture?.let {
+            mainSurface?.release()
+            mainSurface = Surface(it)
+            manager.setMainSurface(mainSurface)
         }
 
         // Start camera
         startCamera(preset)
+    }
+
+    /**
+     * Letterbox a participant's picture inside its box.
+     *
+     * A codec fills whatever surface it is handed, so a full-screen portrait
+     * view stretches a landscape webcam across it. Nothing in the view
+     * hierarchy does this for us: neither SurfaceView nor TextureView has a
+     * scale type.
+     *
+     * @param key identifies the view, so an unchanged shape is not re-applied
+     */
+    /**
+     * Letterbox a participant's picture inside its view.
+     *
+     * A codec fills whatever surface it is handed, so a landscape webcam in a
+     * portrait view is stretched across it unless something intervenes.
+     * Neither SurfaceView nor TextureView has a scale type, so the shape has
+     * to be imposed here.
+     *
+     * Done with a transform rather than by resizing the view. Resizing is
+     * what a SurfaceView cannot survive - the framework releases the codec
+     * bound to the surface it destroys - and a TextureView turns out to be no
+     * happier about it. The transform leaves the view's bounds and its
+     * SurfaceTexture alone, so the decoder never notices.
+     *
+     * Applied from a layout listener, because the first participant update
+     * arrives before the view has been measured and a transform computed
+     * against zero, or against an intermediate measurement, is wrong for the
+     * rest of the call.
+     */
+    private fun fitToAspect(key: Int, tv: android.view.TextureView, vw: Int, vh: Int) {
+        if (vw <= 0 || vh <= 0) return
+        pendingAspect[key] = vw to vh
+
+        if (!layoutHooked.contains(key)) {
+            layoutHooked.add(key)
+            tv.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                applyAspect(key, v as android.view.TextureView)
+            }
+        }
+        applyAspect(key, tv)
+    }
+
+    private fun applyAspect(key: Int, tv: android.view.TextureView) {
+        val size = pendingAspect[key] ?: return
+        val w = tv.width
+        val h = tv.height
+        if (w <= 0 || h <= 0) return
+
+        val aspect = size.first.toFloat() / size.second.toFloat()
+        val boxAspect = w.toFloat() / h.toFloat()
+
+        val stamp = "$w:$h:${"%.3f".format(aspect)}"
+        if (appliedFit[key] == stamp) return
+        appliedFit[key] = stamp
+
+        val sx: Float
+        val sy: Float
+        if (aspect > boxAspect) {
+            sx = 1f
+            sy = boxAspect / aspect
+        } else {
+            sx = aspect / boxAspect
+            sy = 1f
+        }
+
+        val m = android.graphics.Matrix()
+        m.setScale(sx, sy, w / 2f, h / 2f)
+        tv.setTransform(m)
+        tv.invalidate()
     }
 
     /**
@@ -260,6 +370,12 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         val manager = videoCallManager ?: return
 
         val main = participants.firstOrNull { it.main }
+
+        // The big view, shaped to whoever is on it. Posted when the container
+        // has not been measured yet, which is the case on the first update.
+        if (main != null && main.width > 0) {
+            fitToAspect(-1, remoteSurfaceView, main.width, main.height)
+        }
         val wanted = main?.let { if (it.pinned) "\uD83D\uDCCC ${it.name}" else it.name }
         if (wanted != captionText) {
             captionText = wanted
@@ -278,6 +394,10 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
             stripCells.remove(slot)?.let { strip.removeView(it) }
             cellText.remove(slot)
             cellColor.remove(slot)
+            pendingAspect.remove(slot)
+            appliedFit.remove(slot)
+            layoutHooked.remove(slot)
+            thumbSurfaces.remove(slot)?.release()
             manager.setThumbSurface(slot, null)
         }
 
@@ -299,25 +419,37 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
                     strip.addView(view)
                     view.setOnClickListener { manager.togglePin(p.slot) }
 
-                    val sv = view.findViewById<SurfaceView>(R.id.thumbSurface)
-                    /* A SurfaceView draws in its own layer behind the window,
-                     * and the window here is opaque black. One of them can
-                     * punch through; the rest are simply covered, which is
-                     * why the strip was a row of black rectangles while the
-                     * decoders behind it were happily producing frames.
-                     * Media overlay puts them above that layer. */
-                    sv.setZOrderMediaOverlay(true)
-                    sv.holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(h: SurfaceHolder) {
-                            manager.setThumbSurface(p.slot, h.surface)
+                    val sv = view.findViewById<android.view.TextureView>(R.id.thumbSurface)
+                    val slot = p.slot
+                    sv.surfaceTextureListener =
+                        object : android.view.TextureView.SurfaceTextureListener {
+                            override fun onSurfaceTextureAvailable(
+                                st: android.graphics.SurfaceTexture, w: Int, h: Int
+                            ) {
+                                Log.d(TAG, "thumb $slot: texture available")
+                                thumbSurfaces.remove(slot)?.release()
+                                val surf = Surface(st)
+                                thumbSurfaces[slot] = surf
+                                manager.setThumbSurface(slot, surf)
+                            }
+
+                            override fun onSurfaceTextureSizeChanged(
+                                st: android.graphics.SurfaceTexture, w: Int, h: Int
+                            ) = Unit
+
+                            override fun onSurfaceTextureDestroyed(
+                                st: android.graphics.SurfaceTexture
+                            ): Boolean {
+                                Log.d(TAG, "thumb $slot: texture destroyed")
+                                manager.setThumbSurface(slot, null)
+                                thumbSurfaces.remove(slot)?.release()
+                                return true
+                            }
+
+                            override fun onSurfaceTextureUpdated(
+                                st: android.graphics.SurfaceTexture
+                            ) = Unit
                         }
-                        override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
-                            manager.setThumbSurface(p.slot, h.surface)
-                        }
-                        override fun surfaceDestroyed(h: SurfaceHolder) {
-                            manager.setThumbSurface(p.slot, null)
-                        }
-                    })
                 }
 
             val text = if (p.pinned) "\uD83D\uDCCC ${p.name}" else p.name
@@ -337,6 +469,18 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
             if (cellColor[p.slot] != color) {
                 cellColor[p.slot] = color
                 cell.findViewById<View>(R.id.thumbFrame).setBackgroundColor(color)
+            }
+
+            // Same treatment for the cell: a portrait phone and a landscape
+            // webcam do not both fit a fixed box without one of them being
+            // squashed to do it.
+            if (p.width > 0) {
+                fitToAspect(
+                    p.slot,
+                    cell.findViewById(R.id.thumbSurface),
+                    p.width,
+                    p.height,
+                )
             }
 
             /* The person on the big view has no second copy of themselves

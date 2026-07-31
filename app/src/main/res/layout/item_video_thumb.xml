@@ -16,7 +16,7 @@
     android:clickable="true"
     android:focusable="true">
 
-    <SurfaceView
+    <TextureView
         android:id="@+id/thumbSurface"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />

@@ -1,35 +1,59 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    A call: one participant large, everyone in a strip along the bottom.
+
+    The big view lives in its own container above the strip rather than
+    behind it, so the caption under it has somewhere to sit and the picture
+    is not partly covered by the thumbnails.
+-->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- The participant on the big view -->
-    <SurfaceView
-        android:id="@+id/remoteSurfaceView"
+    <!-- The area the big view gets, ending where the strip begins. -->
+    <FrameLayout
+        android:id="@+id/mainContainer"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:layout_marginBottom="248dp">
 
-    <!-- Their name, under the big view -->
-    <TextView
-        android:id="@+id/mainCaption"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom|start"
-        android:layout_marginStart="16dp"
-        android:layout_marginBottom="200dp"
-        android:background="#A0000000"
-        android:paddingStart="10dp"
-        android:paddingEnd="10dp"
-        android:paddingTop="4dp"
-        android:paddingBottom="4dp"
-        android:textColor="#FFFFFF"
-        android:textSize="14sp"
-        android:visibility="gone" />
+        <!--
+            TextureView, not SurfaceView.
 
-    <!-- Everyone else, along the bottom. Tap a cell to keep that person on
-         the big view; tap again to let the speaker have it back. -->
+            A codec fills whatever surface it is given, so the picture has to
+            be letterboxed by something. Resizing a SurfaceView to do it
+            destroys its surface, and the framework releases the codec bound
+            to that surface along with it - measured at 166 decoder rebuilds
+            in half a minute. A TextureView letterboxes with a transform
+            matrix and never gives its surface up, so nothing is rebuilt. It
+            also has no z-order to arrange: several SurfaceViews in one window
+            need explicit ordering or all but one are simply covered.
+        -->
+        <TextureView
+            android:id="@+id/remoteSurfaceView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <TextView
+            android:id="@+id/mainCaption"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="8dp"
+            android:background="#A0000000"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:paddingTop="5dp"
+            android:paddingBottom="5dp"
+            android:textColor="#FFFFFF"
+            android:textSize="15sp"
+            android:visibility="gone" />
+    </FrameLayout>
+
+    <!-- Everyone, along the bottom. Tap a cell to keep that person on the
+         big view; tap again to let the speaker have it back. -->
     <HorizontalScrollView
         android:id="@+id/stripScroll"
         android:layout_width="match_parent"
