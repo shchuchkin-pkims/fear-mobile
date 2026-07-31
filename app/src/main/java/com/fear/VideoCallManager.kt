@@ -745,22 +745,42 @@ class VideoCallManager(
         val vKey = ownVideoKey ?: return
 
         val pts = System.nanoTime() / 1000
-        val encoded = encoder.encodePlanes(
-            yBuf, yRowStride,
-            uBuf, uRowStride, uPixelStride,
-            vBuf, vRowStride, vPixelStride,
-            srcWidth, srcHeight,
-            sensorRotation,
-            pts
-        ) ?: return
 
-        sendFragmentedFrame(encoded, vKey)
+        /*
+         * The running check above is a gate, not a lock. This runs on
+         * CameraX's own analyzer pool, and nothing synchronises that pool
+         * with the thread ending the call: the check passes, endCall stops
+         * the encoder, and the frame already in flight writes into a buffer
+         * that no longer exists.
+         *
+         * Uncaught on that pool it kills the process, which is what it did
+         * on every exit from a video call - and it took endCall's key wiping
+         * and its teardown report down with it, so leaving a call by pressing
+         * back left the sender table and the media keys unwiped and told the
+         * peers nothing. A frame dropped during teardown costs a frame.
+         */
+        try {
+            val encoded = encoder.encodePlanes(
+                yBuf, yRowStride,
+                uBuf, uRowStride, uPixelStride,
+                vBuf, vRowStride, vPixelStride,
+                srcWidth, srcHeight,
+                sensorRotation,
+                pts
+            ) ?: return
 
-        // Send stats every 2 seconds
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastStatsSendTime >= 2000L) {
-            lastStatsSendTime = now
-            sendStatsPacket(vKey)
+            sendFragmentedFrame(encoded, vKey)
+
+            // Send stats every 2 seconds
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastStatsSendTime >= 2000L) {
+                lastStatsSendTime = now
+                sendStatsPacket(vKey)
+            }
+        } catch (e: IllegalStateException) {
+            // Only worth a line if we are not already tearing down, where it
+            // is the expected outcome rather than a fault.
+            if (running.get()) Log.w(TAG, "video frame dropped: ${e.message}")
         }
     }
 
