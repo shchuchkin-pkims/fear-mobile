@@ -136,9 +136,49 @@ class AudioCallManager(
     private var tcpSocket: Socket? = null
     private val tcpSendLock = Any()
 
-    // Opus codec
+    // Opus codec. One encoder, because we have one voice. No single
+    // decoder: every rendered participant gets its own, in the pool below.
     private var opusEncoder: OpusCodec.Encoder? = null
-    private var opusDecoder: OpusCodec.Decoder? = null
+
+    /**
+     * One rendered participant: its decoder, its jitter buffer, and enough
+     * bookkeeping to decide who gives up a decoder when a new voice arrives.
+     */
+    private class MixSlot {
+        /** sender-table slot index, or -1 when this entry is free */
+        var slot: Int = -1
+        var decoder: OpusCodec.Decoder? = null
+        /** decoded PCM frames waiting for play-out, oldest first */
+        val ring: ArrayDeque<ShortArray> = ArrayDeque()
+        /** when we last decoded a frame from this participant */
+        var lastMs: Long = 0
+        /** the jitter buffer has reached the play-out depth */
+        var prefilled: Boolean = false
+        /** frames actually mixed, for the teardown report */
+        var frames: Long = 0
+    }
+
+    /**
+     * One decoder and one jitter buffer per rendered participant.
+     *
+     * A single decoder cannot serve several senders: Opus carries state across
+     * frames, so interleaving two streams through one decoder makes both
+     * unintelligible - and a single AudioTrack write path would have them
+     * overwrite each other rather than mix. That is why the crypto working for
+     * N participants is not the same as the call working for N: this is the
+     * other half, and it is the half that was missing here.
+     */
+    private val mix = Array(MAX_MIX) { MixSlot() }
+
+    /** Guards mix[]: the receive path fills the rings, play-out drains them. */
+    private val mixLock = Any()
+
+    /**
+     * Packets successfully decrypted from each sender-table slot. Only the
+     * teardown report uses it, and that report is what tells "installed a
+     * peer" apart from "actually heard that peer".
+     */
+    private val rxCount = LongArray(SenderTable.MAX_SLOTS)
 
     // RTT measurement (ping/pong via stats packets)
     @Volatile private var lastPeerPingTs = 0
@@ -170,11 +210,12 @@ class AudioCallManager(
         if (identityMgr != null) this.identityManager = identityMgr
 
         // Initialize Opus codec (destroy first: initialize may run twice for
-        // one manager, and the old native handles would leak)
+        // one manager, and the old native handles would leak). No decoder is
+        // built here - one is built per participant, the first time that
+        // participant is actually heard.
         try { opusEncoder?.destroy() } catch (_: Exception) {}
-        try { opusDecoder?.destroy() } catch (_: Exception) {}
         opusEncoder = OpusCodec.createEncoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AC_OPUS_BITRATE)
-        opusDecoder = OpusCodec.createDecoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
+        mixTeardown()
 
         deriveCallMaterial()
     }
@@ -215,6 +256,7 @@ class AudioCallManager(
 
         // Safe to restart at zero: the key is new because the salt is new.
         seqTx.set(0)
+        java.util.Arrays.fill(rxCount, 0L)
         legacyPeerLogged.set(false)
         seenPeers.clear()
         println("ACM_DEBUG: media keys ready, sid=${ownSid.joinToString("") { "%02x".format(it) }}")
@@ -346,10 +388,10 @@ class AudioCallManager(
                 // into release builds and land in logcat/bugreports.
                 println("ACM_DEBUG: Encryption key set (${encryptionKey.size} bytes)")
                 // Update room key if different OR if codecs not initialized
-                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
-                    println("ACM_DEBUG: Initializing with new key... (encoder=${opusEncoder != null}, decoder=${opusDecoder != null})")
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null) {
+                    println("ACM_DEBUG: Initializing with new key... (encoder=${opusEncoder != null})")
                     initialize(encryptionKey)
-                    println("ACM_DEBUG: Initialization complete (encoder=${opusEncoder != null}, decoder=${opusDecoder != null})")
+                    println("ACM_DEBUG: Initialization complete (encoder=${opusEncoder != null})")
                 } else {
                     println("ACM_DEBUG: Already initialized, skipping")
                 }
@@ -430,9 +472,11 @@ class AudioCallManager(
                 startAudioRecording()
                 println("ACM_DEBUG: Audio recording started")
 
-                // Don't start playback loop - processAudioPacket will write directly to AudioTrack
-                // startAudioPlayback()
-                println("ACM_DEBUG: Audio playback ready (direct mode)")
+                // Mandatory now. The receive path only fills per-participant
+                // jitter buffers; this loop is what mixes them into one stream
+                // and what paces the output device.
+                startAudioPlayback()
+                println("ACM_DEBUG: Audio playback (mixer) started")
 
                 // Announce ourselves. Nothing waits on an answer any more:
                 // our keys come from our own salt, so we can already encrypt.
@@ -464,7 +508,7 @@ class AudioCallManager(
                     return@launch
                 }
 
-                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null) {
                     initialize(encryptionKey)
                 }
 
@@ -508,6 +552,7 @@ class AudioCallManager(
 
                 startUdpReceiving()
                 startAudioRecording()
+                startAudioPlayback()
 
                 notifyCallStarted("Listening on :$bindPort", false)
 
@@ -680,7 +725,7 @@ class AudioCallManager(
                     return@launch
                 }
 
-                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null) {
                     initialize(encryptionKey)
                 }
 
@@ -725,6 +770,7 @@ class AudioCallManager(
 
                 startUdpReceiving()
                 startAudioRecording()
+                startAudioPlayback()
                 startHelloAnnounce()
 
                 notifyCallStarted("Relay $serverIp:$serverPort", true)
@@ -776,8 +822,7 @@ class AudioCallManager(
             // Start threads
             startUdpReceiving()
             startAudioRecording()
-            // Don't start playback loop - processAudioPacket will write directly to AudioTrack
-            // startAudioPlayback()
+            startAudioPlayback()
 
             // Both sides announce now: there is no caller/callee bit in the
             // key derivation any more, so there is none in the handshake.
@@ -875,7 +920,7 @@ class AudioCallManager(
         tcpSocket = null
 
         println("ACM_DEBUG: Cleaning up Opus codecs...")
-        // Clean up Opus encoder/decoder
+        // Clean up Opus encoder
         try {
             opusEncoder?.destroy()
             opusEncoder = null
@@ -883,12 +928,15 @@ class AudioCallManager(
             println("ACM_DEBUG: Error destroying opusEncoder: ${e.message}")
         }
 
-        try {
-            opusDecoder?.destroy()
-            opusDecoder = null
-        } catch (e: Exception) {
-            println("ACM_DEBUG: Error destroying opusDecoder: ${e.message}")
-        }
+        // One line per participant we installed: how many of their packets
+        // decrypted, and how many frames of theirs actually reached the
+        // speaker. A peer that decrypted but never mixed is exactly the defect
+        // this pool exists to remove, and it is invisible from a decrypt count
+        // alone. Printed before clearMediaKeys() drops the sender table.
+        reportMedia()
+
+        // Then release every per-participant decoder and jitter buffer.
+        mixTeardown()
 
         // Stop foreground service
         try {
@@ -1183,65 +1231,111 @@ class AudioCallManager(
         }
     }
 
+    /**
+     * Play-out: mix every rendered participant into one stream.
+     *
+     * This runs on its own coroutine rather than inside the receive loop,
+     * because with several senders the receive loop fires several times per
+     * frame period and would drive the device far faster than real time.
+     * AudioTrack in MODE_STREAM blocks until its buffer has room, so writing
+     * one frame per iteration is what paces this loop - including the silent
+     * frames, which keep the device fed while nobody is speaking. It is the
+     * same role Pa_WriteStream plays in the desktop build.
+     *
+     * A two-party call is simply N=1: one entry in the pool, one frame summed
+     * per iteration, the same bytes reaching AudioTrack as before.
+     */
     private fun startAudioPlayback() {
         println("ACM_DEBUG: startAudioPlayback called")
         playJob = CoroutineScope(Dispatchers.IO).launch {
-            val track = audioTrack
-            if (track == null) {
-                println("ACM_DEBUG: audioTrack is null in startAudioPlayback!")
-                return@launch
-            }
+            println("ACM_DEBUG: startAudioPlayback - entering mix loop")
 
-            println("ACM_DEBUG: startAudioPlayback - entering loop")
-
-            // For now, just play silence
-            // In full implementation, this would play from a decoded audio buffer
-            val silence = ByteArray(AUDIO_PCM_BYTES_PER_FRAME) { 0 }
+            // 32-bit accumulator: summing eight full-scale 16-bit frames
+            // cannot overflow it, so clipping is decided once, at the end.
+            val acc = IntArray(AUDIO_FRAME_SAMPLES)
+            val out = ByteArray(AUDIO_PCM_BYTES_PER_FRAME)
+            var frameNo = 0L
+            var idleFrames = 0L
 
             while (isRunning.get()) {
                 try {
-                    // Synchronize entire write operation to prevent track from being released
+                    java.util.Arrays.fill(acc, 0)
+                    var voices = 0
+
+                    synchronized(mixLock) {
+                        for (m in mix) {
+                            if (m.slot < 0) continue
+
+                            // Build a little depth before starting a voice, and
+                            // go back to waiting if it runs dry: playing every
+                            // frame the instant it arrives turns ordinary
+                            // network jitter into chopped audio.
+                            if (!m.prefilled) {
+                                if (m.ring.size < PLAYOUT_PREFILL_FRAMES) continue
+                                m.prefilled = true
+                            }
+                            val frame = m.ring.removeFirstOrNull()
+                            if (frame == null) {
+                                m.prefilled = false
+                                continue
+                            }
+                            for (k in 0 until AUDIO_FRAME_SAMPLES) acc[k] += frame[k]
+                            m.frames++
+                            voices++
+                        }
+                    }
+
+                    // Saturate rather than wrap. Wrapping turns two loud
+                    // speakers into a full-scale square wave, which is
+                    // unpleasant in a way that clipping is not.
+                    for (k in 0 until AUDIO_FRAME_SAMPLES) {
+                        var v = acc[k]
+                        if (v > MAX_SAMPLE) v = MAX_SAMPLE
+                        else if (v < MIN_SAMPLE) v = MIN_SAMPLE
+                        out[k * 2] = (v and 0xFF).toByte()
+                        out[k * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                    }
+
+                    // Synchronized for the whole write: this is what keeps the
+                    // track from being released underneath us.
                     val written = try {
                         synchronized(this@AudioCallManager) {
-                            val currentTrack = audioTrack
-
-                            if (currentTrack == null) {
-                                println("ACM_DEBUG: audioTrack became null, stopping playback")
-                                return@synchronized -2  // Signal to break
+                            val track = audioTrack
+                            when {
+                                track == null -> NO_TRACK
+                                track.state != AudioTrack.STATE_INITIALIZED -> NO_TRACK
+                                track.playState != AudioTrack.PLAYSTATE_PLAYING -> NO_TRACK
+                                else -> track.write(out, 0, out.size)
                             }
-
-                            // Check state before write
-                            if (currentTrack.state != AudioTrack.STATE_INITIALIZED) {
-                                println("ACM_DEBUG: audioTrack not initialized, stopping playback")
-                                return@synchronized -2  // Signal to break
-                            }
-
-                            if (currentTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                                println("ACM_DEBUG: audioTrack not playing, stopping playback")
-                                return@synchronized -2  // Signal to break
-                            }
-
-                            // Write while still holding the lock
-                            currentTrack.write(silence, 0, silence.size)
                         }
                     } catch (e: IllegalStateException) {
                         println("ACM_DEBUG: IllegalStateException during write: ${e.message}")
-                        -1
+                        NO_TRACK
                     } catch (e: NullPointerException) {
                         println("ACM_DEBUG: NullPointerException during write: ${e.message}")
-                        -1
+                        NO_TRACK
                     }
 
-                    if (written == -2 || written < 0) {
-                        if (written == -2) {
-                            // Track is gone or invalid, stop playback
-                            break
+                    if (written == NO_TRACK) {
+                        // No usable output device. The frames above were still
+                        // popped, so the jitter buffers cannot grow without
+                        // bound; pace by hand since nothing else does.
+                        idleFrames++
+                        if (idleFrames % 250L == 1L) {
+                            println("ACM_DEBUG: playout has no usable AudioTrack (frame $frameNo)")
                         }
+                        delay(AUDIO_FRAME_MS.toLong())
+                        continue
+                    }
+                    if (written < 0) {
                         println("ACM_DEBUG: track.write returned error: $written")
                         break
                     }
 
-                    delay(AUDIO_FRAME_MS.toLong())
+                    frameNo++
+                    if (voices > 0 && frameNo % 250L == 0L) {
+                        println("ACM_DEBUG: playout frame $frameNo, $voices voice(s) mixed")
+                    }
                 } catch (e: Exception) {
                     println("ACM_DEBUG: Playback exception: ${e.message}")
                     e.printStackTrace()
@@ -1251,7 +1345,7 @@ class AudioCallManager(
                     }
                 }
             }
-            println("ACM_DEBUG: startAudioPlayback - exiting loop")
+            println("ACM_DEBUG: startAudioPlayback - exiting mix loop")
         }
     }
 
@@ -1384,11 +1478,14 @@ class AudioCallManager(
                     println("ACM_DEBUG: dropped packet from slot $idx, counter=$counter ($verdict)")
                     return
                 }
+                if (idx >= 0 && idx < rxCount.size) rxCount[idx]++
 
                 // The type byte is covered by the tag, so routing on it cannot
                 // be steered by flipping a cleartext byte in flight.
                 when (parsed.type) {
-                    PKT_VER_AUDIO.toInt() -> playAudioPayload(plain, counter)
+                    // Which sender this is decides which decoder it reaches:
+                    // idx is the sender-table slot the key came from.
+                    PKT_VER_AUDIO.toInt() -> decodeForMix(idx, plain)
                     PKT_VER_STATS.toInt() -> handleStatsPayload(plain)
                     else -> {}
                 }
@@ -1402,57 +1499,148 @@ class AudioCallManager(
         }
     }
 
-    /** Decode and play one authenticated audio payload. */
-    private fun playAudioPayload(encodedData: ByteArray, counter: Long) {
-        val decoder = opusDecoder ?: return
-        if (!isRunning.get()) return
-
-        val pcmSamples = try {
-            decoder.decode(encodedData, AUDIO_FRAME_SAMPLES)
-        } catch (e: Exception) {
-            // Opus decode failed - corrupted data or wrong format
-            println("ACM_DEBUG: Opus decode failed: ${e.message}")
-            return
+    /**
+     * The decoder and jitter buffer for one sender, creating or reassigning an
+     * entry if this is a voice we are not currently rendering.
+     *
+     * Reassignment builds a fresh decoder instead of reusing the old one: Opus
+     * state left by the previous speaker would be decoded as noise at the head
+     * of the new stream. OpusCodec.Decoder.reset() is an empty method over the
+     * native decoder, so replacing the object is the only reset reachable from
+     * here, and it is the equivalent of OPUS_RESET_STATE on the desktop.
+     *
+     * Caller must hold mixLock.
+     *
+     * @return null only if a decoder cannot be created at all
+     */
+    private fun mixAcquire(tableSlot: Int): MixSlot? {
+        for (m in mix) {
+            if (m.slot == tableSlot) return m
         }
 
-        if (pcmSamples.isEmpty()) {
-            println("ACM_DEBUG: Opus decoder returned empty array")
-            return
-        }
-
-        if (!isRunning.get()) return
-
-        // Convert shorts to bytes for AudioTrack
-        val audioData = try {
-            ByteArray(pcmSamples.size * 2).also { data ->
-                for (i in pcmSamples.indices) {
-                    val sample = pcmSamples[i].toInt()
-                    data[i * 2] = (sample and 0xFF).toByte()
-                    data[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
-                }
+        val chosen: MixSlot = mix.firstOrNull { it.slot < 0 } ?: run {
+            // Everything is busy: the voice heard longest ago steps aside. Its
+            // key and replay window stay in the sender table, so it comes back
+            // the moment it speaks again.
+            var lru = mix[0]
+            for (m in mix) {
+                if (m.lastMs < lru.lastMs) lru = m
             }
-        } catch (e: Exception) {
-            return
+            println("ACM_DEBUG: mix pool full, table slot ${lru.slot} yields its decoder to $tableSlot")
+            lru
         }
 
-        // Play audio - use synchronized access for entire write operation
-        // This prevents the track from being released while we're writing to it
-        try {
-            synchronized(this@AudioCallManager) {
-                val track = audioTrack
-                if (track != null &&
-                    track.state == AudioTrack.STATE_INITIALIZED &&
-                    track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    val written = track.write(audioData, 0, audioData.size)
-                    if (counter % 50 == 0L) {
-                        println("ACM_DEBUG: Wrote $written bytes to AudioTrack (requested ${audioData.size})")
+        // Whatever is queued belongs to the participant being displaced.
+        chosen.ring.clear()
+        chosen.decoder?.let {
+            try { it.destroy() } catch (_: Exception) {}
+        }
+        chosen.decoder = null
+
+        val dec = try {
+            OpusCodec.createDecoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
+        } catch (e: Exception) {
+            println("ACM_DEBUG: no decoder for table slot $tableSlot: ${e.message}")
+            null
+        }
+        if (dec == null) {
+            chosen.slot = -1
+            return null
+        }
+
+        chosen.decoder = dec
+        chosen.slot = tableSlot
+        chosen.prefilled = false
+        chosen.frames = 0
+        // Stamped now, so a voice that has just arrived is not the victim of
+        // the very next arrival before it has been heard at all.
+        chosen.lastMs = SystemClock.elapsedRealtime()
+        println("ACM_DEBUG: rendering table slot $tableSlot (${mix.count { it.slot >= 0 }}/$MAX_MIX voices)")
+        return chosen
+    }
+
+    /**
+     * Decode one authenticated audio payload into its own sender's jitter
+     * buffer.
+     *
+     * Nothing is written to AudioTrack here. With several senders this runs
+     * several times per frame period, so writing from here would push the
+     * device far faster than real time and let participants overwrite one
+     * another - which is the bug this pool replaces, not the fix.
+     */
+    private fun decodeForMix(tableSlot: Int, encodedData: ByteArray) {
+        if (!isRunning.get()) return
+
+        synchronized(mixLock) {
+            // Re-read under the lock. isRunning is cleared before mixTeardown
+            // takes this lock, so a false here means teardown has not started
+            // yet and will still collect whatever mixAcquire builds below;
+            // without the re-read a packet in flight can create a decoder
+            // after teardown and leak it for the life of the process.
+            if (!isRunning.get()) return
+            val m = mixAcquire(tableSlot) ?: return
+            val decoder = m.decoder ?: return
+
+            val pcm = try {
+                decoder.decode(encodedData, AUDIO_FRAME_SAMPLES)
+            } catch (e: Exception) {
+                println("ACM_DEBUG: Opus decode failed for table slot $tableSlot: ${e.message}")
+                return
+            }
+            if (pcm.size < AUDIO_FRAME_SAMPLES) return
+
+            m.ring.addLast(pcm)
+            m.lastMs = SystemClock.elapsedRealtime()
+
+            // Per-sender latency control: one peer arriving in bursts must not
+            // add delay for the others, and must not grow without bound.
+            while (m.ring.size > MAX_PLAYOUT_FRAMES) m.ring.removeFirst()
+        }
+    }
+
+    /** Release every per-participant decoder and jitter buffer. */
+    private fun mixTeardown() {
+        synchronized(mixLock) {
+            for (m in mix) {
+                m.decoder?.let {
+                    try {
+                        it.destroy()
+                    } catch (e: Exception) {
+                        println("ACM_DEBUG: Error destroying decoder: ${e.message}")
                     }
-                } else {
-                    println("ACM_DEBUG: AudioTrack not ready - state=${track?.state}, playState=${track?.playState}")
                 }
+                m.decoder = null
+                m.ring.clear()
+                m.slot = -1
+                m.prefilled = false
+                m.lastMs = 0
+                m.frames = 0
             }
-        } catch (e: Exception) {
-            println("ACM_DEBUG: AudioTrack write Exception: ${e.message}")
+        }
+    }
+
+    /**
+     * Per-participant teardown report: decrypted vs actually mixed. Must run
+     * before mixTeardown() (which zeroes the frame counts) and before
+     * clearMediaKeys() (which drops the sender table).
+     */
+    private fun reportMedia() {
+        // The two locks are taken one after the other, never nested: no other
+        // path here takes mixLock and tableLock at the same time, and this one
+        // must not be the first to create an order between them.
+        val mixedBySlot = HashMap<Int, Long>()
+        synchronized(mixLock) {
+            for (m in mix) {
+                if (m.slot >= 0) mixedBySlot[m.slot] = m.frames
+            }
+        }
+        synchronized(tableLock) {
+            val table = senderTable ?: return
+            for (i in 0 until SenderTable.MAX_SLOTS) {
+                val slot = table.slotAt(i) ?: continue
+                val sid = slot.sid.joinToString("") { "%02x".format(it) }
+                println("ACM_DEBUG: [MEDIA] peer $sid decrypted ${rxCount[i]} mixed ${mixedBySlot[i] ?: 0L}")
+            }
         }
     }
 
@@ -1709,6 +1897,34 @@ class AudioCallManager(
     private companion object {
         /** Nothing produces a nonzero key version yet. */
         const val KEY_VERSION = 0
+
+        /**
+         * How many participants are rendered at once.
+         *
+         * The sender table holds 32 senders because the transport does, but
+         * decoding and mixing 32 streams is not something a phone will do, and
+         * a room where eight people talk at once is already unusable for human
+         * reasons. Senders past this limit stay authenticated and stay tracked
+         * - they are simply not rendered, and the participant heard longest ago
+         * gives up its decoder when somebody new speaks.
+         */
+        const val MAX_MIX = 8
+
+        /** Frames a participant must have queued before it starts playing. */
+        const val PLAYOUT_PREFILL_FRAMES = 6
+
+        /** Per-participant jitter-buffer cap, in 20 ms frames. */
+        const val MAX_PLAYOUT_FRAMES = 20
+
+        /** Mixing clips here rather than wrapping. */
+        const val MAX_SAMPLE = 32767      // Short.MAX_VALUE
+        const val MIN_SAMPLE = -32768     // Short.MIN_VALUE
+
+        /**
+         * track.write() stand-in for "no usable AudioTrack this iteration".
+         * Distinct from every AudioTrack.ERROR_* code, which are -1 to -6.
+         */
+        const val NO_TRACK = -1000
 
         const val CALL_ID_REQUIRED =
             "Cannot start the call: no call id. Pass the 16-byte call_id from " +
