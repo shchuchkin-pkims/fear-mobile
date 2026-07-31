@@ -3,13 +3,16 @@ package com.fear.crypto
 import org.bouncycastle.crypto.digests.Blake2bDigest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Mirrors tests/test_media_keys.c: same frozen vectors, hashed with
- * BouncyCastle so the check stays independent of libsodium and runs on a
- * plain JVM.
+ * Mirrors tests/test_media_keys.c: the same frozen fear.media.v2 vectors,
+ * hashed with BouncyCastle so the check stays independent of libsodium and
+ * runs on a plain JVM. If these ever disagree with the C side, Android and
+ * desktop calls stop interoperating.
  */
 class MediaKeysTest {
 
@@ -22,165 +25,123 @@ class MediaKeysTest {
     }
 
     private fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
+    private fun bin(h: String) = ByteArray(h.length / 2) {
+        h.substring(it * 2, it * 2 + 2).toInt(16).toByte()
+    }
 
-    private val master = ByteArray(32) { it.toByte() }
-    private val saltA = ByteArray(16) { (0x10 + it).toByte() }
-    private val saltB = ByteArray(16) { (0xF0 xor it).toByte() }
-    private val halfC = ByteArray(16).also { it[15] = 0x01 }
+    private val kCall = ByteArray(32) { it.toByte() }
+    private val callId = ByteArray(16) { (0x10 + it).toByte() }
+    private val callId2 = ByteArray(16) { (0xE0 + it).toByte() }
+    private val saltA = ByteArray(16) { (0xA0 + it).toByte() }
+    private val saltB = ByteArray(16) { (0x5A + it).toByte() }
+    private val pk = bin("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737")
+    private val zeros = MediaKeys.UNSIGNED_IDBIND
 
     @Test
-    fun frozenVectors() {
-        assertEquals(
-            "2115ba791b04de1beea3d49fecf95748fcf788c1ea5b4901dd534b50279a14d8",
-            hex(MediaKeys.derive(master, MediaKeys.STREAM_AUDIO,
-                                 MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc)))
-        assertEquals(
-            "5dfb5ec2fe608102adb45ddb87635827891ea7b8b4b326b58ef7a27c1a12638b",
-            hex(MediaKeys.derive(master, MediaKeys.STREAM_AUDIO,
-                                 MediaKeys.DIR_CALLEE_TO_CALLER, saltA, bc)))
-        assertEquals(
-            "c653aba9d730f2f041d465c34fb906f36bdbb73fc4e6516dc66ccbb020645009",
-            hex(MediaKeys.derive(master, MediaKeys.STREAM_VIDEO,
-                                 MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc)))
-        assertEquals(
-            "0b45aa24615c1af180958bf59e949e516253a119d64baa9fd5d01f553aabb85b",
-            hex(MediaKeys.derive(master, MediaKeys.STREAM_VIDEO,
-                                 MediaKeys.DIR_CALLEE_TO_CALLER, saltA, bc)))
-        assertEquals(
-            "64050af487f07cc001e50c3bd1af8301e64084ef41a01d8a7047ca5de4522852",
-            hex(MediaKeys.derive(master, MediaKeys.STREAM_AUDIO,
-                                 MediaKeys.DIR_CALLER_TO_CALLEE, saltB, bc)))
+    fun helloKeyVectors() {
+        assertEquals("e17ec5d029ed2987c577869ec52547ba6b2504b9ea8759c51a6d94645b967924",
+            hex(MediaKeys.helloKey(kCall, callId, bc)))
+        assertEquals("32593dd97694c649d21f9642d2a188d3918b286a374a09c725e3335cabc2a0a7",
+            hex(MediaKeys.helloKey(kCall, callId2, bc)))
     }
 
     @Test
-    fun infoFraming() {
-        val info = MediaKeys.info(MediaKeys.STREAM_VIDEO, MediaKeys.DIR_CALLEE_TO_CALLER, saltA)
-        assertArrayEquals("fear.media.v1".toByteArray(Charsets.US_ASCII), info.copyOfRange(0, 13))
-        assertEquals(1, info[13].toInt())
-        assertEquals(1, info[14].toInt())
-        assertArrayEquals(saltA, info.copyOfRange(15, 31))
+    fun senderKeyVectors() {
+        // unsigned audio
+        assertEquals("0bc7ef4f1ac0a8c46391f4f153ef956893475f84be6a061d88a08139a8554de0",
+            hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltA, zeros, bc)))
+        // unsigned video: same inputs, other counter domain
+        assertEquals("0d9837fae769f064978fd34c440199c876b0018444f78f5112ab5fda691a7460",
+            hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_VIDEO, 0, callId, saltA, zeros, bc)))
+        // signed audio: identity bound in
+        assertEquals("8a9243ecb9c62c27ba149995fe00efdb28d0e2ca5aad325ea88b86d5c3e6771e",
+            hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltA, pk, bc)))
+        // key_version is bound, big endian
+        assertEquals("77c76b092b98a4fed163eda6aefbe9fd591ae8a96e703c64a3419339eef3edcf",
+            hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 7, callId, saltA, pk, bc)))
+        // another sender in the same call
+        assertEquals("42175bf01239d346f9ded7e88611f973ccdba9bf4e7856421fd65ebae9ba5128",
+            hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltB, pk, bc)))
+        // same sender, different call: a recording cannot replay across calls
+        assertEquals("cd451578c0089eb3e1d63bcb2714723ae9bbf5a65a7e5941180b18ea61077401",
+            hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId2, saltA, pk, bc)))
     }
 
     @Test
-    fun allFourKeysOfACallDiffer() {
-        val keys = listOf(
-            MediaKeys.derive(master, MediaKeys.STREAM_AUDIO, MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc),
-            MediaKeys.derive(master, MediaKeys.STREAM_AUDIO, MediaKeys.DIR_CALLEE_TO_CALLER, saltA, bc),
-            MediaKeys.derive(master, MediaKeys.STREAM_VIDEO, MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc),
-            MediaKeys.derive(master, MediaKeys.STREAM_VIDEO, MediaKeys.DIR_CALLEE_TO_CALLER, saltA, bc),
-        ).map { hex(it) }
-        assertEquals(4, keys.toSet().size)
-        assertEquals(false, keys.contains(hex(master)))
+    fun senderIdVectors() {
+        assertEquals("0f2cee", hex(MediaKeys.senderId(kCall, callId, saltA, zeros, bc)))
+        assertEquals("5338c1", hex(MediaKeys.senderId(kCall, callId, saltA, pk, bc)))
+        assertEquals("19bbc4", hex(MediaKeys.senderId(kCall, callId, saltB, pk, bc)))
+        assertEquals("26dd22", hex(MediaKeys.senderId(kCall, callId2, saltA, pk, bc)))
     }
 
     @Test
-    fun saltAndMasterAreBound() {
-        val a = hex(MediaKeys.derive(master, MediaKeys.STREAM_AUDIO,
-                                     MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc))
-        val bSalt = hex(MediaKeys.derive(master, MediaKeys.STREAM_AUDIO,
-                                         MediaKeys.DIR_CALLER_TO_CALLEE, saltB, bc))
-        assertNotEquals(a, bSalt)
-
-        val otherMaster = master.copyOf().also { it[31] = (it[31].toInt() xor 1).toByte() }
-        val bMaster = hex(MediaKeys.derive(otherMaster, MediaKeys.STREAM_AUDIO,
-                                           MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc))
-        assertNotEquals(a, bMaster)
+    fun everyInputIsBound() {
+        val base = hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltA, pk, bc))
+        assertNotEquals(base, hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_VIDEO, 0, callId, saltA, pk, bc)))
+        assertNotEquals(base, hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 1, callId, saltA, pk, bc)))
+        assertNotEquals(base, hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId2, saltA, pk, bc)))
+        assertNotEquals(base, hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltB, pk, bc)))
+        assertNotEquals(base, hex(MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltA, zeros, bc)))
     }
 
+    /** Three participants in one call all end up with distinct keys. */
     @Test
-    fun theTwoEndsAgree() {
-        val (callerSend, callerRecv) = MediaKeys.derivePair(
-            master, MediaKeys.STREAM_AUDIO, isCaller = true, salt = saltA, hash = bc)
-        val (calleeSend, calleeRecv) = MediaKeys.derivePair(
-            master, MediaKeys.STREAM_AUDIO, isCaller = false, salt = saltA, hash = bc)
-
-        assertArrayEquals(callerSend, calleeRecv)
-        assertArrayEquals(calleeSend, callerRecv)
-        assertNotEquals(hex(callerSend), hex(callerRecv))
-        assertNotEquals(hex(calleeSend), hex(calleeRecv))
-    }
-
-    /**
-     * Same salt-agreement vectors the C test pins, computed independently
-     * with Python hashlib.blake2b(key=master, digest_size=16).
-     */
-    @Test
-    fun saltAgreementVectors() {
-        assertEquals("72f75f37beebffb6d9da8920b9045063",
-            hex(MediaKeys.saltCombine(master, saltA, saltB, bc)))
-        assertEquals("ef6cdd21ef8fb871e10d248a13f3be87",
-            hex(MediaKeys.saltCombine(ByteArray(32), saltA, saltB, bc)))
-        assertEquals("6c6d840e804427679a352df05065fd2b",
-            hex(MediaKeys.saltCombine(master, saltA, halfC, bc)))
-    }
-
-    @Test
-    fun saltAgreementIsCommutative() {
-        assertArrayEquals(
-            MediaKeys.saltCombine(master, saltA, saltB, bc),
-            MediaKeys.saltCombine(master, saltB, saltA, bc))
-    }
-
-    @Test
-    fun saltBindsBothHalvesAndMaster() {
-        val ab = hex(MediaKeys.saltCombine(master, saltA, saltB, bc))
-        assertNotEquals(ab, hex(MediaKeys.saltCombine(master, saltA, halfC, bc)))
-        val otherMaster = master.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }
-        assertNotEquals(ab, hex(MediaKeys.saltCombine(otherMaster, saltA, saltB, bc)))
-    }
-
-    @Test
-    fun rolesAreOppositeAndReflectionIsRefused() {
-        val aIsCaller = MediaKeys.roleFromHalves(saltA, saltB)
-        val bIsCaller = MediaKeys.roleFromHalves(saltB, saltA)
-        assertEquals(true, aIsCaller)
-        assertEquals(false, bIsCaller)
-        // Our own half echoed back: refuse rather than pick a side.
-        assertEquals(null, MediaKeys.roleFromHalves(saltA, saltA))
-    }
-
-    /** Two peers, each knowing only its own half and the received one. */
-    @Test
-    fun endToEndBothPeersAgree() {
-        val aSalt = MediaKeys.saltCombine(master, saltA, saltB, bc)
-        val bSalt = MediaKeys.saltCombine(master, saltB, saltA, bc)
-        assertArrayEquals(aSalt, bSalt)
-
-        val aRole = MediaKeys.roleFromHalves(saltA, saltB)!!
-        val bRole = MediaKeys.roleFromHalves(saltB, saltA)!!
-        assertNotEquals(aRole, bRole)
-
-        for (stream in listOf(MediaKeys.STREAM_AUDIO, MediaKeys.STREAM_VIDEO)) {
-            val (aTx, aRx) = MediaKeys.derivePair(master, stream, aRole, aSalt, bc)
-            val (bTx, bRx) = MediaKeys.derivePair(master, stream, bRole, bSalt, bc)
-            assertArrayEquals(aTx, bRx)
-            assertArrayEquals(bTx, aRx)
-            assertNotEquals(hex(aTx), hex(aRx))
+    fun groupOfThreeHasNoKeyCollisions() {
+        val saltC = ByteArray(16) { (0x33 + it).toByte() }
+        val keys = listOf(saltA, saltB, saltC).flatMap { salt ->
+            listOf(MediaKeys.STREAM_AUDIO, MediaKeys.STREAM_VIDEO).map { s ->
+                hex(MediaKeys.deriveSender(kCall, s, 0, callId, salt, zeros, bc))
+            }
         }
+        assertEquals(6, keys.toSet().size)
+
+        // And each participant derives every peer's key from public data alone.
+        val bAsSeenByA = MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltB, zeros, bc)
+        val bOwnKey = MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, callId, saltB, zeros, bc)
+        assertArrayEquals(bOwnKey, bAsSeenByA)
     }
 
-    /** The Kotlin comparison must match memcmp, including the 0x80 boundary. */
     @Test
-    fun halfComparisonIsUnsigned() {
-        val low = ByteArray(16).also { it[0] = 0x7F }
-        val high = ByteArray(16).also { it[0] = 0x80.toByte() }
-        assertEquals(true, MediaKeys.roleFromHalves(low, high))
-        assertEquals(false, MediaKeys.roleFromHalves(high, low))
+    fun helloMacRoundtripAndRejection() {
+        val hk = MediaKeys.helloKey(kCall, callId, bc)
+        val body = ByteArray(40) { it.toByte() }
+
+        val mac = MediaKeys.helloMac(hk, body, bc)
+        assertEquals("a0254883e218b3ab5b22aa7a6c11dbd2", hex(mac))
+        assertTrue(MediaKeys.helloMacVerify(hk, body, mac, bc))
+
+        val tampered = body.copyOf().also { it[13] = (it[13].toInt() xor 1).toByte() }
+        assertFalse(MediaKeys.helloMacVerify(hk, tampered, mac, bc))
+
+        val badMac = mac.copyOf().also { it[15] = (it[15].toInt() xor 1).toByte() }
+        assertFalse(MediaKeys.helloMacVerify(hk, body, badMac, bc))
+
+        // A HELLO from another call must not verify: this is what keeps an
+        // off-path attacker out of the handshake entirely.
+        val otherHk = MediaKeys.helloKey(kCall, callId2, bc)
+        assertFalse(MediaKeys.helloMacVerify(otherHk, body, mac, bc))
+
+        assertFalse(MediaKeys.helloMacVerify(hk, body, ByteArray(8), bc))
     }
 
     @Test(expected = IllegalArgumentException::class)
-    fun rejectsWrongHalfSize() {
-        MediaKeys.saltCombine(master, saltA, ByteArray(8), bc)
+    fun refusesAllZeroCallId() {
+        MediaKeys.deriveSender(kCall, MediaKeys.STREAM_AUDIO, 0, ByteArray(16), saltA, pk, bc)
     }
 
     @Test(expected = IllegalArgumentException::class)
-    fun rejectsWrongSaltSize() {
-        MediaKeys.derive(master, MediaKeys.STREAM_AUDIO,
-                         MediaKeys.DIR_CALLER_TO_CALLEE, ByteArray(8), bc)
+    fun refusesShortCallId() {
+        MediaKeys.helloKey(kCall, ByteArray(8) { 1 }, bc)
     }
 
     @Test(expected = IllegalArgumentException::class)
-    fun rejectsUnknownStream() {
-        MediaKeys.derive(master, 7, MediaKeys.DIR_CALLER_TO_CALLEE, saltA, bc)
+    fun refusesUnknownStream() {
+        MediaKeys.deriveSender(kCall, 7, 0, callId, saltA, pk, bc)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun refusesWrongIdbindSize() {
+        MediaKeys.senderId(kCall, callId, saltA, ByteArray(16), bc)
     }
 }

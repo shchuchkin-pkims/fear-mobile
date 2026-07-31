@@ -1,142 +1,162 @@
 package com.fear.crypto
 
 /**
- * Per-direction media keys - Kotlin port of identity/media_keys.c
- * (audit items M3 / M5).
+ * Sender-rooted media keys for group calls - Kotlin port of
+ * identity/media_keys.c (audit M3 / M5).
  *
- *     K_media = BLAKE2b(key  = K_call,
- *                       data = "fear.media.v1" || stream(1) || direction(1) || salt(16),
- *                       out  = 32)
+ *     K_send(P, stream) = BLAKE2b(key  = K_call,
+ *                                 data = "fear.media.v2" || stream
+ *                                        || keyVersion || callId
+ *                                        || senderSalt || idbind,
+ *                                 out  = 32)
  *
- * Today both directions of a call share one key and are told apart only by
- * a random 4-byte nonce prefix, while both peers start their sequence
- * counter at 0 - a prefix collision then reuses a key/nonce pair under GCM
- * (M3). The key is also derived deterministically from the room key, so
- * collisions pile up across sessions rather than being confined to one call
- * (M5). A key per direction plus a fresh 16-byte session salt removes both.
+ * Every participant encrypts under a key nobody else uses, derived from its
+ * own public announcement. A receiver derives any peer's key from K_call plus
+ * what that peer announced, so there is no agreement step, no role, and a
+ * participant joining or leaving changes nobody else's keys. The previous
+ * scheme keyed on a caller/callee bit, which with three participants meant
+ * the last HELLO won and every receive key but one was wrong.
  *
- * The vectors in MediaKeysTest are the ones frozen on the C side.
+ * All multi-byte integers are big-endian, like the rest of the media wire.
+ * KeySchedule is little-endian and is deliberately not reused here.
+ *
+ * The vectors in MediaKeysTest are the ones frozen on the C side; if the two
+ * ever disagree, Android and desktop stop interoperating.
  */
 object MediaKeys {
 
     const val KEY_BYTES = 32
     const val SALT_BYTES = 16
-    const val CTX = "fear.media.v1"
-    const val SALT_CTX = "fear.media.salt.v1"
+    const val CALLID_BYTES = 16
+    const val SID_BYTES = 3
+    const val MAC_BYTES = 16
+    const val IDBIND_BYTES = 32
 
+    /** Largest forward jump a replay window may accept in one step. */
+    const val MAX_CTR_JUMP = 16384
+
+    const val CTX_V2 = "fear.media.v2"
+    const val SID_CTX = "fear.media.sid.v2"
+    const val HELLO_CTX = "fear.media.hello.v2"
+
+    /** Counter domain, not media type: audio and stats share one counter. */
     const val STREAM_AUDIO = 0
     const val STREAM_VIDEO = 1
 
-    const val DIR_CALLER_TO_CALLEE = 0
-    const val DIR_CALLEE_TO_CALLER = 1
+    /** Unsigned calls bind 32 zero bytes where the Ed25519 public key would go. */
+    val UNSIGNED_IDBIND = ByteArray(IDBIND_BYTES)
 
-    /**
-     * Fold the two HELLO halves into the session salt:
-     *
-     *     salt = BLAKE2b(key  = master,
-     *                    data = "fear.media.salt.v1" || lo || hi,
-     *                    out  = 16)
-     *
-     * lo/hi are the halves in byte order, which makes the fold commutative:
-     * both ends reach the same salt without agreeing who spoke first. Each
-     * peer contributes one half, so neither can dictate the salt on its own
-     * and a replayed HELLO cannot push the other side back onto a salt it
-     * has already used.
-     */
-    fun saltCombine(
-        master: ByteArray,
-        halfA: ByteArray,
-        halfB: ByteArray,
+    private fun requireCallId(callId: ByteArray) {
+        require(callId.size == CALLID_BYTES) { "callId must be $CALLID_BYTES bytes" }
+        // All-zero means nobody plumbed it through; refusing keeps the
+        // cross-call replay barrier from being silently disabled.
+        require(callId.any { it != 0.toByte() }) { "callId must not be all zero" }
+    }
+
+    /** HELLO authentication key for a call. */
+    fun helloKey(
+        kCall: ByteArray,
+        callId: ByteArray,
         hash: KeyedHash = SodiumKeyedHash,
     ): ByteArray {
-        require(master.size == KEY_BYTES) { "master must be $KEY_BYTES bytes" }
-        require(halfA.size == SALT_BYTES && halfB.size == SALT_BYTES) {
-            "halves must be $SALT_BYTES bytes"
-        }
-        val cmp = compareHalves(halfA, halfB)
-        val lo = if (cmp <= 0) halfA else halfB
-        val hi = if (cmp <= 0) halfB else halfA
-
-        val ctx = SALT_CTX.toByteArray(Charsets.US_ASCII)
-        val data = ByteArray(ctx.size + 2 * SALT_BYTES)
+        require(kCall.size == KEY_BYTES) { "K_call must be $KEY_BYTES bytes" }
+        requireCallId(callId)
+        val ctx = HELLO_CTX.toByteArray(Charsets.US_ASCII)
+        val data = ByteArray(ctx.size + CALLID_BYTES)
         ctx.copyInto(data, 0)
-        lo.copyInto(data, ctx.size)
-        hi.copyInto(data, ctx.size + SALT_BYTES)
-        return hash.blake2b(data, master, SALT_BYTES)
+        callId.copyInto(data, ctx.size)
+        return hash.blake2b(data, kCall, KEY_BYTES)
     }
 
     /**
-     * Decide the direction bit from the halves: the peer with the smaller
-     * half is the caller, so the two ends cannot disagree.
+     * One sender's media key for one counter domain. Used with our own salt
+     * and identity for the send key, and with a peer's announced values for
+     * the key we decrypt that peer with.
      *
-     * Returns null when the halves are equal - that is a reflected HELLO
-     * far more often than a 1-in-2^128 coincidence, and either answer would
-     * put both ends on the same key with both counters at 0. The caller
-     * must abandon the call rather than pick.
+     * @param idbind the sender's Ed25519 public key, or [UNSIGNED_IDBIND]
      */
-    fun roleFromHalves(localHalf: ByteArray, peerHalf: ByteArray): Boolean? {
-        require(localHalf.size == SALT_BYTES && peerHalf.size == SALT_BYTES) {
-            "halves must be $SALT_BYTES bytes"
-        }
-        val cmp = compareHalves(localHalf, peerHalf)
-        if (cmp == 0) return null
-        return cmp < 0
-    }
-
-    /** Unsigned byte-order comparison, matching memcmp on the C side. */
-    private fun compareHalves(a: ByteArray, b: ByteArray): Int {
-        for (i in 0 until SALT_BYTES) {
-            val d = (a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF)
-            if (d != 0) return d
-        }
-        return 0
-    }
-
-    /** The exact bytes hashed under the call master key. */
-    fun info(stream: Int, direction: Int, salt: ByteArray): ByteArray {
-        require(stream == STREAM_AUDIO || stream == STREAM_VIDEO) { "bad stream: $stream" }
-        require(direction == DIR_CALLER_TO_CALLEE || direction == DIR_CALLEE_TO_CALLER) {
-            "bad direction: $direction"
-        }
-        require(salt.size == SALT_BYTES) { "salt must be $SALT_BYTES bytes" }
-        val ctx = CTX.toByteArray(Charsets.US_ASCII)
-        val out = ByteArray(ctx.size + 2 + SALT_BYTES)
-        ctx.copyInto(out, 0)
-        out[ctx.size] = stream.toByte()
-        out[ctx.size + 1] = direction.toByte()
-        salt.copyInto(out, ctx.size + 2)
-        return out
-    }
-
-    /** Derive one directional media key. */
-    fun derive(
-        master: ByteArray,
+    fun deriveSender(
+        kCall: ByteArray,
         stream: Int,
-        direction: Int,
-        salt: ByteArray,
+        keyVersion: Int,
+        callId: ByteArray,
+        senderSalt: ByteArray,
+        idbind: ByteArray,
         hash: KeyedHash = SodiumKeyedHash,
     ): ByteArray {
-        require(master.size == KEY_BYTES) { "master must be $KEY_BYTES bytes" }
-        return hash.blake2b(info(stream, direction, salt), master, KEY_BYTES)
+        require(kCall.size == KEY_BYTES) { "K_call must be $KEY_BYTES bytes" }
+        require(stream == STREAM_AUDIO || stream == STREAM_VIDEO) { "bad stream: $stream" }
+        require(keyVersion in 0..0xFFFF) { "keyVersion out of range: $keyVersion" }
+        require(senderSalt.size == SALT_BYTES) { "salt must be $SALT_BYTES bytes" }
+        require(idbind.size == IDBIND_BYTES) { "idbind must be $IDBIND_BYTES bytes" }
+        requireCallId(callId)
+
+        val ctx = CTX_V2.toByteArray(Charsets.US_ASCII)
+        val data = ByteArray(ctx.size + 1 + 2 + CALLID_BYTES + SALT_BYTES + IDBIND_BYTES)
+        var o = 0
+        ctx.copyInto(data, o); o += ctx.size
+        data[o++] = stream.toByte()
+        data[o++] = ((keyVersion ushr 8) and 0xFF).toByte()   // big endian
+        data[o++] = (keyVersion and 0xFF).toByte()
+        callId.copyInto(data, o); o += CALLID_BYTES
+        senderSalt.copyInto(data, o); o += SALT_BYTES
+        idbind.copyInto(data, o)
+        return hash.blake2b(data, kCall, KEY_BYTES)
     }
 
     /**
-     * Both keys this peer needs, picked from its role: the caller's send key
-     * is the callee's receive key and vice versa, so each end calls this and
-     * gets a matching pair.
+     * A sender's wire tag. One tag identifies a participant across audio,
+     * video and stats, so it deliberately takes no stream argument.
      *
-     * @return (sendKey, recvKey)
+     * BLAKE2b cannot produce a 3-byte digest and carries the output length in
+     * its parameter block, so this computes 16 bytes and truncates - exactly
+     * as the C side does, or the tags diverge.
      */
-    fun derivePair(
-        master: ByteArray,
-        stream: Int,
-        isCaller: Boolean,
-        salt: ByteArray,
+    fun senderId(
+        kCall: ByteArray,
+        callId: ByteArray,
+        senderSalt: ByteArray,
+        idbind: ByteArray,
         hash: KeyedHash = SodiumKeyedHash,
-    ): Pair<ByteArray, ByteArray> {
-        val sendDir = if (isCaller) DIR_CALLER_TO_CALLEE else DIR_CALLEE_TO_CALLER
-        val recvDir = if (isCaller) DIR_CALLEE_TO_CALLER else DIR_CALLER_TO_CALLEE
-        return derive(master, stream, sendDir, salt, hash) to
-               derive(master, stream, recvDir, salt, hash)
+    ): ByteArray {
+        require(kCall.size == KEY_BYTES) { "K_call must be $KEY_BYTES bytes" }
+        require(senderSalt.size == SALT_BYTES) { "salt must be $SALT_BYTES bytes" }
+        require(idbind.size == IDBIND_BYTES) { "idbind must be $IDBIND_BYTES bytes" }
+        requireCallId(callId)
+
+        val ctx = SID_CTX.toByteArray(Charsets.US_ASCII)
+        val data = ByteArray(ctx.size + CALLID_BYTES + SALT_BYTES + IDBIND_BYTES)
+        var o = 0
+        ctx.copyInto(data, o); o += ctx.size
+        callId.copyInto(data, o); o += CALLID_BYTES
+        senderSalt.copyInto(data, o); o += SALT_BYTES
+        idbind.copyInto(data, o)
+        return hash.blake2b(data, kCall, 16).copyOf(SID_BYTES)
+    }
+
+    /** Authenticate a HELLO body (everything before the trailing MAC). */
+    fun helloMac(
+        helloKey: ByteArray,
+        hello: ByteArray,
+        hash: KeyedHash = SodiumKeyedHash,
+    ): ByteArray {
+        require(helloKey.size == KEY_BYTES) { "hello key must be $KEY_BYTES bytes" }
+        return hash.blake2b(hello, helloKey, MAC_BYTES)
+    }
+
+    /** Verify a HELLO MAC in constant time. */
+    fun helloMacVerify(
+        helloKey: ByteArray,
+        hello: ByteArray,
+        mac: ByteArray,
+        hash: KeyedHash = SodiumKeyedHash,
+    ): Boolean {
+        if (mac.size != MAC_BYTES) return false
+        val expect = helloMac(helloKey, hello, hash)
+        // Constant time: a short-circuiting compare leaks the MAC one byte per
+        // forgery attempt, and the attacker chooses how often to retry.
+        var diff = 0
+        for (i in 0 until MAC_BYTES) diff = diff or (expect[i].toInt() xor mac[i].toInt())
+        return diff == 0
     }
 }
