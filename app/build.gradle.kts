@@ -36,6 +36,18 @@ android {
     }
 
     buildTypes {
+        debug {
+            /* A separate application id so a development build installs
+             * alongside the release one rather than demanding an uninstall.
+             * Replacing the release build would take the identity key and the
+             * message history with it - they live in app-private storage, and
+             * uninstalling is the only way Android lets a differently-signed
+             * build take over a package. The FileProvider authority already
+             * derives from the application id, and the launcher name comes
+             * from app/src/debug/res, so nothing else needs to change. */
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("release")
