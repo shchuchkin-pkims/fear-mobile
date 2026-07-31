@@ -252,7 +252,6 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
                 override fun onSurfaceTextureAvailable(
                     st: android.graphics.SurfaceTexture, w: Int, h: Int
                 ) {
-                    Log.d(TAG, "main: texture available")
                     mainSurface?.release()
                     mainSurface = Surface(st)
                     manager.setMainSurface(mainSurface)
@@ -267,7 +266,6 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
                 override fun onSurfaceTextureDestroyed(
                     st: android.graphics.SurfaceTexture
                 ): Boolean {
-                    Log.d(TAG, "main: texture destroyed")
                     manager.setMainSurface(null)
                     mainSurface?.release()
                     mainSurface = null
@@ -426,7 +424,6 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
                             override fun onSurfaceTextureAvailable(
                                 st: android.graphics.SurfaceTexture, w: Int, h: Int
                             ) {
-                                Log.d(TAG, "thumb $slot: texture available")
                                 thumbSurfaces.remove(slot)?.release()
                                 val surf = Surface(st)
                                 thumbSurfaces[slot] = surf
@@ -440,7 +437,6 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
                             override fun onSurfaceTextureDestroyed(
                                 st: android.graphics.SurfaceTexture
                             ): Boolean {
-                                Log.d(TAG, "thumb $slot: texture destroyed")
                                 manager.setThumbSurface(slot, null)
                                 thumbSurfaces.remove(slot)?.release()
                                 return true
