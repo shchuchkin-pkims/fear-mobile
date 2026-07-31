@@ -1024,6 +1024,13 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
      * invite, because it is still fresh - that is what puts both ends on the
      * same keys.
      */
+    /**
+     * Answer. Audio starts here; video is started by the screen, which is the
+     * only part that needs an Activity. Either way the call_id comes from the
+     * invitation that was just announced - every media key of a call is bound
+     * to it, so two ends that each drew their own would connect, exchange
+     * packets and hear silence.
+     */
     fun acceptIncomingCall() {
         val incoming = _uiState.value.incomingCall ?: return
         _uiState.update { it.copy(incomingCall = null) }

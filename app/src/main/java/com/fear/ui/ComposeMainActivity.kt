@@ -726,25 +726,32 @@ class ComposeMainActivity : ComponentActivity() {
                         text = {
                             androidx.compose.material3.Text(
                                 if (incoming.video)
-                                    "${incoming.fromUser} is calling with video. " +
-                                    "Video calls are answered from the video screen."
+                                    "${incoming.fromUser} is calling with video."
                                 else
                                     "${incoming.fromUser} is calling.")
                         },
                         confirmButton = {
-                            if (!incoming.video) {
-                                androidx.compose.material3.TextButton(
-                                    onClick = { viewModel.acceptIncomingCall() }
-                                ) { androidx.compose.material3.Text("Answer") }
-                            }
+                            androidx.compose.material3.TextButton(
+                                onClick = {
+                                    /* A video invitation used to be shown and
+                                     * not answerable, on the grounds that
+                                     * video is started from the video screen.
+                                     * It is the same path either way:
+                                     * beginVideoCall joins the call_id just
+                                     * announced rather than drawing a new one.
+                                     * The only reason this lives here and not
+                                     * in the view model is that starting the
+                                     * screen needs an Activity. */
+                                    val video = incoming.video
+                                    viewModel.acceptIncomingCall()
+                                    if (video) startVideoCall()
+                                }
+                            ) { androidx.compose.material3.Text("Answer") }
                         },
                         dismissButton = {
                             androidx.compose.material3.TextButton(
                                 onClick = { viewModel.dismissIncomingCall() }
-                            ) {
-                                androidx.compose.material3.Text(
-                                    if (incoming.video) "OK" else "Decline")
-                            }
+                            ) { androidx.compose.material3.Text("Decline") }
                         },
                     )
                 }
