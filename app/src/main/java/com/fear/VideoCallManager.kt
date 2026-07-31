@@ -1177,6 +1177,10 @@ class VideoCallManager(
                     width = sendWidth,
                     height = sendHeight,
                     fps = quality.fps,
+                    // The name we registered on the relay with, so the far
+                    // end can caption us with something a person recognises
+                    // instead of six hex digits of our SID.
+                    name = relayName,
                 ),
                 hk,
                 skPlaceholder,

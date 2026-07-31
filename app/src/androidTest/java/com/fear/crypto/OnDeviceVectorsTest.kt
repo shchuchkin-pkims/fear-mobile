@@ -117,12 +117,12 @@ class OnDeviceVectorsTest {
 
         val pkt = MediaHello.build(signed, helloKey, sk)
         assertEquals(
-            "7e03009e07000007101112131415161718191a1b1c1d1e1f" +
-            "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf028001e01900" +
-            "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737" +
-            "2b9b4a45c4c2ad7d835677dc6260ee0e27bf2946ef62d0b7cc0f523f30ace05c" +
-            "05b6c4f80cb90ca59da76b41cdaeec7f45833f1eb7ebba16cbad2577d9bc9505" +
-            "fdab26ee8e43dcce31a1bd07ae56e7da",
+            "7e0400ae07000007101112131415161718191a1b1c1d1e1fa0a1a2a3a4a5a6a7" +
+            "a8a9aaabacadaeaf028001e0190000000000000000000000000000000000d04a" +
+            "b232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737338c" +
+            "8397cbc659b5374df33a226fa1b0e265a37f4fcfd1e9b7107e7062369160bb93" +
+            "35319895612cfc74b5142622ed8989889be0a06240e44d6879ab293c0f0e2052" +
+            "8d48f4b542818915b5c5b083f9b4",
             hex(pkt))
 
         val r = MediaHello.parse(pkt, pkt.size, helloKey)

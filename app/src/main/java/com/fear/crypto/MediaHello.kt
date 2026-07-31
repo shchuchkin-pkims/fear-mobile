@@ -44,13 +44,16 @@ object SodiumEd25519 : Ed25519Ops {
 object MediaHello {
 
     const val TYPE: Byte = 0x7E
-    const val VERSION: Byte = 0x03
+    const val VERSION: Byte = 0x04
 
     /** The pre-group HELLO type, kept only to recognise peers that are too old. */
     const val LEGACY_TYPE: Byte = 0x7F
 
-    const val SIZE_BASE = 62
-    const val SIZE_SIGNED = 158
+    const val SIZE_BASE = 78
+    const val SIZE_SIGNED = 174
+
+    /** Display name field width. Not NUL-terminated when exactly full. */
+    const val NAME_BYTES = 16
 
     const val FLAG_VIDEO = 0x01
     const val FLAG_AUDIO = 0x02
@@ -73,10 +76,11 @@ object MediaHello {
     private const val OFF_HEIGHT = 42
     private const val OFF_FPS = 44
     private const val OFF_RSVD2 = 45
-    private const val OFF_PK = 46
-    private const val OFF_SIG = 78
+    private const val OFF_NAME = 46
+    private const val OFF_PK = 62
+    private const val OFF_SIG = 94
     /** The signature covers everything before it. */
-    private const val SIGNED_RANGE = 78
+    private const val SIGNED_RANGE = 94
 
     /** One value per rejection, so a dropped packet can say why. */
     enum class Status {
@@ -90,6 +94,7 @@ object MediaHello {
         ERR_LENGTH,
         ERR_RESERVED,
         ERR_CALLID,
+        ERR_NAME,
         ERR_SIGNATURE,
     }
 
@@ -101,6 +106,13 @@ object MediaHello {
         val width: Int = 0,
         val height: Int = 0,
         val fps: Int = 0,
+        /**
+         * What the sender calls themselves, so a call can put a person's
+         * name under their picture instead of six hex digits of their SID.
+         * A label, not an identity: the MAC only proves a room member sent
+         * it. Empty when none was announced.
+         */
+        val name: String = "",
         /** Present only when flags has FLAG_IDENTITY. */
         val pk: ByteArray? = null,
     ) {
@@ -176,6 +188,24 @@ object MediaHello {
         hello.callId.copyInto(out, OFF_CALLID)
         hello.senderSalt.copyInto(out, OFF_SALT)
 
+        // Truncated on a byte boundary rather than refused: a long name is a
+        // display problem, and failing to announce ourselves over one would
+        // be worse. Cutting UTF-8 mid-character would produce bytes the far
+        // end rejects, so the cut lands on a whole character.
+        if (hello.name.isNotEmpty()) {
+            var encoded = hello.name.toByteArray(Charsets.UTF_8)
+            if (encoded.size > NAME_BYTES) {
+                var take = hello.name.length
+                while (take > 0) {
+                    encoded = hello.name.substring(0, take).toByteArray(Charsets.UTF_8)
+                    if (encoded.size <= NAME_BYTES) break
+                    take--
+                }
+                if (take == 0) encoded = ByteArray(0)
+            }
+            encoded.copyInto(out, OFF_NAME)
+        }
+
         // Zeroed rather than stale when the flag is clear.
         if (hello.flags and FLAG_VIDEO != 0) {
             wrBe16(out, OFF_WIDTH, hello.width)
@@ -238,6 +268,24 @@ object MediaHello {
 
         if (isZero(buf, OFF_CALLID, MediaKeys.CALLID_BYTES)) return ParseResult(Status.ERR_CALLID)
 
+        // The name reaches text renderers, so control characters are refused
+        // rather than stripped, and everything after the first NUL has to be
+        // NUL: padding is not a place to hide bytes a careless consumer might
+        // read past the terminator. UTF-8 passes; a name need not be English.
+        var nameEnd = NAME_BYTES
+        run {
+            var ended = false
+            for (i in 0 until NAME_BYTES) {
+                val ch = buf[OFF_NAME + i].toInt() and 0xFF
+                if (ended) {
+                    if (ch != 0) return ParseResult(Status.ERR_NAME)
+                    continue
+                }
+                if (ch == 0) { ended = true; nameEnd = i; continue }
+                if (ch < 0x20 || ch == 0x7F) return ParseResult(Status.ERR_NAME)
+            }
+        }
+
         var pk: ByteArray? = null
         if (flags and FLAG_IDENTITY != 0) {
             pk = buf.copyOfRange(OFF_PK, OFF_PK + PK_BYTES)
@@ -253,6 +301,7 @@ object MediaHello {
             keyVersion = rdBe16(buf, OFF_KEYVER),
             callId = buf.copyOfRange(OFF_CALLID, OFF_CALLID + MediaKeys.CALLID_BYTES),
             senderSalt = buf.copyOfRange(OFF_SALT, OFF_SALT + MediaKeys.SALT_BYTES),
+            name = String(buf, OFF_NAME, nameEnd, Charsets.UTF_8),
             width = if (videoOn) rdBe16(buf, OFF_WIDTH) else 0,
             height = if (videoOn) rdBe16(buf, OFF_HEIGHT) else 0,
             fps = if (videoOn) buf[OFF_FPS].toInt() and 0xFF else 0,

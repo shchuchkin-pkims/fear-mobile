@@ -1728,6 +1728,10 @@ class AudioCallManager(
                     keyVersion = KEY_VERSION,
                     callId = cid,
                     senderSalt = senderSalt,
+                    // The name we registered on the relay with, so the far
+                    // end can caption us with something a person recognises
+                    // instead of six hex digits of our SID.
+                    name = relayName,
                 ),
                 hk,
                 skPlaceholder,
