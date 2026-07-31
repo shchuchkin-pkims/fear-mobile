@@ -1,5 +1,7 @@
 package com.fear
 
+import com.fear.crypto.CallInvite
+
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -31,6 +33,16 @@ class FearClient(
         fun onCallStarted(remoteUser: String, isInitiator: Boolean)
         fun onCallEnded()
         fun onAudioStatsUpdated(rttMs: Int) {}
+
+        /**
+         * A room member announced a call.
+         *
+         * The invite carries the call_id every media key of that call is
+         * bound to; without using this exact value the two ends derive
+         * different keys and hear nothing. Defaulted so screens that do not
+         * handle calls need no change.
+         */
+        fun onCallInviteReceived(fromUser: String, invite: CallInvite.Invite) {}
         fun onContactsUpdated(contacts: List<String>)
     }
 
@@ -803,6 +815,25 @@ class FearClient(
         return ad
     }
 
+    /**
+     * Announce a call to the room.
+     *
+     * Draw the call_id with SecureRandom, hand the same value to the media
+     * manager, and send it here: it has to be fresh per call, since a value
+     * derived from the room key would be identical for every call in that
+     * room and a recording of one would replay into the next.
+     */
+    fun sendCallInvite(invite: CallInvite.Invite): Boolean {
+        val sock = socket ?: return false
+        return try {
+            sendEncryptedMessage(sock, Common.MSG_TYPE_CALL_INVITE, CallInvite.build(invite))
+            true
+        } catch (e: Exception) {
+            Log.w("FearClient", "call invite not sent: ${e.message}")
+            false
+        }
+    }
+
     private fun sendEncryptedMessage(socket: Socket, type: Byte, payload: ByteArray) {
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
@@ -1126,6 +1157,20 @@ class FearClient(
                     val content = String(plaintext, Charsets.UTF_8)
                     val message = Message(room, senderName, content, System.currentTimeMillis())
                     notifyMessageReceived(message)
+                }
+
+                Common.MSG_TYPE_CALL_INVITE -> {
+                    // Authenticated already: this arrived inside the room
+                    // AEAD, so only a member could have produced it. What is
+                    // still untrusted is the content, which parse() checks -
+                    // in particular the host, which would otherwise reach a
+                    // connect call straight from another party.
+                    val r = CallInvite.parse(plaintext)
+                    if (r.status == CallInvite.Status.OK && r.invite != null) {
+                        handler.post { listener.onCallInviteReceived(senderName, r.invite) }
+                    } else {
+                        Log.w("FearClient", "dropped a call invite from $senderName: ${r.status}")
+                    }
                 }
 
                 Common.MSG_TYPE_FILE_START, Common.MSG_TYPE_FILE_CHUNK, Common.MSG_TYPE_FILE_END -> {
