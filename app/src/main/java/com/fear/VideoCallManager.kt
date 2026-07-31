@@ -43,6 +43,12 @@ class VideoCallManager(
     private val listener: VideoCallListener
 ) {
     companion object {
+        /** Beacon period while nobody has answered. */
+        private const val HELLO_RETRY_MS = 250L
+        /** Beacon period once somebody has, matching audio_call's keepalive. */
+        private const val HELLO_KEEPALIVE_MS = 5000L
+        /** How long to sit unanswered before saying so once. */
+        private const val HELLO_LONELY_MS = 5000L
         /** Participants rendered at once, out of the 32 the key table holds. */
         private const val MAX_MIX = 8
         /** Jitter depth before a voice starts playing, in frames. */
@@ -661,11 +667,22 @@ class VideoCallManager(
     }
 
     /**
-     * Attach decoder surface for rendering remote video. Can be called after startCall.
+     * Attach the surface remote video is rendered on. Safe to call after
+     * startCall, and safe to call again.
+     *
+     * The decoder has to follow the surface, because MediaCodec bound to a
+     * surface that Android has destroyed fails every later call into it - the
+     * codec is gone, not merely stale. SurfaceView destroys and recreates its
+     * surface when the view is resized, and this view is resized to match the
+     * peer whose picture is on screen. With one peer that happens once, at the
+     * start; with two peers of different shapes it happens again later, and
+     * a decoder that did not follow spends the rest of the call throwing.
      */
     fun attachDecoderSurface(surface: Surface) {
+        if (decoderSurface === surface && vp8Decoder != null) return
         decoderSurface = surface
-        if (vp8Decoder != null) return // Already attached
+        try { vp8Decoder?.stop() } catch (_: Exception) {}
+        vp8Decoder = null
         try {
             vp8Decoder = Vp8Decoder().also {
                 it.start(surface, quality.width, quality.height)
@@ -674,6 +691,18 @@ class VideoCallManager(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VP8 decoder", e)
         }
+    }
+
+    /**
+     * The rendering surface is going away. Release the decoder with it and
+     * remember there is nowhere to draw, so nothing rebuilds one onto a
+     * surface that no longer exists.
+     */
+    fun detachDecoderSurface() {
+        Log.d(TAG, "decoder surface destroyed, releasing decoder")
+        try { vp8Decoder?.stop() } catch (_: Exception) {}
+        vp8Decoder = null
+        decoderSurface = null
     }
 
     /**
@@ -1044,30 +1073,55 @@ class VideoCallManager(
 
     // --- HELLO handshake ---
 
+    /**
+     * Announce ourselves for the whole call: quickly while nobody has
+     * answered, slowly once somebody has.
+     *
+     * This used to stop at the first peer, on the reasoning that a later
+     * arrival is covered by the one reply handleHello2 sends them. That reply
+     * is a single packet with no retransmission behind it, and when a real
+     * three-device call was placed this phone was the later arrival: both
+     * desktops heard its HELLO and neither reply came back, so it sent video
+     * they could both see, received nothing, and gave up after five seconds -
+     * five times running.
+     *
+     * Nor does an unanswered HELLO end the call any more. Being first into a
+     * group call is normal; the old five-second timeout dropped whoever
+     * opened one before anybody else could join it.
+     *
+     * A repeat installs nothing at the peer, since the sender table is
+     * idempotent per salt, and draws no reply of its own, so the beacon
+     * cannot turn into a handshake storm.
+     */
     private fun helloLoop() {
-        var retries = 0
         Log.d(TAG, "HELLO loop started, sending to ${remoteAddress?.hostAddress}:$remotePort")
 
-        // Announce until somebody is known, then stop: a peer that joins
-        // later is answered by the one reply in handleHello2. Nothing waits
-        // on this loop to start sending media.
-        while (running.get() && peerCount() == 0 && retries < 100) {
-            sendHello()
-            if (retries % 20 == 0) {
-                Log.d(TAG, "HELLO sent #$retries (waiting for a peer...)")
-            }
-            Thread.sleep(50)
-            retries++
-        }
+        var announced = false
+        var lonelyLogged = false
+        var waitedMs = 0L
 
-        if (peerCount() > 0) {
-            Log.d(TAG, "HELLO handshake completed after $retries retries")
-            Log.d(TAG, "Remote: ${remoteWidth}x${remoteHeight}@${remoteFps}")
-            listener.onConnected(remoteWidth, remoteHeight, remoteFps)
-        } else if (running.get()) {
-            Log.e(TAG, "HELLO handshake timed out after $retries retries (${retries * 50}ms)")
-            listener.onCallError("Connection timed out (no response from peer)")
-            endCall()
+        while (running.get()) {
+            sendHello()
+
+            if (!announced && peerCount() > 0) {
+                announced = true
+                Log.d(TAG, "HELLO handshake completed after ${waitedMs}ms")
+                Log.d(TAG, "Remote: ${remoteWidth}x${remoteHeight}@${remoteFps}")
+                listener.onConnected(remoteWidth, remoteHeight, remoteFps)
+            }
+
+            if (!announced && !lonelyLogged && waitedMs >= HELLO_LONELY_MS) {
+                lonelyLogged = true
+                Log.w(TAG, "no peer after ${waitedMs}ms, still announcing")
+            }
+
+            val gap = if (peerCount() == 0) HELLO_RETRY_MS else HELLO_KEEPALIVE_MS
+            try {
+                Thread.sleep(gap)
+            } catch (_: InterruptedException) {
+                break
+            }
+            waitedMs += gap
         }
     }
 
@@ -1467,6 +1521,10 @@ class VideoCallManager(
             // One surface, so one participant: feeding every sender into the
             // single decoder is what made three cameras look broken.
             if (shouldShow(slot, System.currentTimeMillis())) {
+                // A decoder that was replaced on the last handover, or lost
+                // when one failed to build, is rebuilt here rather than
+                // leaving the call with no picture for the rest of its life.
+                if (vp8Decoder == null && decoderSurface != null) restartDecoder()
                 vp8Decoder?.decode(completeFrame, System.nanoTime() / 1000)
             }
         }

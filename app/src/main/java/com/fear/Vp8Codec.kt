@@ -241,7 +241,13 @@ class Vp8Decoder {
     private var codec: MediaCodec? = null
     private val bufferInfo = MediaCodec.BufferInfo()
 
-    fun start(surface: Surface, width: Int, height: Int) {
+    /* The thread that decodes is not the thread that ends a call, and on a
+     * speaker handover the decoder is replaced while pictures keep arriving.
+     * Every entry point below therefore takes this, because a release landing
+     * between two of decode()s JNI calls throws IllegalStateException. */
+    private val lock = Any()
+
+    fun start(surface: Surface, width: Int, height: Int) = synchronized(lock) {
         codec = tryCreateDecoder(MIME_VP8, surface, width, height)
             ?: tryCreateDecoder(MIME_VP8_ALT, surface, width, height)
             ?: tryCreateByName(surface, width, height)
@@ -282,30 +288,55 @@ class Vp8Decoder {
         return null
     }
 
-    fun decode(data: ByteArray, presentationTimeUs: Long) {
-        val c = codec ?: return
+    /**
+     * Feed one frame and render whatever the codec hands back.
+     *
+     * Never throws. A frame that cannot be decoded is a frame not shown; it
+     * used to be the end of the call, because the receive loop treats any
+     * exception as a dead connection and tears everything down - taking the
+     * audio with it. That is not a thought experiment: a live three-way call
+     * died this way half a second after connecting, when one thread released
+     * the codec while another was between dequeueInputBuffer and
+     * dequeueOutputBuffer on it.
+     *
+     * @return false when the frame was dropped.
+     */
+    fun decode(data: ByteArray, presentationTimeUs: Long): Boolean {
+        synchronized(lock) {
+            val c = codec ?: return false
+            try {
+                val inputIndex = c.dequeueInputBuffer(10_000)
+                if (inputIndex >= 0) {
+                    val inputBuffer = c.getInputBuffer(inputIndex) ?: return false
+                    inputBuffer.clear()
+                    inputBuffer.put(data)
+                    c.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
+                }
 
-        val inputIndex = c.dequeueInputBuffer(10_000)
-        if (inputIndex >= 0) {
-            val inputBuffer = c.getInputBuffer(inputIndex) ?: return
-            inputBuffer.clear()
-            inputBuffer.put(data)
-            c.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
-        }
-
-        var outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
-        while (outputIndex >= 0) {
-            c.releaseOutputBuffer(outputIndex, true)
-            outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+                var outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+                while (outputIndex >= 0) {
+                    c.releaseOutputBuffer(outputIndex, true)
+                    outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+                }
+                return true
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "frame dropped: ${e.message}")
+                return false
+            }
         }
     }
 
     fun stop() {
-        try {
-            codec?.stop()
-            codec?.release()
-        } catch (_: Exception) {}
-        codec = null
+        synchronized(lock) {
+            val c = codec ?: return
+            // Cleared first, so a decode that is waiting on the lock finds
+            // nothing to work with rather than a handle about to be freed.
+            codec = null
+            try { c.stop() } catch (_: Exception) {}
+            // Released even when stop() failed, or the codec keeps the Surface
+            // and the decoder built to replace it cannot configure onto it.
+            try { c.release() } catch (_: Exception) {}
+        }
     }
 }
 

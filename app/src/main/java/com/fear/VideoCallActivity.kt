@@ -207,8 +207,19 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
                 manager.attachDecoderSurface(holder.surface)
             }
 
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-            override fun surfaceDestroyed(holder: SurfaceHolder) {}
+            /* A resize gives the view a new surface, and the decoder bound
+             * to the old one is dead from that moment on. Both of these were
+             * empty, which is why a call with two peers of different shapes
+             * lost its picture the moment the second one announced itself. */
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                Log.d(TAG, "Surface changed (${width}x${height}), rebinding decoder")
+                manager.attachDecoderSurface(holder.surface)
+            }
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                Log.d(TAG, "Surface destroyed, releasing decoder")
+                manager.detachDecoderSurface()
+            }
         })
 
         // Also check if surface already exists
