@@ -1733,17 +1733,21 @@ class AudioCallManager(
     }
 
     /**
-     * Announce ourselves until somebody is known, then stop. A peer that
-     * joins later is covered by the one reply in handleHello2, not by this.
+     * Announce ourselves for the whole call: quickly while nobody has
+     * answered, slowly once somebody has.
+     *
+     * Stopping at the first peer left a later arrival dependent on the single
+     * reply handleHello2 sends them, which has no retransmission behind it.
+     * Two-party audio survived that only because the desktop beacons; the
+     * video path, where nothing did, failed outright on a real three-device
+     * call. Both sides beacon now.
      */
     private fun startHelloAnnounce() {
         sendHelloPacket()
         CoroutineScope(Dispatchers.IO).launch {
-            var attempts = 0
-            while (peerCount() == 0 && isRunning.get() && attempts < 100) {
+            while (isRunning.get()) {
                 sendHelloPacket()
-                delay(50)
-                attempts++
+                delay(if (peerCount() == 0) HELLO_RETRY_MS else HELLO_KEEPALIVE_MS)
             }
         }
     }
@@ -1895,6 +1899,10 @@ class AudioCallManager(
     }
 
     private companion object {
+        /** Beacon period while nobody has answered. */
+        const val HELLO_RETRY_MS = 250L
+        /** Beacon period once somebody has, matching audio_call's keepalive. */
+        const val HELLO_KEEPALIVE_MS = 5000L
         /** Nothing produces a nonzero key version yet. */
         const val KEY_VERSION = 0
 
