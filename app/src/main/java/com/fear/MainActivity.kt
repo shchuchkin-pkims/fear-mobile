@@ -26,6 +26,10 @@ import java.text.SimpleDateFormat
 import java.util.*
 
 
+private const val NO_CALL_ID_MSG =
+    "Cannot start the call: connect to a room first, the call id has to be " +
+    "announced there."
+
 class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
 
     private lateinit var connectionLayout: FrameLayout
@@ -311,12 +315,22 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     return@setPositiveButton
                 }
 
+                // The call id is announced to the room and then handed to
+                // the call screen: the media keys are bound to it, so both
+                // ends have to run under the very same value.
+                val callIdHex = fearClient.beginCallHex(video = true)
+                if (callIdHex == null) {
+                    Toast.makeText(this, NO_CALL_ID_MSG, Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+
                 val intent = Intent(this, VideoCallActivity::class.java).apply {
                     putExtra(VideoCallActivity.EXTRA_REMOTE_IP, serverIp)
                     putExtra(VideoCallActivity.EXTRA_REMOTE_PORT, serverPort)
                     putExtra(VideoCallActivity.EXTRA_LOCAL_PORT, 0)
                     putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, encryptionKey)
                     putExtra(VideoCallActivity.EXTRA_QUALITY, quality)
+                    putExtra(VideoCallActivity.EXTRA_CALL_ID, callIdHex)
                 }
                 startActivity(intent)
             }
@@ -335,6 +349,15 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     return@setNeutralButton
                 }
 
+                // Listening is the answering side, so this normally picks
+                // up the id the caller announced; when nobody has announced
+                // one it draws and announces its own.
+                val callIdHex = fearClient.beginCallHex(video = true)
+                if (callIdHex == null) {
+                    Toast.makeText(this, NO_CALL_ID_MSG, Toast.LENGTH_LONG).show()
+                    return@setNeutralButton
+                }
+
                 val intent = Intent(this, VideoCallActivity::class.java).apply {
                     putExtra(VideoCallActivity.EXTRA_REMOTE_IP, "")
                     putExtra(VideoCallActivity.EXTRA_REMOTE_PORT, 0)
@@ -342,6 +365,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, encryptionKey)
                     putExtra(VideoCallActivity.EXTRA_QUALITY, quality)
                     putExtra(VideoCallActivity.EXTRA_IS_LISTENING, true)
+                    putExtra(VideoCallActivity.EXTRA_CALL_ID, callIdHex)
                 }
                 startActivity(intent)
             }
@@ -366,6 +390,12 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     return@setOnClickListener
                 }
 
+                val callIdHex = fearClient.beginCallHex(video = true)
+                if (callIdHex == null) {
+                    Toast.makeText(this, NO_CALL_ID_MSG, Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+
                 val intent = Intent(this, VideoCallActivity::class.java).apply {
                     putExtra(VideoCallActivity.EXTRA_REMOTE_IP, fearClient.getServerHost())
                     putExtra(VideoCallActivity.EXTRA_REMOTE_PORT, fearClient.getServerPort())
@@ -375,6 +405,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     putExtra(VideoCallActivity.EXTRA_IS_RELAY, true)
                     putExtra(VideoCallActivity.EXTRA_RELAY_ROOM, fearClient.getCurrentRoom())
                     putExtra(VideoCallActivity.EXTRA_RELAY_NAME, fearClient.getCurrentName())
+                    putExtra(VideoCallActivity.EXTRA_CALL_ID, callIdHex)
                 }
                 startActivity(intent)
                 dialog.dismiss()

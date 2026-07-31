@@ -19,6 +19,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.fear.crypto.MediaKeys
 import java.util.concurrent.Executors
 
 /**
@@ -38,6 +39,8 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         const val EXTRA_IS_RELAY = "is_relay"
         const val EXTRA_RELAY_ROOM = "relay_room"
         const val EXTRA_RELAY_NAME = "relay_name"
+        /** The 16-byte call_id as 32 hex characters. Mandatory: see below. */
+        const val EXTRA_CALL_ID = "call_id"
         private const val PERMISSION_CODE = 200
     }
 
@@ -63,6 +66,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
     private var isRelayMode = false
     private var relayRoom = ""
     private var relayName = ""
+    private var callIdHex = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,6 +82,7 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
         isRelayMode = intent.getBooleanExtra(EXTRA_IS_RELAY, false)
         relayRoom = intent.getStringExtra(EXTRA_RELAY_ROOM) ?: ""
         relayName = intent.getStringExtra(EXTRA_RELAY_NAME) ?: ""
+        callIdHex = intent.getStringExtra(EXTRA_CALL_ID) ?: ""
 
         Log.d(TAG, "onCreate: remote=$remoteIp:$remotePort keyLen=${encryptionKeyHex.length} quality=$qualityPreset listen=$isListeningMode relay=$isRelayMode")
 
@@ -153,11 +158,32 @@ class VideoCallActivity : AppCompatActivity(), VideoCallManager.VideoCallListene
             else -> VideoQualityPreset.MEDIUM
         }
 
+        // Every media key of this call is bound to the call_id, so there is
+        // no call without one. The screen that started us draws it and
+        // announces it to the room; deriving one here from the room key would
+        // give every call in that room the same id.
+        val callId = try {
+            if (callIdHex.length != MediaKeys.CALLID_BYTES * 2) null
+            else ByteArray(MediaKeys.CALLID_BYTES) { i ->
+                callIdHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        } catch (e: Exception) {
+            null
+        }
+        if (callId == null) {
+            Log.e(TAG, "No usable call id in the intent (${callIdHex.length} chars)")
+            Toast.makeText(this, "No call id: cannot start an encrypted call",
+                Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
+
         val manager = VideoCallManager(this, this)
         videoCallManager = manager
 
         val identityMgr = IdentityManager(this)
-        manager.initialize(keyBytes, preset, if (identityMgr.hasIdentity()) identityMgr else null)
+        manager.initialize(keyBytes, preset,
+            if (identityMgr.hasIdentity()) identityMgr else null, callId)
 
         if (isRelayMode) {
             Log.d(TAG, "Starting relay call to $remoteIp:$remotePort room=$relayRoom name=$relayName")

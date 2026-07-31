@@ -1,6 +1,7 @@
 package com.fear
 
 import com.fear.crypto.CallInvite
+import com.fear.crypto.MediaKeys
 
 import android.content.Context
 import android.os.Handler
@@ -16,6 +17,20 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.security.SecureRandom
 import java.util.*
+
+/**
+ * How long a call announced by another member counts as still running. A
+ * start inside this window joins that call instead of opening a second one.
+ */
+private const val INVITE_FRESH_MS = 60_000L
+
+private const val ERR_NO_ROOM_FOR_ID =
+    "Cannot start the call: the call id has to be announced to the room, and " +
+    "this client is not connected to one."
+
+private const val ERR_NO_INVITE =
+    "Cannot answer the call: the caller announced no call id, so there is " +
+    "nothing to derive the media keys from."
 
 class FearClient(
     private val context: Context,
@@ -88,6 +103,27 @@ class FearClient(
     private var audioCallManager: AudioCallManager? = null
     private var pendingCallRequest: AudioCallRequest? = null
     private var identityManager: IdentityManager? = null
+
+    /**
+     * The call_id of the call being set up: 16 bytes, drawn by whoever starts
+     * a call and announced to the room in a CallInvite. Every media key is
+     * bound to it, so the value handed to a call manager has to be the very
+     * same one the room was told - one id in the invite and another in the
+     * keys gives a call that connects and then sits in silence.
+     */
+    @Volatile private var currentCallId: ByteArray? = null
+
+    /** The last call another member announced, in which room, and when. */
+    @Volatile private var lastInvite: CallInvite.Invite? = null
+    @Volatile private var lastInviteRoom = ""
+    @Volatile private var lastInviteAt = 0L
+
+    /**
+     * The call_id the audio manager was last configured for. initialize()
+     * re-derives every key and rebuilds the codecs, so it must not be called
+     * again on a call that is already running.
+     */
+    @Volatile private var mediaCallId: ByteArray? = null
 
     private fun getOrCreateAudioCallManager(): AudioCallManager {
         if (audioCallManager == null) {
@@ -356,6 +392,15 @@ class FearClient(
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val socket = socket ?: return@launch
+
+                // The call id goes out first, and this waits for it: the other
+                // end answers through acceptAudioCall(), which has nothing to
+                // bind its media keys to until the invite has arrived.
+                if (beginCall(video = false, sendOnIo = false) == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
+
                 val request = AudioCallRequest(currentRoom, clientName, targetUser)
                 sendAudioCallMessage(socket, Common.MSG_TYPE_AUDIO_CALL_REQUEST, request)
             } catch (e: Exception) {
@@ -370,8 +415,20 @@ class FearClient(
                 val socket = socket ?: return@launch
                 val request = pendingCallRequest ?: return@launch
 
+                // Answering, so the id is the caller's, taken from the invite
+                // they announced. Drawing one here would derive keys the
+                // caller cannot, and deriving one from the room key would hand
+                // every call in this room the same id.
+                val callId = invitedCallId()
+                if (callId == null) {
+                    notifyError(ERR_NO_INVITE)
+                    pendingCallRequest = null
+                    return@launch
+                }
+
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(roomKey)
+                manager.initialize(roomKey, callId, identityManager)
+                mediaCallId = callId
 
                 val udpInfo = AudioUdpInfo(
                     currentRoom, clientName,
@@ -407,6 +464,10 @@ class FearClient(
                 val endMsg = AudioCallRequest(currentRoom, clientName, "")
                 sendAudioCallMessage(socket, Common.MSG_TYPE_AUDIO_CALL_END, endMsg)
                 audioCallManager?.endCall()
+                // The next call draws its own id: silently reusing this one is
+                // the cross-call replay window the id exists to close.
+                currentCallId = null
+                mediaCallId = null
             } catch (e: Exception) {
                 notifyError("Failed to end audio call: ${e.message}")
             }
@@ -420,8 +481,14 @@ class FearClient(
                     notifyError("Invalid encryption key size: ${encryptionKey.size}, expected 32 bytes")
                     return@launch
                 }
+                val callId = beginCall(video = false, sendOnIo = false)
+                if (callId == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(encryptionKey)
+                manager.initialize(encryptionKey, callId, identityManager)
+                mediaCallId = callId
                 manager.startCallDirect(serverIp, serverPort, localPort, encryptionKey)
                 notifyCallStarted("$serverIp:$serverPort", true)
             } catch (e: Exception) {
@@ -441,8 +508,14 @@ class FearClient(
                     notifyError("Not connected to a server")
                     return@launch
                 }
+                val callId = beginCall(video = false, sendOnIo = false)
+                if (callId == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(encryptionKey)
+                manager.initialize(encryptionKey, callId, identityManager)
+                mediaCallId = callId
                 manager.startRelay(serverHost, serverPort, currentRoom, clientName, 0, encryptionKey)
                 notifyCallStarted("Relay $serverHost:$serverPort", true)
             } catch (e: Exception) {
@@ -458,8 +531,14 @@ class FearClient(
                     notifyError("Invalid encryption key size: ${encryptionKey.size}, expected 32 bytes")
                     return@launch
                 }
+                val callId = beginCall(video = false, sendOnIo = false)
+                if (callId == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(encryptionKey)
+                manager.initialize(encryptionKey, callId, identityManager)
+                mediaCallId = callId
                 manager.startListenDirect(localPort, encryptionKey)
                 notifyCallStarted("Listening on :$localPort", false)
             } catch (e: Exception) {
@@ -834,6 +913,91 @@ class FearClient(
         }
     }
 
+    /**
+     * Whether the last invite still stands: recent, and from the room this
+     * client is in now. A call announced in a room we have since left says
+     * nothing about a call here, and its key material is a different room's.
+     */
+    private fun inviteStillCounts(): Boolean =
+        lastInviteRoom == currentRoom &&
+            System.currentTimeMillis() - lastInviteAt < INVITE_FRESH_MS
+
+    /** 16 fresh bytes. All-zero means "unset" on both sides, so never that. */
+    private fun newCallId(): ByteArray {
+        val id = ByteArray(MediaKeys.CALLID_BYTES)
+        val rng = SecureRandom()
+        do { rng.nextBytes(id) } while (id.all { it == 0.toByte() })
+        return id
+    }
+
+    /**
+     * The call_id from the invite a peer announced, when that announcement is
+     * still current. Null means nobody announced a call, and there is no
+     * honest way to guess one: an id derived from the room key would be
+     * identical for every call in the room, which is precisely the cross-call
+     * replay barrier the id exists to provide.
+     */
+    private fun invitedCallId(): ByteArray? {
+        val inv = lastInvite ?: return null
+        if (!inviteStillCounts()) return null
+        val id = inv.callId.copyOf()
+        currentCallId = id
+        return id
+    }
+
+    /**
+     * The call_id to start a call under, or null when the room cannot be told
+     * about it.
+     *
+     * Joining beats starting: when someone announced a call here moments ago
+     * this runs under that id, because two participants that each draw their
+     * own would derive different keys and hear each other as silence.
+     * Otherwise it draws one and announces it - and when that cannot be sent
+     * it returns null rather than start a call whose keys no one else can
+     * derive.
+     *
+     * @param sendOnIo true when the caller may be on the main thread, where a
+     *                 socket write throws NetworkOnMainThreadException; the
+     *                 invite then goes out on an IO coroutine. Callers already
+     *                 off the main thread pass false and get the invite on the
+     *                 wire before this returns.
+     */
+    private fun beginCall(video: Boolean, sendOnIo: Boolean): ByteArray? {
+        val want = if (video) CallInvite.FLAG_VIDEO else CallInvite.FLAG_AUDIO
+        val inv = lastInvite
+        if (inv != null && inv.flags and want != 0 && inviteStillCounts()) {
+            Log.d("FearClient", "joining the call already announced in this room")
+            val joined = inv.callId.copyOf()
+            currentCallId = joined
+            return joined
+        }
+
+        if (socket == null || !isConnected) return null
+
+        val id = newCallId()
+        val flags = if (video) CallInvite.FLAG_AUDIO or CallInvite.FLAG_VIDEO
+                    else CallInvite.FLAG_AUDIO
+        // No host or port hint: the transport is arranged by the screen that
+        // starts the call, and this only has to carry the id.
+        val invite = CallInvite.Invite(flags, id)
+        if (sendOnIo) {
+            CoroutineScope(Dispatchers.IO).launch { sendCallInvite(invite) }
+        } else if (!sendCallInvite(invite)) {
+            return null
+        }
+        currentCallId = id
+        return id
+    }
+
+    /**
+     * The call_id for a call this screen is about to start, as 32 hex
+     * characters, for handing to VideoCallActivity through an intent. Null
+     * when there is no room to announce it in. Safe to call on the main
+     * thread: the announcement itself goes out on an IO coroutine.
+     */
+    fun beginCallHex(video: Boolean): String? =
+        beginCall(video, sendOnIo = true)?.joinToString("") { "%02x".format(it) }
+
     private fun sendEncryptedMessage(socket: Socket, type: Byte, payload: ByteArray) {
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
@@ -1167,6 +1331,16 @@ class FearClient(
                     // connect call straight from another party.
                     val r = CallInvite.parse(plaintext)
                     if (r.status == CallInvite.Status.OK && r.invite != null) {
+                        // Kept so that answering, or starting a call from this
+                        // side a moment later, runs under the id that was
+                        // announced instead of a second one nobody else has.
+                        // Our own invite comes back from the server too, and
+                        // that echo carries no new information.
+                        if (senderName != clientName) {
+                            lastInvite = r.invite
+                            lastInviteRoom = room
+                            lastInviteAt = System.currentTimeMillis()
+                        }
                         handler.post { listener.onCallInviteReceived(senderName, r.invite) }
                     } else {
                         Log.w("FearClient", "dropped a call invite from $senderName: ${r.status}")
@@ -1288,7 +1462,22 @@ class FearClient(
                     val udpInfo = parseAudioUdpInfo(String(plaintext, Charsets.UTF_8))
                     if (udpInfo != null && udpInfo.user != clientName) {
                         val host = socket.inetAddress.hostAddress ?: return@receiveMessage true
+                        // The id we announced when we rang - the same value the
+                        // answering side took from that invite.
+                        val callId = currentCallId ?: invitedCallId()
+                        if (callId == null) {
+                            notifyError(ERR_NO_ROOM_FOR_ID)
+                            return@receiveMessage true
+                        }
                         val manager = getOrCreateAudioCallManager()
+                        // Only when it is not already set up for this call: a
+                        // second peer's UDP info arriving while the first is
+                        // talking would otherwise re-derive our keys and our
+                        // SID under everyone's feet.
+                        if (!callId.contentEquals(mediaCallId)) {
+                            manager.initialize(roomKey, callId, identityManager)
+                            mediaCallId = callId
+                        }
                         manager.startCall(udpInfo.user, host, udpInfo.udpPort, udpInfo.noncePrefix)
                     }
                 }

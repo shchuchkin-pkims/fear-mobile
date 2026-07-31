@@ -971,6 +971,14 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     fun roomName(): String   = client.getCurrentRoom()
     fun userName(): String   = client.getCurrentName()
 
+    /**
+     * The call_id for a video call, hex: the one a peer announced in this room
+     * a moment ago, or a fresh one that the client announces there. Null when
+     * there is no room to announce it in - every media key is bound to this
+     * value, so a call that cannot publish it could only talk to itself.
+     */
+    fun beginVideoCall(): String? = client.beginCallHex(video = true)
+
     /** Audio call: relay through the chat server. Uses roomKey for symmetric crypto. */
     fun startAudioCall() {
         if (!_uiState.value.isConnected) return

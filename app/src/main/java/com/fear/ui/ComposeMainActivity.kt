@@ -761,7 +761,19 @@ class ComposeMainActivity : ComponentActivity() {
         }
         val keyHex = viewModel.roomKeyHex()
         if (keyHex.length != 64) return
+        // The call id is announced to the room and handed to the call screen:
+        // the media keys are bound to it, so every participant has to run
+        // under the very same value.
+        val callIdHex = viewModel.beginVideoCall()
+        if (callIdHex == null) {
+            Toast.makeText(this,
+                "Cannot start the call: connect to a room first, the call id " +
+                "has to be announced there.",
+                Toast.LENGTH_LONG).show()
+            return
+        }
         val intent = Intent(this, VideoCallActivity::class.java).apply {
+            putExtra(VideoCallActivity.EXTRA_CALL_ID,     callIdHex)
             putExtra(VideoCallActivity.EXTRA_REMOTE_IP,    viewModel.serverHost())
             putExtra(VideoCallActivity.EXTRA_REMOTE_PORT,  viewModel.serverPort())
             putExtra(VideoCallActivity.EXTRA_LOCAL_PORT,   0)

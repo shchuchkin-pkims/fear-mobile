@@ -16,11 +16,14 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
+import com.fear.crypto.Ed25519Ops
+import com.fear.crypto.MediaHello
+import com.fear.crypto.MediaKeys
+import com.fear.crypto.MediaPacket
+import com.fear.crypto.SenderTable
+import com.fear.crypto.SodiumEd25519
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * Video call manager for FEAR messenger.
@@ -28,7 +31,12 @@ import javax.crypto.spec.SecretKeySpec
  *
  * Protocol: UDP with AES-256-GCM encryption.
  * Audio (0x01) and Video (0x02) packets on same socket.
- * HELLO (0x7F) for handshake.
+ * HELLO2 (0x7E) for handshake; 0x7F is the pre-group HELLO, recognised only
+ * so an old peer can be told to update.
+ *
+ * Keys are per sender: every participant encrypts under keys derived from its
+ * own announced salt, so a call can have more than two people in it and two
+ * senders can both start their counters at zero.
  */
 class VideoCallManager(
     private val context: Context,
@@ -36,6 +44,13 @@ class VideoCallManager(
 ) {
     companion object {
         private const val TAG = "VCM"
+
+        /** Nothing produces a nonzero key version yet. */
+        private const val KEY_VERSION = 0
+
+        private const val CALL_ID_REQUIRED =
+            "Cannot start the call: no call id. Pass the 16-byte call_id from " +
+            "the call invite to initialize() or setCallId()."
     }
 
     interface VideoCallListener {
@@ -47,16 +62,46 @@ class VideoCallManager(
         fun onStatsUpdated(packetsReceived: Int, packetsLost: Int, rttMs: Int)
     }
 
-    // Keys
-    private var audioKey: ByteArray? = null
-    private var videoKey: ByteArray? = null
+    // Keys. Ours are derived from our own salt, so they need no peer and no
+    // caller/callee bit; a peer's are derived from what that peer announced.
+    /** K_call. Copied, never aliased: teardown wipes this array. */
+    private var callKey = ByteArray(0)
 
-    // Nonce prefixes
-    private val localNoncePrefix = ByteArray(4)
-    private var remoteNoncePrefix: ByteArray? = null
-    private val remotePrefixReady = AtomicBoolean(false)
+    /** 16-byte call id. Mandatory - every media key is bound to it. */
+    private var callId: ByteArray? = null
 
-    // Sequence counters
+    /** Drawn once per call, before any thread starts, never re-drawn. */
+    private var senderSalt = ByteArray(0)
+
+    /** Our wire tag, one per participant across audio, video and stats. */
+    private var ownSid = ByteArray(0)
+
+    /** Send key for the audio counter domain. */
+    private var ownAudioKey: ByteArray? = null
+
+    /** Send key for the video counter domain: fragments AND stats. */
+    private var ownVideoKey: ByteArray? = null
+
+    /** HELLO2 MAC key, mk_hello_key(K_call, call_id). */
+    private var helloKey: ByteArray? = null
+
+    /** Our Ed25519 public key when an identity is loaded, else 32 zero bytes. */
+    private var idbind: ByteArray = MediaKeys.UNSIGNED_IDBIND
+
+    /** Per-sender keys and replay windows for the other participants. */
+    private var senderTable: SenderTable.Table? = null
+
+    /** Guards senderTable: install runs on the receive thread, count elsewhere. */
+    private val tableLock = Any()
+
+    /** Peers already run through TOFU, keyed by their public key. */
+    private val seenPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** One line per call, not per packet, when a peer is too old to talk to. */
+    private val legacyPeerLogged = AtomicBoolean(false)
+
+    // Sequence counters. Two counter domains, not three: video fragments and
+    // stats both draw from videoSeqTx, so they must also share the video key.
     private val audioSeqTx = AtomicLong(0)
     private val videoSeqTx = AtomicLong(0)
 
@@ -95,7 +140,9 @@ class VideoCallManager(
     private var remoteHeight = 0
     private var remoteFps = 0
 
-    // Fragment reassembly
+    // Fragment reassembly, keyed by (sender slot, frame id): two senders can
+    // be on the same frame id at the same moment, and one bucket for both
+    // would splice their fragments into one broken frame.
     private val pendingFrames = HashMap<Long, PendingFrame>()
     private var frameIdCounter = 0L
 
@@ -131,22 +178,118 @@ class VideoCallManager(
         val timestamp: Long = System.currentTimeMillis()
     )
 
+    /**
+     * Configure one call. Must be called before any thread starts.
+     *
+     * @param masterKey K_call, 32 bytes; copied here and wiped on teardown
+     * @param callId    the 16-byte call id from the call invite. Mandatory:
+     *                  without it no media key exists and every start path
+     *                  below refuses. Pass null only to keep a call id that
+     *                  was supplied by an earlier call to this method.
+     */
     fun initialize(masterKey: ByteArray, preset: VideoQualityPreset = VideoQualityPreset.MEDIUM,
-                   identityMgr: IdentityManager? = null) {
-        audioKey = KeyDerivation.deriveAudioKey(masterKey)
-        videoKey = KeyDerivation.deriveVideoKey(masterKey)
+                   identityMgr: IdentityManager? = null, callId: ByteArray? = null) {
+        val keepId = callId?.copyOf() ?: this.callId?.copyOf()
+        clearMediaKeys()
+
+        callKey = masterKey.copyOf()
+        this.callId = keepId
         quality = preset
         sendWidth = preset.width
         sendHeight = preset.height
         identityManager = identityMgr
-        SecureRandom().nextBytes(localNoncePrefix)
+
+        val ok = deriveCallMaterial()
 
         Log.d(TAG, "Initialized: quality=${preset.width}x${preset.height}@${preset.fps}")
-        Log.d(TAG, "Local nonce prefix: ${localNoncePrefix.toHex()}")
         // Never log key material: minify is disabled, so these survive into
         // release builds and land in logcat/bugreports.
-        Log.d(TAG, "Audio/video subkeys derived")
+        Log.d(TAG, "Media keys ready: $ok")
         Log.d(TAG, "Identity: ${if (identityMgr?.hasIdentity() == true) "yes" else "no"}")
+    }
+
+    /** Bind this manager to a call id and derive our per-call material. */
+    fun setCallId(callId: ByteArray): Boolean {
+        this.callId = callId.copyOf()
+        return deriveCallMaterial()
+    }
+
+    /**
+     * Our SID and both send keys come from our own salt, so nothing here
+     * needs a peer, a role or a handshake - only K_call and the call id.
+     */
+    private fun deriveCallMaterial(): Boolean {
+        val cid = callId
+        if (callKey.size != MediaKeys.KEY_BYTES) {
+            Log.e(TAG, "Bad master key size ${callKey.size}: media disabled")
+            return false
+        }
+        if (cid == null || cid.size != MediaKeys.CALLID_BYTES || cid.all { it == 0.toByte() }) {
+            Log.e(TAG, "No call id: media stays disabled until one is supplied")
+            return false
+        }
+
+        val im = identityManager
+        val pk = if (im != null && im.hasIdentity()) im.getPublicKey() else null
+        idbind = pk ?: MediaKeys.UNSIGNED_IDBIND
+
+        senderSalt = ByteArray(MediaKeys.SALT_BYTES).also { SecureRandom().nextBytes(it) }
+        ownSid = MediaKeys.senderId(callKey, cid, senderSalt, idbind)
+        ownAudioKey = MediaKeys.deriveSender(
+            callKey, MediaKeys.STREAM_AUDIO, KEY_VERSION, cid, senderSalt, idbind)
+        ownVideoKey = MediaKeys.deriveSender(
+            callKey, MediaKeys.STREAM_VIDEO, KEY_VERSION, cid, senderSalt, idbind)
+        helloKey = MediaKeys.helloKey(callKey, cid)
+        // ownSalt is handed over so the table refuses our own announcement
+        // echoed back at us, which would install our send keys as a peer.
+        synchronized(tableLock) { senderTable = SenderTable.Table(callKey, cid, senderSalt) }
+
+        // Safe to restart at zero: the keys are new because the salt is new.
+        audioSeqTx.set(0)
+        videoSeqTx.set(0)
+        legacyPeerLogged.set(false)
+        seenPeers.clear()
+        Log.d(TAG, "Media keys ready, sid=${ownSid.toHex()}")
+        return true
+    }
+
+    /** True once a call id and K_call have produced our keys. */
+    private fun mediaReady(): Boolean =
+        ownAudioKey != null && ownVideoKey != null && helloKey != null &&
+            senderTable != null && ownSid.size == MediaKeys.SID_BYTES
+
+    private fun peerCount(): Int = synchronized(tableLock) { senderTable?.count() ?: 0 }
+
+    /**
+     * Wipe every key, salt and the master key. sodium_memzero has no Kotlin
+     * equivalent; Arrays.fill is what a JVM offers.
+     */
+    private fun clearMediaKeys() {
+        synchronized(tableLock) {
+            senderTable?.let { t ->
+                for (i in 0 until SenderTable.MAX_SLOTS) {
+                    val slot = t.slotAt(i) ?: continue
+                    for (k in slot.keys) java.util.Arrays.fill(k, 0)
+                }
+            }
+            senderTable = null
+        }
+        ownAudioKey?.let { java.util.Arrays.fill(it, 0) }
+        ownAudioKey = null
+        ownVideoKey?.let { java.util.Arrays.fill(it, 0) }
+        ownVideoKey = null
+        helloKey?.let { java.util.Arrays.fill(it, 0) }
+        helloKey = null
+        java.util.Arrays.fill(senderSalt, 0)
+        senderSalt = ByteArray(0)
+        java.util.Arrays.fill(callKey, 0)
+        callKey = ByteArray(0)
+        ownSid = ByteArray(0)
+        idbind = MediaKeys.UNSIGNED_IDBIND
+        // Cleared too: the next call needs its own id, and silently reusing
+        // this one would weaken the cross-call replay barrier it exists for.
+        callId = null
+        seenPeers.clear()
     }
 
     fun getLocalUdpPort(): Int = udpSocket?.localPort ?: 0
@@ -291,6 +434,11 @@ class VideoCallManager(
     fun startRelay(serverIp: String, serverPort: Int, room: String, name: String, localUdpPort: Int = 0) {
         if (running.get()) return
 
+        if (!mediaReady()) {
+            listener.onCallError(CALL_ID_REQUIRED)
+            return
+        }
+
         relayMode = true
         relayRoom = room
         relayName = name
@@ -352,6 +500,11 @@ class VideoCallManager(
 
         Log.d(TAG, "startCall: remote=$remoteIp:$remoteUdpPort, localPort=$localUdpPort")
 
+        if (!mediaReady()) {
+            listener.onCallError(CALL_ID_REQUIRED)
+            return
+        }
+
         try {
             remoteAddress = InetAddress.getByName(remoteIp)
             Log.d(TAG, "Resolved remote address: ${remoteAddress?.hostAddress}")
@@ -411,6 +564,11 @@ class VideoCallManager(
 
         val bindPort = if (localUdpPort > 0) localUdpPort else 50000
         Log.d(TAG, "startListen: port=$bindPort")
+
+        if (!mediaReady()) {
+            listener.onCallError(CALL_ID_REQUIRED)
+            return
+        }
 
         // Don't set remote address — will be learned from incoming HELLO
         remoteAddress = null
@@ -492,10 +650,11 @@ class VideoCallManager(
         vBuf: ByteBuffer, vRowStride: Int, vPixelStride: Int,
         srcWidth: Int, srcHeight: Int
     ) {
-        if (!running.get() || !remotePrefixReady.get()) return
+        // No readiness gate: our send keys exist as soon as the call does.
+        if (!running.get()) return
 
         val encoder = vp8Encoder ?: return
-        val vKey = videoKey ?: return
+        val vKey = ownVideoKey ?: return
 
         val pts = System.nanoTime() / 1000
         val encoded = encoder.encodePlanes(
@@ -521,20 +680,14 @@ class VideoCallManager(
      * Feed Opus-encoded audio data for sending.
      */
     fun sendAudioPacket(opusData: ByteArray) {
-        if (!running.get() || !remotePrefixReady.get()) return
-        val aKey = audioKey ?: return
+        if (!running.get()) return
+        val aKey = ownAudioKey ?: return
 
+        // Audio has its own counter domain here, unlike audio_call: video
+        // fragments and stats share the other one.
         val seq = audioSeqTx.getAndIncrement()
-        val nonce = buildNonce(localNoncePrefix, seq)
-        val encrypted = aesGcmEncrypt(opusData, aKey, nonce) ?: return
-
-        val packet = ByteBuffer.allocate(1 + 8 + encrypted.size).apply {
-            order(ByteOrder.BIG_ENDIAN)
-            put(Common.PKT_VER_AUDIO)
-            putLong(seq)
-            put(encrypted)
-        }.array()
-
+        val packet = MediaPacket.encrypt(
+            Common.PKT_VER_AUDIO.toInt(), ownSid, seq, aKey, opusData) ?: return
         sendPacket(packet)
     }
 
@@ -630,7 +783,6 @@ class VideoCallManager(
                 val bytesRead = recorder.read(pcmBuf, 0, pcmBuf.size)
                 if (bytesRead < Common.AUDIO_PCM_BYTES_PER_FRAME) continue
                 if (isMuted) continue
-                if (!remotePrefixReady.get()) continue
 
                 val encoder = opusEncoder ?: continue
 
@@ -704,15 +856,16 @@ class VideoCallManager(
         tcpSocket = null
 
         pendingFrames.clear()
-        remotePrefixReady.set(false)
         isListening.set(false)
-        remoteNoncePrefix = null
         audioSeqTx.set(0)
         videoSeqTx.set(0)
         peerVerified = false
         relayMode = false
         relayRoom = ""
         relayName = ""
+
+        // Last, once every thread that could touch a key is gone.
+        clearMediaKeys()
 
         Log.d(TAG, "Call ended. Sent=$videoPacketsSent Received=$videoPacketsReceived")
         videoPacketsSent = 0
@@ -727,16 +880,19 @@ class VideoCallManager(
         var retries = 0
         Log.d(TAG, "HELLO loop started, sending to ${remoteAddress?.hostAddress}:$remotePort")
 
-        while (running.get() && !remotePrefixReady.get() && retries < 100) {
+        // Announce until somebody is known, then stop: a peer that joins
+        // later is answered by the one reply in handleHello2. Nothing waits
+        // on this loop to start sending media.
+        while (running.get() && peerCount() == 0 && retries < 100) {
             sendHello()
             if (retries % 20 == 0) {
-                Log.d(TAG, "HELLO sent #$retries (waiting for response...)")
+                Log.d(TAG, "HELLO sent #$retries (waiting for a peer...)")
             }
             Thread.sleep(50)
             retries++
         }
 
-        if (remotePrefixReady.get()) {
+        if (peerCount() > 0) {
             Log.d(TAG, "HELLO handshake completed after $retries retries")
             Log.d(TAG, "Remote: ${remoteWidth}x${remoteHeight}@${remoteFps}")
             listener.onConnected(remoteWidth, remoteHeight, remoteFps)
@@ -747,61 +903,62 @@ class VideoCallManager(
         }
     }
 
+    /**
+     * HELLO2, type 0x7E. This binary sends audio and video, so both flags are
+     * set and the geometry fields are meaningful; IDENTITY is added when an
+     * identity is loaded.
+     */
     private fun sendHello() {
+        val hk = helloKey ?: return
+        val cid = callId ?: return
+        if (senderSalt.size != MediaKeys.SALT_BYTES) return
+
         val im = identityManager
-        val hasIdentity = im != null && im.hasIdentity()
+        val pk = if (im != null && im.hasIdentity()) im.getPublicKey() else null
+        var flags = MediaHello.FLAG_VIDEO or MediaHello.FLAG_AUDIO
+        if (pk != null) flags = flags or MediaHello.FLAG_IDENTITY
 
-        var flags: Byte = (Common.HELLO_FLAG_VIDEO.toInt() or Common.HELLO_FLAG_AUDIO.toInt()).toByte()
-        if (hasIdentity) flags = (flags.toInt() or Common.HELLO_FLAG_IDENTITY.toInt()).toByte()
+        // IdentityManager never hands out identity_sk, so this array is a
+        // placeholder: build() reads only bytes 32..63 from it, and those are
+        // the public key. The signature comes back from IdentityManager.
+        val skPlaceholder = if (pk != null) ByteArray(64).also { pk.copyInto(it, 32) } else null
 
-        // Base HELLO: [0x7F][prefix(4)][flags(1)][width(2 BE)][height(2 BE)][fps(1)] = 11 bytes
-        val baseSize = 11
-        val identitySize = if (hasIdentity) Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES else 0
-        val totalSize = baseSize + identitySize
-
-        val buf = ByteBuffer.allocate(totalSize).apply {
-            order(ByteOrder.BIG_ENDIAN)
-            put(Common.PKT_VER_HELLO)
-            put(localNoncePrefix)
-            put(flags)
-            putShort(sendWidth.toShort())
-            putShort(sendHeight.toShort())
-            put(quality.fps.toByte())
+        val packet = try {
+            MediaHello.build(
+                MediaHello.Hello(
+                    flags = flags,
+                    keyVersion = KEY_VERSION,
+                    callId = cid,
+                    senderSalt = senderSalt,
+                    width = sendWidth,
+                    height = sendHeight,
+                    fps = quality.fps,
+                ),
+                hk,
+                skPlaceholder,
+                signer = identityOps(),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "HELLO2 build failed: ${e.message}")
+            return
         }
 
-        if (hasIdentity && im != null) {
-            val pk = im.getPublicKey()
-            if (pk == null) {
-                Log.w(TAG, "Identity getPublicKey() returned null, sending without identity")
-                return sendHelloWithoutIdentity()
-            }
-            buf.put(pk)
-            // Sign the hello bytes so far
-            val helloBytes = buf.array().copyOfRange(0, baseSize + Common.IDENTITY_PK_BYTES)
-            val sig = im.sign(helloBytes)
-            if (sig != null) {
-                buf.put(sig)
-            } else {
-                Log.w(TAG, "Identity sign failed, sending without identity")
-                return sendHelloWithoutIdentity()
-            }
-        }
-
-        sendPacket(buf.array())
+        sendPacket(packet)
     }
 
-    private fun sendHelloWithoutIdentity() {
-        val flags = (Common.HELLO_FLAG_VIDEO.toInt() or Common.HELLO_FLAG_AUDIO.toInt()).toByte()
-        val buf = ByteBuffer.allocate(11).apply {
-            order(ByteOrder.BIG_ENDIAN)
-            put(Common.PKT_VER_HELLO)
-            put(localNoncePrefix)
-            put(flags)
-            putShort(sendWidth.toShort())
-            putShort(sendHeight.toShort())
-            put(quality.fps.toByte())
+    /**
+     * Signing and verification for HELLO2, delegated to IdentityManager when
+     * there is one so identity_sk never leaves it.
+     */
+    private fun identityOps(): Ed25519Ops {
+        val im = identityManager ?: return SodiumEd25519
+        return object : Ed25519Ops {
+            override fun sign(msg: ByteArray, sk: ByteArray): ByteArray =
+                im.sign(msg) ?: ByteArray(0)
+
+            override fun verify(msg: ByteArray, sig: ByteArray, pk: ByteArray): Boolean =
+                im.verify(msg, sig, pk)
         }
-        sendPacket(buf.array())
     }
 
     // --- Receive loop ---
@@ -847,20 +1004,13 @@ class VideoCallManager(
 
                 if (data.isEmpty()) continue
 
-                val pktType = data[0].toInt() and 0xFF
-
-                when (data[0]) {
-                    Common.PKT_VER_HELLO -> {
-                        Log.d(TAG, "Received HELLO (${data.size} bytes)")
-                        handleHello(data)
-                    }
-                    Common.PKT_VER_AUDIO -> handleAudioPacket(data)
-                    Common.PKT_TYPE_VIDEO_FRAG -> {
-                        videoPacketsReceived++
-                        handleVideoFragment(data)
-                    }
-                    Common.PKT_TYPE_STATS -> handleStatsPacket(data)
-                    else -> Log.w(TAG, "Unknown packet type: 0x${"%02x".format(pktType)} (${data.size} bytes)")
+                // HELLO2 (0x7E) or a pre-group HELLO (0x7F). Everything else
+                // is media, and its type byte is not trusted until the packet
+                // decrypts under some sender's key.
+                if (data[0] == MediaHello.TYPE || data[0] == MediaHello.LEGACY_TYPE) {
+                    handleMediaHello(data)
+                } else {
+                    handleMediaPacket(data)
                 }
             } catch (e: java.net.SocketTimeoutException) {
                 // Normal timeout, continue (UDP only)
@@ -877,74 +1027,143 @@ class VideoCallManager(
         Log.d(TAG, "Receive loop ended")
     }
 
-    private fun handleHello(data: ByteArray) {
-        if (data.size < 5) {
-            Log.w(TAG, "HELLO too short: ${data.size} bytes")
+    /**
+     * A verified HELLO2 installs its sender. The table decides what is new:
+     * an identical announcement is a no-op by construction, so a repeated
+     * HELLO cannot reset a replay window or swap a key out from under us.
+     */
+    private fun handleMediaHello(data: ByteArray) {
+        val hk = helloKey ?: return
+        val cid = callId ?: return
+        val table = senderTable ?: return
+
+        val res = MediaHello.parse(data, data.size, hk, signer = identityOps())
+        if (res.status != MediaHello.Status.OK) {
+            if (res.status == MediaHello.Status.ERR_LEGACY_PEER &&
+                legacyPeerLogged.compareAndSet(false, true)) {
+                // Once per call: an old peer will keep sending these.
+                Log.w(TAG, "Peer runs a pre-group build")
+                listener.onCallError("Peer runs a pre-group F.E.A.R. build and must be updated")
+            } else {
+                Log.d(TAG, "HELLO2 rejected: ${res.status}")
+            }
+            // Never answer a HELLO that failed to parse: replying would tell
+            // an off-path prober which guesses are worth repeating.
             return
         }
 
-        val prefix = data.copyOfRange(1, 5)
-        Log.d(TAG, "HELLO remote prefix: ${prefix.toHex()}")
+        val hello = res.hello ?: return
+        // The MAC key is derived from our own call id, so a foreign call id
+        // cannot reach this point. Checked anyway - it is one comparison.
+        if (!hello.callId.contentEquals(cid)) return
 
-        // Check if this is a new session (different prefix)
-        val existingPrefix = remoteNoncePrefix
-        if (existingPrefix != null && !existingPrefix.contentEquals(prefix)) {
-            Log.d(TAG, "Peer reconnected (new prefix), resetting state")
-            pendingFrames.clear()
-            vp8Decoder?.stop()
-            peerVerified = false
+        val peerIdbind = hello.pk ?: MediaKeys.UNSIGNED_IDBIND
+        val status: SenderTable.Status
+        val isNew: Boolean
+        synchronized(tableLock) {
+            val before = table.count()
+            status = table.install(hello.senderSalt, peerIdbind, hello.keyVersion).first
+            isNew = status == SenderTable.Status.OK && table.count() > before
         }
 
-        remoteNoncePrefix = prefix
-        remotePrefixReady.set(true)
+        if (status != SenderTable.Status.OK) {
+            Log.w(TAG, "HELLO2 not installed: $status")
+            return
+        }
 
-        // Parse video HELLO
-        if (data.size >= 11) {
-            val flags = data[5]
-            val bb = ByteBuffer.wrap(data, 6, 5).order(ByteOrder.BIG_ENDIAN)
-            remoteWidth = bb.short.toInt() and 0xFFFF
-            remoteHeight = bb.short.toInt() and 0xFFFF
-            remoteFps = bb.get().toInt() and 0xFF
+        if (hello.flags and MediaHello.FLAG_VIDEO != 0) {
+            remoteWidth = hello.width
+            remoteHeight = hello.height
+            remoteFps = hello.fps
+            Log.d(TAG, "Peer video: ${remoteWidth}x${remoteHeight}@${remoteFps}")
+        }
 
-            Log.d(TAG, "Peer video: ${remoteWidth}x${remoteHeight}@${remoteFps} flags=0x${"%02x".format(flags)}")
+        val pk = hello.pk
+        if (pk != null) {
+            // parse() already verified the signature over the announcement.
+            peerVerified = true
+            notePeerIdentity(pk)
+        }
 
-            // Handle identity if present
-            if ((flags.toInt() and Common.HELLO_FLAG_IDENTITY.toInt()) != 0 && !peerVerified) {
-                val sigPrefixOffset = 11
-                if (data.size >= sigPrefixOffset + Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
-                    val pk = data.copyOfRange(sigPrefixOffset, sigPrefixOffset + Common.IDENTITY_PK_BYTES)
-                    val sig = data.copyOfRange(
-                        sigPrefixOffset + Common.IDENTITY_PK_BYTES,
-                        sigPrefixOffset + Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES)
-                    val signedData = data.copyOfRange(0, sigPrefixOffset + Common.IDENTITY_PK_BYTES)
-
-                    val im = identityManager
-                    if (im != null && im.verify(signedData, sig, pk)) {
-                        peerVerified = true
-                        Log.d(TAG, "Peer identity verified: ${im.fingerprint(pk)}")
-                    } else {
-                        Log.w(TAG, "Peer identity verification FAILED")
-                    }
-                }
-            }
-        } else {
-            Log.d(TAG, "Audio-only HELLO (${data.size} bytes)")
+        if (isNew) {
+            // Exactly one reply, so the new peer learns us. A repeat installs
+            // nothing and gets no answer, which is what stops two peers from
+            // echoing HELLOs at each other forever. Nothing is reset here
+            // either: a re-announcement must not drop anyone's frames or
+            // rewind anyone's replay window.
+            Log.d(TAG, "New sender installed (${peerCount()} peers), replying with one HELLO2")
+            sendHello()
         }
     }
 
-    private fun handleAudioPacket(data: ByteArray) {
-        if (data.size < 1 + 8 + Common.AUDIO_AEAD_ABYTES) return
+    /**
+     * TOFU keyed by the peer's public key. Keying it by a display name (or by
+     * a fixed string) would let one participant's record cover another's as
+     * soon as a call has more than two people in it.
+     */
+    private fun notePeerIdentity(pk: ByteArray) {
+        val im = identityManager ?: return
+        val label = im.fpshort(pk)
+        if (!seenPeers.add(label)) return
+        Log.d(TAG, "Peer identity ${im.fingerprint(pk)} is ${im.checkPeerKey(label, pk)}")
+    }
 
-        val aKey = audioKey ?: return
-        val rPrefix = remoteNoncePrefix ?: return
+    /**
+     * One media packet: find the sender by SID, decrypt under that sender's
+     * key for this counter domain, then - and only then - offer the counter
+     * to that sender's replay window.
+     */
+    private fun handleMediaPacket(data: ByteArray) {
+        val table = senderTable ?: return
 
-        val bb = ByteBuffer.wrap(data, 1, 8).order(ByteOrder.BIG_ENDIAN)
-        val seq = bb.long
+        // The SID chooses the key. Nothing here is trusted yet, and peek() is
+        // where a runt packet is turned away.
+        val parsed = MediaPacket.peek(data) ?: return
+        val type = parsed.type
 
-        val nonce = buildNonce(rPrefix, seq)
-        val ciphertext = data.copyOfRange(9, data.size)
-        val opusData = aesGcmDecrypt(ciphertext, aKey, nonce) ?: return
+        // Counter domain, not media type: audio has its own counter, while
+        // video fragments and stats share the video counter and therefore the
+        // video key. Getting this wrong is an instant nonce collision.
+        val stream = when (type) {
+            Common.PKT_VER_AUDIO.toInt() -> MediaKeys.STREAM_AUDIO
+            Common.PKT_TYPE_VIDEO_FRAG.toInt(),
+            Common.PKT_TYPE_STATS.toInt() -> MediaKeys.STREAM_VIDEO
+            else -> return
+        }
 
+        val sid = parsed.sid
+        val counter = parsed.counter
+
+        // A 3-byte tag collides for real, so there may be two candidates.
+        val candidates = synchronized(tableLock) { table.findBySid(sid) }
+        for (idx in candidates) {
+            val key = synchronized(tableLock) { table.key(idx, stream) } ?: continue
+            val plain = MediaPacket.decrypt(data, data.size, key) ?: continue
+
+            // Authenticated only now, so only now may the window move: a
+            // forged counter that advanced it would silence the real sender.
+            val verdict = synchronized(tableLock) { table.acceptSeq(idx, stream, counter) }
+            if (verdict != SenderTable.Verdict.FRESH) {
+                Log.d(TAG, "Dropped packet from slot $idx, counter=$counter ($verdict)")
+                return
+            }
+
+            // The type byte is covered by the tag, so routing on it cannot be
+            // steered by flipping a cleartext byte in flight.
+            when (type) {
+                Common.PKT_VER_AUDIO.toInt() -> handleAudioPayload(plain)
+                Common.PKT_TYPE_VIDEO_FRAG.toInt() -> {
+                    videoPacketsReceived++
+                    handleVideoFragment(idx, plain)
+                }
+                Common.PKT_TYPE_STATS.toInt() -> handleStatsPayload(plain)
+            }
+            return
+        }
+        // Nobody installed opened it: an unknown sender, or noise.
+    }
+
+    private fun handleAudioPayload(opusData: ByteArray) {
         // Decode Opus -> PCM
         val decoder = opusDecoder ?: return
         val pcmSamples = try {
@@ -972,25 +1191,8 @@ class VideoCallManager(
         } catch (_: Exception) {}
     }
 
-    private fun handleVideoFragment(data: ByteArray) {
-        if (data.size < 1 + 8 + Common.FRAG_HEADER_SIZE + Common.AUDIO_AEAD_ABYTES) return
-
-        val vKey = videoKey ?: return
-        val rPrefix = remoteNoncePrefix ?: return
-
-        val bb = ByteBuffer.wrap(data, 1, 8).order(ByteOrder.BIG_ENDIAN)
-        val seq = bb.long
-
-        val nonce = buildNonce(rPrefix, seq)
-        val ciphertext = data.copyOfRange(9, data.size)
-        val decrypted = aesGcmDecrypt(ciphertext, vKey, nonce)
-        if (decrypted == null) {
-            if (videoPacketsReceived <= 5) {
-                Log.w(TAG, "Video decrypt FAILED seq=$seq cipherLen=${ciphertext.size}")
-            }
-            return
-        }
-
+    /** @param slot the sender this fragment authenticated as */
+    private fun handleVideoFragment(slot: Int, decrypted: ByteArray) {
         if (decrypted.size < Common.FRAG_HEADER_SIZE) return
 
         // Parse fragment header (all Big-Endian)
@@ -1005,9 +1207,16 @@ class VideoCallManager(
 
         val payload = decrypted.copyOfRange(Common.FRAG_HEADER_SIZE,
             Common.FRAG_HEADER_SIZE + minOf(fragSize, decrypted.size - Common.FRAG_HEADER_SIZE))
+        // The reassembly buffer is sized at FRAG_MAX_PAYLOAD per fragment, so
+        // an oversized one would run off the end of it.
+        if (payload.size > Common.FRAG_MAX_PAYLOAD) return
+
+        // One reassembly bucket per sender: frame ids are per sender and two
+        // of them will collide as soon as there are three participants.
+        val bucket = (slot.toLong() shl 32) or frameId
 
         // Reassemble
-        val frame = pendingFrames.getOrPut(frameId) {
+        val frame = pendingFrames.getOrPut(bucket) {
             PendingFrame(
                 frameId = frameId,
                 totalFrags = totalFrags,
@@ -1028,10 +1237,10 @@ class VideoCallManager(
             // Complete frame — calculate actual size
             val totalSize = (totalFrags - 1) * Common.FRAG_MAX_PAYLOAD + payload.size
             val completeFrame = frame.data.copyOfRange(0, totalSize)
-            pendingFrames.remove(frameId)
+            pendingFrames.remove(bucket)
 
             if (frameId <= 3) {
-                Log.d(TAG, "Complete VP8 frame #$frameId: $totalSize bytes ($totalFrags frags)")
+                Log.d(TAG, "Complete VP8 frame #$frameId from slot $slot: $totalSize bytes ($totalFrags frags)")
             }
 
             // Decode VP8
@@ -1039,18 +1248,7 @@ class VideoCallManager(
         }
     }
 
-    private fun handleStatsPacket(data: ByteArray) {
-        if (data.size < 1 + 8 + 16 + Common.AUDIO_AEAD_ABYTES) return
-
-        val vKey = videoKey ?: return
-        val rPrefix = remoteNoncePrefix ?: return
-
-        val bb = ByteBuffer.wrap(data, 1, 8).order(ByteOrder.BIG_ENDIAN)
-        val seq = bb.long
-        val nonce = buildNonce(rPrefix, seq)
-        val ciphertext = data.copyOfRange(9, data.size)
-        val decrypted = aesGcmDecrypt(ciphertext, vKey, nonce) ?: return
-
+    private fun handleStatsPayload(decrypted: ByteArray) {
         if (decrypted.size >= 16) {
             val stats = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
             val received = stats.int
@@ -1084,17 +1282,10 @@ class VideoCallManager(
             putInt(now32)                          // reserved field = our ping timestamp
         }.array()
 
+        // Stats ride the video counter, so they ride the video key with it.
         val seq = videoSeqTx.getAndIncrement()
-        val nonce = buildNonce(localNoncePrefix, seq)
-        val encrypted = aesGcmEncrypt(payload, vKey, nonce) ?: return
-
-        val packet = ByteBuffer.allocate(1 + 8 + encrypted.size).apply {
-            order(ByteOrder.BIG_ENDIAN)
-            put(Common.PKT_TYPE_STATS)
-            putLong(seq)
-            put(encrypted)
-        }.array()
-
+        val packet = MediaPacket.encrypt(
+            Common.PKT_TYPE_STATS.toInt(), ownSid, seq, vKey, payload) ?: return
         sendPacket(packet)
     }
 
@@ -1126,22 +1317,14 @@ class VideoCallManager(
             System.arraycopy(header, 0, plaintext, 0, header.size)
             System.arraycopy(fragData, 0, plaintext, header.size, fragData.size)
 
-            // Encrypt with video key
+            // Encrypt under our own video send key
             val seq = videoSeqTx.getAndIncrement()
-            val nonce = buildNonce(localNoncePrefix, seq)
-            val encrypted = aesGcmEncrypt(plaintext, vKey, nonce)
-            if (encrypted == null) {
+            val packet = MediaPacket.encrypt(
+                Common.PKT_TYPE_VIDEO_FRAG.toInt(), ownSid, seq, vKey, plaintext)
+            if (packet == null) {
                 if (videoPacketsSent < 3) Log.e(TAG, "Video encrypt failed seq=$seq")
                 continue
             }
-
-            // Build packet: [0x02][seq(8 BE)][encrypted]
-            val packet = ByteBuffer.allocate(1 + 8 + encrypted.size).apply {
-                order(ByteOrder.BIG_ENDIAN)
-                put(Common.PKT_TYPE_VIDEO_FRAG)
-                putLong(seq)
-                put(encrypted)
-            }.array()
 
             sendPacket(packet)
             videoPacketsSent++
@@ -1152,41 +1335,11 @@ class VideoCallManager(
         }
     }
 
-    // --- Crypto helpers ---
-
-    private fun buildNonce(prefix: ByteArray, seq: Long): ByteArray {
-        val nonce = ByteArray(12)
-        System.arraycopy(prefix, 0, nonce, 0, 4)
-        val bb = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
-        bb.putLong(seq)
-        System.arraycopy(bb.array(), 0, nonce, 4, 8)
-        return nonce
-    }
-
-    private fun aesGcmEncrypt(plaintext: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? {
-        return try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE,
-                SecretKeySpec(key, "AES"),
-                GCMParameterSpec(128, nonce))
-            cipher.doFinal(plaintext)
-        } catch (e: Exception) {
-            Log.e(TAG, "AES-GCM encrypt failed: ${e.message}")
-            null
-        }
-    }
-
-    private fun aesGcmDecrypt(ciphertext: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? {
-        return try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE,
-                SecretKeySpec(key, "AES"),
-                GCMParameterSpec(128, nonce))
-            cipher.doFinal(ciphertext)
-        } catch (e: Exception) {
-            null // Normal for bad packets — don't spam logs
-        }
-    }
+    // The framing - [type(1)][SID(3)][counter(5)] then AES-256-GCM with those
+    // nine bytes as AAD - lives in com.fear.crypto.MediaPacket. It used to be
+    // hand-copied into this file and into AudioCallManager, which is how two
+    // ports of one wire format drift apart; MediaPacket is pinned by the same
+    // frozen vectors as the C side.
 
     // --- Network ---
 
