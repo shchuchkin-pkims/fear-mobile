@@ -43,6 +43,21 @@ class VideoCallManager(
     private val listener: VideoCallListener
 ) {
     companion object {
+        /** Participants rendered at once, out of the 32 the key table holds. */
+        private const val MAX_MIX = 8
+        /** Jitter depth before a voice starts playing, in frames. */
+        private const val PLAYOUT_PREFILL_FRAMES = 6
+        /** Per-sender latency cap, in frames. */
+        private const val MAX_PLAYOUT_FRAMES = 20
+        /** How long the window holder may be silent before it can be taken. */
+        private const val SPEAKER_QUIET_MS = 700L
+        /** Frames a challenger must deliver to take the window. */
+        private const val SPEAKER_TAKE_FRAMES = 2
+        /** Floor on how often the window may change hands. */
+        private const val SPEAKER_DWELL_MS = 1200L
+        /** A challenger quiet this long stops being one. */
+        private const val SPEAKER_STALE_MS = 400L
+
         private const val TAG = "VCM"
 
         /** Nothing produces a nonzero key version yet. */
@@ -124,7 +139,28 @@ class VideoCallManager(
 
     // Audio
     private var opusEncoder: OpusCodec.Encoder? = null
-    private var opusDecoder: OpusCodec.Decoder? = null
+
+    /**
+     * One decoder and one jitter buffer per rendered participant.
+     *
+     * Opus carries state between frames, so a single decoder fed by several
+     * senders garbles all of them, and writing each sender straight to
+     * AudioTrack as its packets arrive has them cut each other off instead
+     * of mixing. That is the difference between the keys working for N
+     * participants and the call working for N.
+     */
+    private class MixSlot {
+        var slot: Int = -1
+        var decoder: OpusCodec.Decoder? = null
+        val ring: ArrayDeque<ShortArray> = ArrayDeque()
+        var lastMs: Long = 0
+        var prefilled: Boolean = false
+        var frames: Long = 0
+    }
+
+    private val mix = Array(MAX_MIX) { MixSlot() }
+    private val mixLock = Any()
+    private var playThread: Thread? = null
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private var audioRecordThread: Thread? = null
@@ -145,6 +181,28 @@ class VideoCallManager(
     // would splice their fragments into one broken frame.
     private val pendingFrames = HashMap<Long, PendingFrame>()
     private var frameIdCounter = 0L
+
+    /*
+     * One surface, so one participant on screen at a time.
+     *
+     * Every completed frame used to go into the single VP8 decoder whoever
+     * sent it, which decodes one stream against another stream's reference
+     * frames - the video equivalent of sharing an Opus decoder. Only the
+     * holder's frames are decoded now.
+     *
+     * The choice is sticky rather than most-recently-arrived: nothing here
+     * gates sending on speech, every camera streams continuously, so
+     * "whoever arrived last" alternates at random and any hold on top of it
+     * only sets the period of the flicker.
+     */
+    private var decoderSurface: Surface? = null
+    private var dispSlot: Int = -1
+    private var dispLastMs: Long = 0
+    private var dispSwitchMs: Long = 0
+    private var candSlot: Int = -1
+    private var candLastMs: Long = 0
+    private var candFrames: Int = 0
+    private val videoStats = HashMap<Int, Long>()
 
     // Identity
     private var identityManager: IdentityManager? = null
@@ -606,6 +664,7 @@ class VideoCallManager(
      * Attach decoder surface for rendering remote video. Can be called after startCall.
      */
     fun attachDecoderSurface(surface: Surface) {
+        decoderSurface = surface
         if (vp8Decoder != null) return // Already attached
         try {
             vp8Decoder = Vp8Decoder().also {
@@ -693,11 +752,106 @@ class VideoCallManager(
 
     // --- Audio ---
 
+    /**
+     * The decoder and jitter buffer for a sender, creating or reassigning one
+     * when this is a voice we are not currently rendering. Reassignment
+     * replaces the decoder outright, because the old one holds the displaced
+     * stream's history and would decode the new one as noise.
+     */
+    private fun mixAcquire(tableSlot: Int): MixSlot? {
+        for (m in mix) if (m.slot == tableSlot) return m
+
+        val chosen = mix.firstOrNull { it.slot < 0 } ?: run {
+            var lru = mix[0]
+            for (m in mix) if (m.lastMs < lru.lastMs) lru = m
+            lru
+        }
+
+        chosen.ring.clear()
+        chosen.decoder?.let { try { it.destroy() } catch (_: Exception) {} }
+        chosen.decoder = try {
+            OpusCodec.createDecoder(Common.AUDIO_SAMPLE_RATE, Common.AUDIO_CHANNELS)
+        } catch (e: Exception) {
+            Log.w(TAG, "no decoder for slot $tableSlot: ${e.message}")
+            null
+        }
+        if (chosen.decoder == null) { chosen.slot = -1; return null }
+
+        chosen.slot = tableSlot
+        chosen.prefilled = false
+        chosen.frames = 0
+        // Stamped now, so a voice that has only just arrived is not the
+        // victim of the very next arrival.
+        chosen.lastMs = System.currentTimeMillis()
+        return chosen
+    }
+
+    /** Release every decoder and buffer. */
+    private fun mixTeardown() {
+        synchronized(mixLock) {
+            for (m in mix) {
+                m.decoder?.let { try { it.destroy() } catch (_: Exception) {} }
+                m.decoder = null
+                m.ring.clear()
+                m.slot = -1
+                m.prefilled = false
+            }
+        }
+    }
+
+    /**
+     * Mix every rendered participant into one stream.
+     *
+     * Runs on its own thread because with several senders the receive loop
+     * fires several times per frame period and would drive the device faster
+     * than real time. AudioTrack.write blocks when its buffer is full, and
+     * that is what paces this loop - including the silent frames, which keep
+     * the device fed while nobody is speaking.
+     */
+    private fun startPlayout() {
+        if (playThread != null) return
+        playThread = Thread {
+            val n = Common.AUDIO_FRAME_SAMPLES
+            val acc = IntArray(n)
+            val out = ByteArray(n * 2)
+            while (running.get()) {
+                java.util.Arrays.fill(acc, 0)
+                synchronized(mixLock) {
+                    for (m in mix) {
+                        if (m.slot < 0) continue
+                        if (!m.prefilled) {
+                            if (m.ring.size < PLAYOUT_PREFILL_FRAMES) continue
+                            m.prefilled = true
+                        }
+                        val frame = m.ring.removeFirstOrNull()
+                        if (frame == null) { m.prefilled = false; continue }
+                        val len = minOf(n, frame.size)
+                        for (i in 0 until len) acc[i] += frame[i].toInt()
+                        m.frames++
+                    }
+                }
+
+                val track = audioTrack
+                if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
+                    try { Thread.sleep(20) } catch (_: InterruptedException) { break }
+                    continue
+                }
+                // Saturate rather than wrap: wrapping turns two loud speakers
+                // into a full-scale square wave, which is worse than clipping.
+                for (i in 0 until n) {
+                    val v = if (acc[i] > 32767) 32767 else if (acc[i] < -32768) -32768 else acc[i]
+                    out[i * 2] = (v and 0xFF).toByte()
+                    out[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                }
+                try { track.write(out, 0, out.size) } catch (_: Exception) {}
+            }
+        }.also { it.isDaemon = true; it.start() }
+    }
+
     private fun initializeAudio() {
         try {
             // Opus codecs
             opusEncoder = OpusCodec.createEncoder(Common.AUDIO_SAMPLE_RATE, Common.AUDIO_CHANNELS, Common.AC_OPUS_BITRATE)
-            opusDecoder = OpusCodec.createDecoder(Common.AUDIO_SAMPLE_RATE, Common.AUDIO_CHANNELS)
 
             // AudioRecord (microphone)
             val minRecBuf = AudioRecord.getMinBufferSize(
@@ -761,6 +915,7 @@ class VideoCallManager(
             // Start recording and playback
             audioRecord?.startRecording()
             audioTrack?.play()
+            startPlayout()
 
             // Start mic capture thread
             audioRecordThread = Thread {
@@ -844,13 +999,26 @@ class VideoCallManager(
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
+        // Who was heard and who was seen, before the pools are released.
+        synchronized(mixLock) {
+            for (m in mix) {
+                if (m.slot >= 0) Log.i(TAG, "[MEDIA] peer slot ${m.slot} mixed ${m.frames}")
+            }
+        }
+        for ((slot, frames) in videoStats) {
+            Log.i(TAG, "[VIDEO] peer slot $slot frames $frames shown ${if (slot == dispSlot) "yes" else "no"}")
+        }
+        mixTeardown()
+        videoStats.clear()
+        dispSlot = -1; candSlot = -1
+        try { playThread?.interrupt() } catch (_: Exception) {}
+        playThread = null
+
         try { audioTrack?.stop() } catch (_: Exception) {}
         try { audioTrack?.release() } catch (_: Exception) {}
         audioTrack = null
         try { opusEncoder?.destroy() } catch (_: Exception) {}
         opusEncoder = null
-        try { opusDecoder?.destroy() } catch (_: Exception) {}
-        opusDecoder = null
 
         udpSocket = null
         tcpSocket = null
@@ -1151,7 +1319,7 @@ class VideoCallManager(
             // The type byte is covered by the tag, so routing on it cannot be
             // steered by flipping a cleartext byte in flight.
             when (type) {
-                Common.PKT_VER_AUDIO.toInt() -> handleAudioPayload(plain)
+                Common.PKT_VER_AUDIO.toInt() -> handleAudioPayload(idx, plain)
                 Common.PKT_TYPE_VIDEO_FRAG.toInt() -> {
                     videoPacketsReceived++
                     handleVideoFragment(idx, plain)
@@ -1163,32 +1331,83 @@ class VideoCallManager(
         // Nobody installed opened it: an unknown sender, or noise.
     }
 
-    private fun handleAudioPayload(opusData: ByteArray) {
-        // Decode Opus -> PCM
-        val decoder = opusDecoder ?: return
-        val pcmSamples = try {
-            decoder.decode(opusData, Common.AUDIO_FRAME_SAMPLES)
+    /**
+     * Decode into this sender's own decoder and queue the frame. The play-out
+     * thread does the mixing and the writing; nothing here touches AudioTrack.
+     */
+    private fun handleAudioPayload(slot: Int, opusData: ByteArray) {
+        synchronized(mixLock) {
+            if (!running.get()) return
+            val m = mixAcquire(slot) ?: return
+            val pcm = try {
+                m.decoder?.decode(opusData, Common.AUDIO_FRAME_SAMPLES)
+            } catch (e: Exception) {
+                null
+            } ?: return
+            if (pcm.isEmpty()) return
+
+            m.ring.addLast(pcm)
+            m.lastMs = System.currentTimeMillis()
+            // One peer arriving in bursts must not add latency to another.
+            while (m.ring.size > MAX_PLAYOUT_FRAMES) m.ring.removeFirst()
+        }
+    }
+
+    /**
+     * Decide whether `slot` should own the window.
+     *
+     * Sticky, not most-recently-arrived: the holder keeps the window while
+     * its pictures keep coming, a challenger has to deliver a couple of
+     * frames after the holder has gone quiet, and no handover may follow
+     * another too closely. Without the dwell floor two cameras streaming at
+     * once simply trade the window back and forth.
+     */
+    private fun shouldShow(slot: Int, now: Long): Boolean {
+        if (dispSlot == slot) { dispLastMs = now; return true }
+
+        if (dispSlot < 0) {
+            dispSlot = slot; dispLastMs = now; dispSwitchMs = now
+            candSlot = -1; candFrames = 0
+            Log.i(TAG, "active speaker: slot $slot")
+            return true
+        }
+
+        // The holder is still talking, or the last handover is too recent.
+        if (now - dispLastMs < SPEAKER_QUIET_MS) return false
+        if (now - dispSwitchMs < SPEAKER_DWELL_MS) return false
+
+        if (candSlot != slot) {
+            // A challenger that has itself gone quiet loses its candidacy,
+            // otherwise two alternating senders reset each other forever and
+            // the window stays frozen on somebody who has left.
+            if (candSlot >= 0 && now - candLastMs < SPEAKER_STALE_MS) return false
+            candSlot = slot; candFrames = 0
+        }
+        candLastMs = now
+        candFrames++
+        if (candFrames < SPEAKER_TAKE_FRAMES) return false
+
+        val was = dispSlot
+        dispSlot = slot; dispLastMs = now; dispSwitchMs = now
+        candSlot = -1; candFrames = 0
+        Log.i(TAG, "active speaker: slot $slot (was $was)")
+
+        // The decoder holds the previous stream's reference frames, so it has
+        // to start over. Costs a wait for that sender's next keyframe.
+        restartDecoder()
+        return true
+    }
+
+    /** Recreate the VP8 decoder on the same surface, discarding its state. */
+    private fun restartDecoder() {
+        val surface = decoderSurface ?: return
+        try { vp8Decoder?.stop() } catch (_: Exception) {}
+        vp8Decoder = try {
+            Vp8Decoder().also { it.start(surface, quality.width, quality.height) }
         } catch (e: Exception) {
-            return
+            Log.e(TAG, "decoder restart failed", e)
+            null
         }
-        if (pcmSamples.isEmpty()) return
-
-        // Convert shorts to bytes (little-endian PCM16)
-        val audioData = ByteArray(pcmSamples.size * 2)
-        for (i in pcmSamples.indices) {
-            val s = pcmSamples[i].toInt()
-            audioData[i * 2] = (s and 0xFF).toByte()
-            audioData[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
-        }
-
-        // Write to AudioTrack
-        try {
-            val track = audioTrack
-            if (track != null && track.state == AudioTrack.STATE_INITIALIZED
-                && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                track.write(audioData, 0, audioData.size)
-            }
-        } catch (_: Exception) {}
     }
 
     /** @param slot the sender this fragment authenticated as */
@@ -1243,8 +1462,13 @@ class VideoCallManager(
                 Log.d(TAG, "Complete VP8 frame #$frameId from slot $slot: $totalSize bytes ($totalFrags frags)")
             }
 
-            // Decode VP8
-            vp8Decoder?.decode(completeFrame, System.nanoTime() / 1000)
+            videoStats[slot] = (videoStats[slot] ?: 0L) + 1
+
+            // One surface, so one participant: feeding every sender into the
+            // single decoder is what made three cameras look broken.
+            if (shouldShow(slot, System.currentTimeMillis())) {
+                vp8Decoder?.decode(completeFrame, System.nanoTime() / 1000)
+            }
         }
     }
 
