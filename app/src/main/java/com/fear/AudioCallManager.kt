@@ -1656,9 +1656,18 @@ class AudioCallManager(
             val pingTs = bb.int   // peer's timestamp
             val pongTs = bb.int   // echo of our last timestamp
 
+            // The echo is addressed to nobody: a participant echoes whichever
+            // peer it heard from last and everyone receives it, so in a group
+            // call most echoes carry a timestamp from a third machine's clock.
+            // Subtracting that from ours gives the gap between two uptimes -
+            // on a live three-way call it read as 248084855 ms and pinned the
+            // whole call at the lowest quality. Foreign values land anywhere
+            // in the 32-bit millisecond range, so only a plausible one can be
+            // ours. It is a real round trip to whichever peer echoed us last.
             if (pongTs != 0) {
                 val now32 = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
-                measuredRttMs = now32 - pongTs
+                val rtt = now32 - pongTs
+                if (rtt in 0..RTT_SANE_MAX_MS) measuredRttMs = rtt
                 handler.post { listener.onStatsUpdated(measuredRttMs) }
             }
             lastPeerPingTs = pingTs
@@ -1899,6 +1908,8 @@ class AudioCallManager(
     }
 
     private companion object {
+        /** Above this it is somebody else's clock, not a round trip. */
+        const val RTT_SANE_MAX_MS = 5000
         /** Beacon period while nobody has answered. */
         const val HELLO_RETRY_MS = 250L
         /** Beacon period once somebody has, matching audio_call's keepalive. */
