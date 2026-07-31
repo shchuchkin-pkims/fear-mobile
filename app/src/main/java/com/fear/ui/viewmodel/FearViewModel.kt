@@ -338,6 +338,31 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             _uiState.update { it.copy(errorBanner = "File transfer failed: $error") }
         }
         override fun onCallRequestReceived(fromUser: String) {}
+
+        /**
+         * Somebody announced a call. Until now this arrived, was remembered
+         * so that pressing the call button would join the right call, and
+         * was never shown - so a call looked like nothing at all from the
+         * other side.
+         */
+        override fun onCallInviteReceived(
+            fromUser: String,
+            invite: com.fear.crypto.CallInvite.Invite,
+        ) {
+            // Do not ring during a call we are already in: the announcement
+            // is repeated while a caller waits, and the room broadcast comes
+            // back to every member.
+            if (_uiState.value.call.active) return
+            _uiState.update {
+                it.copy(
+                    incomingCall = IncomingCall(fromUser, invite.hasVideo),
+                    messages = it.messages + ChatMessage(
+                        sender = "", timestamp = Instant.now(), isSystem = true,
+                        text = if (invite.hasVideo) "\uD83D\uDCF9 $fromUser is calling (video)"
+                               else "\uD83D\uDCDE $fromUser is calling"),
+                )
+            }
+        }
     }
 
     private val client: FearClient = FearClient(app.applicationContext, listener)
@@ -992,6 +1017,22 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch(Dispatchers.IO) { client.startAudioRelay(keyBytes) }
         _uiState.update { it.copy(call = it.call.copy(active = true)) }
+    }
+
+    /**
+     * Answer the announced call. startAudioCall joins the call_id from the
+     * invite, because it is still fresh - that is what puts both ends on the
+     * same keys.
+     */
+    fun acceptIncomingCall() {
+        val incoming = _uiState.value.incomingCall ?: return
+        _uiState.update { it.copy(incomingCall = null) }
+        if (!incoming.video) startAudioCall()
+    }
+
+    /** Decline: the caller is not told, there is no protocol message for it. */
+    fun dismissIncomingCall() {
+        _uiState.update { it.copy(incomingCall = null) }
     }
 
     fun endAudioCall() {

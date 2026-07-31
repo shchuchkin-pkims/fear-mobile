@@ -51,6 +51,18 @@ data class CallState(
     val rttMs: Int = 0,
 )
 
+/**
+ * A call somebody in the room has announced and we have not answered yet.
+ *
+ * The announcement carries the call_id every media key of that call is bound
+ * to, so answering means joining *that* call rather than starting a second
+ * one nobody else is keyed to.
+ */
+data class IncomingCall(
+    val fromUser: String,
+    val video: Boolean,
+)
+
 data class ChatUiState(
     val isConnected: Boolean = false,
     val isConnecting: Boolean = false,
@@ -60,6 +72,8 @@ data class ChatUiState(
     val statusText: String = "",
     val errorBanner: String? = null,
     val call: CallState = CallState(),
+    /** Non-null while a room member is calling and we have not answered. */
+    val incomingCall: IncomingCall? = null,
     /** Если установлено — UI чата должен прокрутить список к сообщению с
      *  этим timestamp и кратко подсветить его. Используется при переходе
      *  по результату поиска. После применения сбрасывается ViewModel-ом. */

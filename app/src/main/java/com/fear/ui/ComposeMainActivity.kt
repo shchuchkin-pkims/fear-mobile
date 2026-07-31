@@ -710,6 +710,45 @@ class ComposeMainActivity : ComponentActivity() {
                     }
                 }
 
+                /* Входящий звонок. Раньше приглашение приходило, молча
+                 * запоминалось - и звонок с другой стороны выглядел как
+                 * ничего. Отвечаем именно на объявленный call_id: к нему
+                 * привязаны все ключи этого звонка. */
+                val incoming = state.incomingCall
+                if (incoming != null) {
+                    androidx.compose.material3.AlertDialog(
+                        onDismissRequest = { viewModel.dismissIncomingCall() },
+                        title = {
+                            androidx.compose.material3.Text(
+                                if (incoming.video) "Incoming video call"
+                                else "Incoming call")
+                        },
+                        text = {
+                            androidx.compose.material3.Text(
+                                if (incoming.video)
+                                    "${incoming.fromUser} is calling with video. " +
+                                    "Video calls are answered from the video screen."
+                                else
+                                    "${incoming.fromUser} is calling.")
+                        },
+                        confirmButton = {
+                            if (!incoming.video) {
+                                androidx.compose.material3.TextButton(
+                                    onClick = { viewModel.acceptIncomingCall() }
+                                ) { androidx.compose.material3.Text("Answer") }
+                            }
+                        },
+                        dismissButton = {
+                            androidx.compose.material3.TextButton(
+                                onClick = { viewModel.dismissIncomingCall() }
+                            ) {
+                                androidx.compose.material3.Text(
+                                    if (incoming.video) "OK" else "Decline")
+                            }
+                        },
+                    )
+                }
+
                 /* Диалог регистрации handle. Открывается из ProfileScreen
                  * («Add server handle»), из ConnectScreen («Register»),
                  * и в потенциальных будущих сценариях — общий для всех. */
