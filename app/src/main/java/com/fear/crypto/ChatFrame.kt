@@ -31,8 +31,27 @@ import com.fear.Crypto
  */
 object ChatFrame {
 
-    /** K_room generation on the wire. Zero until rotation bundles land. */
+    /** K_room generation used when the caller has not been told otherwise. */
     const val KEY_VERSION = 0
+
+    /**
+     * One generation of K_room.
+     *
+     * Sealing takes exactly one - the current generation, never an old one.
+     * Opening takes a small set, because a rotation does not stop the
+     * messages already in flight under the generation it replaces: they
+     * arrive after it and would be refused by a receiver that had already
+     * forgotten how to read them.
+     */
+    data class RoomKey(val version: Int, val key: ByteArray) {
+        override fun equals(other: Any?): Boolean =
+            other is RoomKey && version == other.version && key.contentEquals(other.key)
+
+        override fun hashCode(): Int = 31 * version + key.contentHashCode()
+    }
+
+    /** Generations a receiver may hold at once. */
+    const val MAX_KEYS = 2
 
     /** AES-256-GCM authentication tag, in bytes. */
     const val TAG_BYTES = 16
@@ -64,17 +83,16 @@ object ChatFrame {
      * the format against the C implementation and against a third one.
      */
     fun sealAt(
-        kRoom: ByteArray,
+        key: RoomKey,
         room: ByteArray,
         name: ByteArray,
         plain: ByteArray,
         nonce: ByteArray,
-        keyVersion: Int,
         epoch: Long,
         hash: KeyedHash = SodiumKeyedHash,
     ): ByteArray? {
-        val header = KeySchedule.writeHeader(keyVersion, epoch)
-        val kEpoch = KeySchedule.deriveEpochKey(kRoom, keyVersion, epoch, hash)
+        val header = KeySchedule.writeHeader(key.version, epoch)
+        val kEpoch = KeySchedule.deriveEpochKey(key.key, key.version, epoch, hash)
         try {
             val ct = Crypto.encrypt(plain, ad(room, name, header), nonce, kEpoch) ?: return null
             return header + ct
@@ -85,14 +103,14 @@ object ChatFrame {
 
     /** Seal for the current hour and the current K_room generation. */
     fun seal(
-        kRoom: ByteArray,
+        key: RoomKey,
         room: ByteArray,
         name: ByteArray,
         plain: ByteArray,
         nonce: ByteArray,
         nowSeconds: Long = System.currentTimeMillis() / 1000L,
         hash: KeyedHash = SodiumKeyedHash,
-    ): ByteArray? = sealAt(kRoom, room, name, plain, nonce, KEY_VERSION,
+    ): ByteArray? = sealAt(key, room, name, plain, nonce,
                            KeySchedule.epochFromUnix(nowSeconds), hash)
 
     /**
@@ -104,7 +122,7 @@ object ChatFrame {
      * however well it authenticates.
      */
     fun openAt(
-        kRoom: ByteArray,
+        keys: List<RoomKey>,
         room: ByteArray,
         name: ByteArray,
         sealed: ByteArray,
@@ -112,10 +130,14 @@ object ChatFrame {
         localEpoch: Long,
         hash: KeyedHash = SodiumKeyedHash,
     ): ByteArray? {
+        if (keys.isEmpty()) return null
         if (sealed.size < KeySchedule.HEADER_BYTES + TAG_BYTES) return null
 
         val (version, epoch) = KeySchedule.readHeader(sealed)
-        if (version != KEY_VERSION) return null
+        // Both checks come before the derivation: somebody able to name a
+        // generation or an epoch should not be able to make us derive
+        // anything at all.
+        val kRoom = keys.firstOrNull { it.version == version }?.key ?: return null
         if (!KeySchedule.epochAcceptable(epoch, localEpoch)) return null
 
         val kEpoch = KeySchedule.deriveEpochKey(kRoom, version, epoch, hash)
@@ -130,13 +152,13 @@ object ChatFrame {
 
     /** Open, taking the local epoch from the clock. */
     fun open(
-        kRoom: ByteArray,
+        keys: List<RoomKey>,
         room: ByteArray,
         name: ByteArray,
         sealed: ByteArray,
         nonce: ByteArray,
         nowSeconds: Long = System.currentTimeMillis() / 1000L,
         hash: KeyedHash = SodiumKeyedHash,
-    ): ByteArray? = openAt(kRoom, room, name, sealed, nonce,
+    ): ByteArray? = openAt(keys, room, name, sealed, nonce,
                            KeySchedule.epochFromUnix(nowSeconds), hash)
 }

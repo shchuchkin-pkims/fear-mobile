@@ -282,7 +282,7 @@ class FearClient(
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ciphertext = ChatFrame.seal(roomKey ?: return, roomBytes, nameBytes, plaintext, nonce) ?: return
+        val ciphertext = ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, roomKey ?: return), roomBytes, nameBytes, plaintext, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, Common.MSG_TYPE_TEXT, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -1079,7 +1079,7 @@ class FearClient(
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ciphertext = ChatFrame.seal(roomKey ?: return, roomBytes, nameBytes, payload, nonce) ?: return
+        val ciphertext = ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, roomKey ?: return), roomBytes, nameBytes, payload, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -1115,7 +1115,7 @@ class FearClient(
 
             val key = roomKey
             val ciphertext = if (key == null) null
-                             else ChatFrame.seal(key, roomBytes, nameBytes, plaintext, nonce)
+                             else ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, key), roomBytes, nameBytes, plaintext, nonce)
             if (ciphertext == null) {
                 notifyError("Encryption failed")
                 return
@@ -1227,7 +1227,7 @@ class FearClient(
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
         val key = roomKey ?: return false
-        val ciphertext = ChatFrame.seal(key, roomBytes, nameBytes, payload, nonce)
+        val ciphertext = ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, key), roomBytes, nameBytes, payload, nonce)
             ?: return false
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         return Common.sendAll(socket, frame)
@@ -1378,8 +1378,13 @@ class FearClient(
 
             // Sealed: [key_version(2)][epoch(4)][AEAD]
             val key = roomKey
-            val plaintext = if (key == null) null else ChatFrame.open(
-                key, roomBuf.copyOf(roomLen), nameBuf.copyOf(nameLen),
+            /* A set, not a key: once rotation lands a receiver has to be
+             * able to read what was already in flight under the generation
+             * being replaced. There is one entry for now. */
+            val ring = if (key == null) null
+                       else listOf(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, key))
+            val plaintext = if (ring == null) null else ChatFrame.open(
+                ring, roomBuf.copyOf(roomLen), nameBuf.copyOf(nameLen),
                 ciphertext, nonce)
             if (plaintext == null) {
                 return true
