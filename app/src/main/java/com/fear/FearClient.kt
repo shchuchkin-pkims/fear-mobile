@@ -1,6 +1,8 @@
 package com.fear
 
 import com.fear.crypto.CallInvite
+import com.fear.crypto.ChatFrame
+import com.fear.crypto.KeySchedule
 import com.fear.crypto.MediaKeys
 
 import android.content.Context
@@ -280,8 +282,7 @@ class FearClient(
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ad = buildAd(roomBytes, nameBytes)
-        val ciphertext = Crypto.encrypt(plaintext, ad, nonce, roomKey) ?: return
+        val ciphertext = ChatFrame.seal(roomKey ?: return, roomBytes, nameBytes, plaintext, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, Common.MSG_TYPE_TEXT, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -881,18 +882,26 @@ class FearClient(
 
     // --- Send helpers ---
 
-    private fun buildAd(roomBytes: ByteArray, nameBytes: ByteArray): ByteArray {
-        val ad = ByteArray(2 + roomBytes.size + 2 + nameBytes.size)
-        var offset = 0
-        Common.writeUInt16(ad, offset, roomBytes.size)
-        offset += 2
-        System.arraycopy(roomBytes, 0, ad, offset, roomBytes.size)
-        offset += roomBytes.size
-        Common.writeUInt16(ad, offset, nameBytes.size)
-        offset += 2
-        System.arraycopy(nameBytes, 0, ad, offset, nameBytes.size)
-        return ad
-    }
+    /**
+     * Additional data: what the server routes on, plus the six bytes that
+     * name the key. Binding the header means a relay can read it for nothing
+     * and cannot move a message to another epoch without the AEAD noticing.
+     */
+    /*
+     * Chat frames are sealed under an epoch key, not under K_room itself:
+     *
+     *     K_epoch = BLAKE2b(key = K_room, "fear.epoch.v1" || version || epoch)
+     *
+     * derived from the clock by every member independently, nothing
+     * exchanged. The six bytes naming it travel in front of the ciphertext,
+     * where the server - which reads msg_type and the length at fixed offsets
+     * and treats the ciphertext as opaque - neither sees a change nor needs
+     * to understand the schedule.
+     *
+     * key_version is zero until rotation bundles land. K_room has no
+     * generation counter yet, and a number nothing maintains would be worse
+     * on the wire than the honest zero.
+     */
 
     /**
      * Announce a call to the room.
@@ -1002,8 +1011,7 @@ class FearClient(
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ad = buildAd(roomBytes, nameBytes)
-        val ciphertext = Crypto.encrypt(payload, ad, nonce, roomKey) ?: return
+        val ciphertext = ChatFrame.seal(roomKey ?: return, roomBytes, nameBytes, payload, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -1014,7 +1022,6 @@ class FearClient(
             val nonce = Crypto.generateNonce()
             val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
             val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-            val ad = buildAd(roomBytes, nameBytes)
 
             // If we have identity, send as SIGNED_TEXT
             val im = identityManager
@@ -1038,7 +1045,9 @@ class FearClient(
                 Log.w("FearClient", "No identity: im=${im != null}, hasIdentity=${im?.hasIdentity()}, sending TEXT (type=0)")
             }
 
-            val ciphertext = Crypto.encrypt(plaintext, ad, nonce, roomKey)
+            val key = roomKey
+            val ciphertext = if (key == null) null
+                             else ChatFrame.seal(key, roomBytes, nameBytes, plaintext, nonce)
             if (ciphertext == null) {
                 notifyError("Encryption failed")
                 return
@@ -1149,8 +1158,9 @@ class FearClient(
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ad = buildAd(roomBytes, nameBytes)
-        val ciphertext = Crypto.encrypt(payload, ad, nonce, roomKey) ?: return false
+        val key = roomKey ?: return false
+        val ciphertext = ChatFrame.seal(key, roomBytes, nameBytes, payload, nonce)
+            ?: return false
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         return Common.sendAll(socket, frame)
     }
@@ -1298,19 +1308,11 @@ class FearClient(
             // Skip own messages
             if (senderName == clientName) return true
 
-            // Build AD for decryption
-            val ad = ByteArray(2 + roomLen + 2 + nameLen)
-            var offset = 0
-            Common.writeUInt16(ad, offset, roomLen)
-            offset += 2
-            System.arraycopy(roomBuf, 0, ad, offset, roomLen)
-            offset += roomLen
-            Common.writeUInt16(ad, offset, nameLen)
-            offset += 2
-            System.arraycopy(nameBuf, 0, ad, offset, nameLen)
-
-            // Decrypt
-            val plaintext = Crypto.decrypt(ciphertext, ad, nonce, roomKey)
+            // Sealed: [key_version(2)][epoch(4)][AEAD]
+            val key = roomKey
+            val plaintext = if (key == null) null else ChatFrame.open(
+                key, roomBuf.copyOf(roomLen), nameBuf.copyOf(nameLen),
+                ciphertext, nonce)
             if (plaintext == null) {
                 return true
             }
