@@ -244,7 +244,7 @@ class FearClient(
                         "[join] Requesting room key via ECDH exchange...", System.currentTimeMillis()))
                     val receivedKey = ecdhJoinRoom(s, joinTimeoutMs)
                     if (receivedKey == null) {
-                        notifyError("Key exchange failed: no response (timeout)")
+                        notifyError(joinFailureText(lastJoinFailure))
                         socket?.close()
                         socket = null
                         isConnected = false
@@ -650,6 +650,35 @@ class FearClient(
      * Perform ECDH key exchange as joiner: send KEY_REQUEST, wait for KEY_RESPONSE.
      * Returns the room key on success, null on failure/timeout.
      */
+    /**
+     * Why a join gave up. Every one of these used to be reported as a
+     * timeout, which is how "Key exchange failed: no response (timeout)"
+     * came to appear 124 ms after the request went out - a quarter of a
+     * second is not a timeout, and being told it was sent the search in
+     * exactly the wrong direction.
+     */
+    private enum class JoinFailure {
+        /** Nobody answered within the window. The only honest timeout. */
+        TIMED_OUT,
+        /** The connection went away underneath us. */
+        DISCONNECTED,
+        /** A frame we cannot resynchronise after: declared lengths past our
+         *  limits, so we no longer know where the next frame begins. */
+        PROTOCOL,
+        /** Somebody answered and the answer did not verify. */
+        REJECTED,
+    }
+
+    private fun joinFailureText(f: JoinFailure): String = when (f) {
+        JoinFailure.TIMED_OUT -> "Key exchange failed: nobody in the room answered in time"
+        JoinFailure.DISCONNECTED -> "Key exchange failed: the connection closed"
+        JoinFailure.PROTOCOL -> "Key exchange failed: unreadable frame from the server"
+        JoinFailure.REJECTED -> "Key exchange failed: the answer did not verify"
+    }
+
+    /** Set by ecdhJoinRoom when it returns null, so the caller can say why. */
+    private var lastJoinFailure: JoinFailure = JoinFailure.TIMED_OUT
+
     private fun ecdhJoinRoom(socket: Socket, timeoutMs: Int = 30000): ByteArray? {
         val ls = LazySodiumAndroid(SodiumAndroid())
         val myPk = ByteArray(Common.CRYPTO_BOX_PUBLICKEYBYTES)
@@ -662,46 +691,81 @@ class FearClient(
 
         val oldTimeout = socket.soTimeout
         socket.soTimeout = timeoutMs
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        /* A failed read is either the window closing or the peer going away,
+         * and the two deserve different words. Anything else that stops us is
+         * a frame we cannot resynchronise after. */
+        fun readFailure(): JoinFailure =
+            if (System.currentTimeMillis() >= deadline) JoinFailure.TIMED_OUT
+            else JoinFailure.DISCONNECTED
 
         try {
             while (true) {
                 // Read frame header
                 val roomLenBuf = ByteArray(2)
-                if (!Common.recvAll(socket, roomLenBuf, 2)) return null
+                if (!Common.recvAll(socket, roomLenBuf, 2)) { lastJoinFailure = readFailure(); return null }
                 val roomLen = Common.readUInt16(roomLenBuf, 0)
-                if (roomLen > Common.MAX_ROOM) return null
+                if (roomLen > Common.MAX_ROOM) { lastJoinFailure = JoinFailure.PROTOCOL; return null }
 
                 val roomBuf = ByteArray(roomLen)
-                if (!Common.recvAll(socket, roomBuf, roomLen)) return null
+                if (!Common.recvAll(socket, roomBuf, roomLen)) { lastJoinFailure = readFailure(); return null }
                 val room = String(roomBuf, Charsets.UTF_8)
 
                 val nameLenBuf = ByteArray(2)
-                if (!Common.recvAll(socket, nameLenBuf, 2)) return null
+                if (!Common.recvAll(socket, nameLenBuf, 2)) { lastJoinFailure = readFailure(); return null }
                 val nameLen = Common.readUInt16(nameLenBuf, 0)
-                if (nameLen > Common.MAX_NAME) return null
+                if (nameLen > Common.MAX_NAME) { lastJoinFailure = JoinFailure.PROTOCOL; return null }
 
                 val nameBuf = ByteArray(nameLen)
-                if (!Common.recvAll(socket, nameBuf, nameLen)) return null
+                if (!Common.recvAll(socket, nameBuf, nameLen)) { lastJoinFailure = readFailure(); return null }
                 val senderName = String(nameBuf, Charsets.UTF_8)
 
                 val nonceLenBuf = ByteArray(2)
-                if (!Common.recvAll(socket, nonceLenBuf, 2)) return null
+                if (!Common.recvAll(socket, nonceLenBuf, 2)) { lastJoinFailure = readFailure(); return null }
                 val nonceLen = Common.readUInt16(nonceLenBuf, 0)
-                if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) return null
+                /* Not our frame, but still a well-formed one: read past it
+                 * rather than abandoning the join. Aborting here reported a
+                 * timeout for what was only an unfamiliar message. */
+                if (nonceLen > Common.MAX_FRAME) {
+                    lastJoinFailure = JoinFailure.PROTOCOL
+                    return null
+                }
+                if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) {
+                    val skip = ByteArray(nonceLen)
+                    if (!Common.recvAll(socket, skip, nonceLen)) {
+                        lastJoinFailure = readFailure(); return null
+                    }
+                    val t = ByteArray(1)
+                    val cl = ByteArray(4)
+                    if (!Common.recvAll(socket, t, 1) || !Common.recvAll(socket, cl, 4)) {
+                        lastJoinFailure = readFailure(); return null
+                    }
+                    val n = Common.readUInt32(cl, 0).toInt()
+                    if (n > Common.MAX_FRAME) {
+                        lastJoinFailure = JoinFailure.PROTOCOL
+                        return null
+                    }
+                    val body = ByteArray(n)
+                    if (!Common.recvAll(socket, body, n)) {
+                        lastJoinFailure = readFailure(); return null
+                    }
+                    continue
+                }
 
                 val nonce = ByteArray(nonceLen)
-                if (!Common.recvAll(socket, nonce, nonceLen)) return null
+                if (!Common.recvAll(socket, nonce, nonceLen)) { lastJoinFailure = readFailure(); return null }
 
                 val typeBuf = ByteArray(1)
-                if (!Common.recvAll(socket, typeBuf, 1)) return null
+                if (!Common.recvAll(socket, typeBuf, 1)) { lastJoinFailure = readFailure(); return null }
 
                 val clenBuf = ByteArray(4)
-                if (!Common.recvAll(socket, clenBuf, 4)) return null
+                if (!Common.recvAll(socket, clenBuf, 4)) { lastJoinFailure = readFailure(); return null }
                 val clen = Common.readUInt32(clenBuf, 0).toInt()
-                if (clen > Common.MAX_FRAME) return null
+                if (clen > Common.MAX_FRAME) { lastJoinFailure = JoinFailure.PROTOCOL; return null }
 
                 val payload = ByteArray(clen)
-                if (!Common.recvAll(socket, payload, clen)) return null
+                if (!Common.recvAll(socket, payload, clen)) { lastJoinFailure = readFailure(); return null }
 
                 // Check if this is a KEY_RESPONSE service message
                 val isZeroNonce = nonce.all { it == 0.toByte() }
@@ -789,6 +853,10 @@ class FearClient(
                         "[join] Aborting key exchange - room key not accepted.",
                         System.currentTimeMillis()))
                     java.util.Arrays.fill(mySk, 0.toByte())
+                    // Somebody answered and the answer did not verify. Saying
+                    // "nobody answered" here would be the opposite of true,
+                    // and this is the case where it matters most.
+                    lastJoinFailure = JoinFailure.REJECTED
                     return null
                 }
 
