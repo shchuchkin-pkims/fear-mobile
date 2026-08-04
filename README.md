@@ -8,7 +8,7 @@
 
 *Бояться - это нормально...*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)]()
 [![API](https://img.shields.io/badge/API-24%2B-brightgreen.svg)]()
 [![Kotlin](https://img.shields.io/badge/Kotlin-1.9-blue.svg)](https://kotlinlang.org)
@@ -179,7 +179,11 @@ The desktop F.E.A.R. application (Linux/Windows) with GUI and CLI is available a
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+F.E.A.R. Mobile is a client application and is licensed under the
+**GNU General Public License v3.0 or later** - see [LICENSE](LICENSE).
+
+The F.E.A.R. server is licensed separately under the AGPL-3.0; see the
+[main repository](https://github.com/shchuchkin-pkims/fear/blob/main/LICENSING.md).
 
 ## Acknowledgments
 
