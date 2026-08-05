@@ -62,10 +62,11 @@ import com.fear.ui.viewmodel.FearViewModel
 
 private data class ServerOption(val label: String, val host: String)
 private val ServerPresets = listOf(
-    // Меппел первым: это сервер по умолчанию, и первый пункт списка - то,
-    // что видит человек, никогда этот список не открывавший.
-    ServerOption("77.221.145.132 — Netherlands (Meppel)", "77.221.145.132"),
+    // Порядок в списке и значение по умолчанию - разные вещи, и здесь они
+    // намеренно разведены: в списке первой идёт Москва, а подставляется в
+    // поле Меппел (см. ChatUiState.host).
     ServerOption("fear-project.ru — Russia (Moscow)",     "fear-project.ru"),
+    ServerOption("77.221.145.132 — Netherlands (Meppel)", "77.221.145.132"),
 )
 
 /**
