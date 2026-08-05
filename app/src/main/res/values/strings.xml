@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">F.E.A.R.</string>
+    <string name="date_today">Today</string>
+    <string name="date_yesterday">Yesterday</string>
 </resources>

@@ -584,7 +584,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
         sendButton.setOnClickListener { sendMessage() }
         findViewById<Button>(R.id.clearChatButton).setOnClickListener {
             messages.clear()
-            messagesAdapter.notifyDataSetChanged()
+            messagesAdapter.reload()
         }
 
         showConnectionLayout()
@@ -886,7 +886,7 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
             connectButton.isEnabled = true
             disconnectButton.isEnabled = false
             messages.clear()
-            messagesAdapter.notifyDataSetChanged()
+            messagesAdapter.reload()
             // Stop foreground service
             ChatService.stop(this)
         }
@@ -895,8 +895,10 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
     override fun onMessageReceived(message: Message) {
         runOnUiThread {
             messages.add(message)
-            messagesAdapter.notifyItemInserted(messages.size - 1)
-            messagesRecyclerView.scrollToPosition(messages.size - 1)
+            /* Позиция в ленте - не индекс сообщения: перед первым сообщением
+             * нового дня встаёт ещё и строка с датой. */
+            messagesAdapter.appended()
+            messagesRecyclerView.scrollToPosition(messagesAdapter.itemCount - 1)
         }
     }
 
@@ -942,10 +944,89 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
     }
 }
 
+/**
+ * Сообщения, разделённые датами.
+ *
+ * Лента состоит не только из сообщений: перед первым сообщением каждого дня
+ * стоит строка с датой. Без неё по одному времени «14:03» не понять, когда
+ * это было: в открытой сессии лента живёт сколько угодно долго и спокойно
+ * переваливает за полночь.
+ *
+ * Список дат адаптер строит сам, поэтому снаружи по-прежнему передаётся
+ * просто список сообщений; меняется только то, что о добавлении и очистке
+ * ему нужно сказать явно, ведь одному сообщению могут отвечать две строки.
+ */
 class MessagesAdapter(
     private val messages: List<Message>,
     var localName: String = ""
-) : RecyclerView.Adapter<MessagesAdapter.MessageViewHolder>() {
+) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+
+    /** Строка ленты: либо дата, либо само сообщение. */
+    private sealed class Row {
+        class Date(val timestamp: Long) : Row()
+        class Bubble(val message: Message) : Row()
+    }
+
+    private val rows = mutableListOf<Row>()
+    private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+
+    init {
+        rebuild()
+    }
+
+    /** Список сообщений заменили или очистили. */
+    fun reload() {
+        rebuild()
+        notifyDataSetChanged()
+    }
+
+    /**
+     * В конец списка добавили одно сообщение.
+     *
+     * Оно даёт одну строку, а если это первое сообщение нового дня - две,
+     * вместе с датой над ним. Обе всегда в конце, поэтому достаточно
+     * сообщить о добавленном хвосте.
+     */
+    fun appended() {
+        val before = rows.size
+        rebuild()
+        val added = rows.size - before
+        if (added > 0) notifyItemRangeInserted(before, added) else notifyDataSetChanged()
+    }
+
+    private fun rebuild() {
+        rows.clear()
+        val calendar = Calendar.getInstance()
+        var lastDay = Long.MIN_VALUE
+        for (message in messages) {
+            val day = dayOf(calendar, message.timestamp)
+            if (day != lastDay) {
+                rows.add(Row.Date(message.timestamp))
+                lastDay = day
+            }
+            rows.add(Row.Bubble(message))
+        }
+    }
+
+    /**
+     * Номер местного календарного дня.
+     *
+     * Сравнивать сами метки времени нельзя: полночь у пользователя и полночь
+     * по UTC - разные моменты, и на границе суток дата уехала бы на день.
+     */
+    private fun dayOf(calendar: Calendar, timestamp: Long): Long {
+        calendar.timeInMillis = timestamp
+        return calendar.get(Calendar.YEAR) * 1000L + calendar.get(Calendar.DAY_OF_YEAR)
+    }
+
+    override fun getItemCount(): Int = rows.size
+
+    override fun getItemViewType(position: Int): Int =
+        if (rows[position] is Row.Date) TYPE_DATE else TYPE_MESSAGE
+
+    class DateViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        val dateTextView: TextView = itemView.findViewById(R.id.dateHeaderTextView)
+    }
 
     class MessageViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         val messageBubble: View = itemView.findViewById(R.id.messageBubble)
@@ -954,19 +1035,56 @@ class MessagesAdapter(
         val timeTextView: TextView = itemView.findViewById(R.id.timeTextView)
     }
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MessageViewHolder {
-        val view = android.view.LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_message, parent, false)
-        return MessageViewHolder(view)
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+        val inflater = android.view.LayoutInflater.from(parent.context)
+        return if (viewType == TYPE_DATE) {
+            DateViewHolder(inflater.inflate(R.layout.item_date_header, parent, false))
+        } else {
+            MessageViewHolder(inflater.inflate(R.layout.item_message, parent, false))
+        }
     }
 
-    override fun onBindViewHolder(holder: MessageViewHolder, position: Int) {
-        val message = messages[position]
-        val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+        when (val row = rows[position]) {
+            is Row.Date -> (holder as DateViewHolder).dateTextView.text =
+                dateLabel(holder.itemView.context, row.timestamp)
+            is Row.Bubble -> bindMessage(holder as MessageViewHolder, row.message)
+        }
+    }
 
+    /**
+     * «Today», «Yesterday» или сама дата.
+     *
+     * Порядок частей даты берётся из локали через getBestDateTimePattern: из
+     * одного и того же скелета выходит «5 августа» по-русски и «August 5»
+     * по-английски. Год пишется только тогда, когда он не нынешний - иначе
+     * он в каждой строке и ни о чём не говорит.
+     */
+    private fun dateLabel(context: Context, timestamp: Long): String {
+        val calendar = Calendar.getInstance()
+        val now = System.currentTimeMillis()
+        val day = dayOf(calendar, timestamp)
+
+        if (day == dayOf(calendar, now)) return context.getString(R.string.date_today)
+
+        val yesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+        if (day == dayOf(calendar, yesterday.timeInMillis)) {
+            return context.getString(R.string.date_yesterday)
+        }
+
+        val locale = Locale.getDefault()
+        calendar.timeInMillis = timestamp
+        val year = calendar.get(Calendar.YEAR)
+        calendar.timeInMillis = now
+        val skeleton = if (year == calendar.get(Calendar.YEAR)) "dMMMM" else "dMMMMy"
+        val pattern = android.text.format.DateFormat.getBestDateTimePattern(locale, skeleton)
+        return SimpleDateFormat(pattern, locale).format(Date(timestamp))
+    }
+
+    private fun bindMessage(holder: MessageViewHolder, message: Message) {
         holder.senderTextView.text = message.sender
         holder.contentTextView.text = message.content
-        holder.timeTextView.text = dateFormat.format(Date(message.timestamp))
+        holder.timeTextView.text = timeFormat.format(Date(message.timestamp))
 
         val isSelf = localName.isNotEmpty() && message.sender == localName
         val lp = holder.messageBubble.layoutParams as android.widget.FrameLayout.LayoutParams
@@ -993,9 +1111,12 @@ class MessagesAdapter(
         }
     }
 
-    override fun getItemCount(): Int = messages.size
-
     private fun dpToPx(context: android.content.Context, dp: Int): Int {
         return (dp * context.resources.displayMetrics.density).toInt()
+    }
+
+    companion object {
+        private const val TYPE_MESSAGE = 0
+        private const val TYPE_DATE = 1
     }
 }

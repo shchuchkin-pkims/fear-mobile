@@ -60,6 +60,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.fear.ui.components.Avatar
@@ -69,6 +70,11 @@ import com.fear.ui.theme.LocalFearColors
 import com.fear.ui.viewmodel.ChatEntry
 import com.fear.ui.viewmodel.ChatKind
 import com.fear.ui.viewmodel.ChatUiState
+import com.fear.R
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -372,7 +378,15 @@ private fun ChatPane(
                 // и LazyColumn падает с IllegalArgumentException.
                 itemsIndexed(messages, key = { i, m ->
                     "$i-${m.timestamp}-${m.sender}-${m.text.hashCode()}"
-                }) { _, msg ->
+                }) { i, msg ->
+                    /* Дата живёт в той же ячейке, что и первое сообщение
+                     * дня, а не отдельным item: ключи здесь уже однажды
+                     * уронили список повторами, и вплетать в ту же схему
+                     * ещё один вид строк - напрашиваться на второй раз. */
+                    val previous = messages.getOrNull(i - 1)
+                    if (previous == null || !sameLocalDay(previous.timestamp, msg.timestamp, ZoneId.systemDefault())) {
+                        DaySeparator(msg.timestamp)
+                    }
                     MessageBubble(msg, onSenderClick = onSenderTap)
                 }
             }
@@ -386,6 +400,59 @@ private fun ChatPane(
             modifier = Modifier.navigationBarsPadding(),
         )
     }
+}
+
+/**
+ * Дата над первым сообщением дня.
+ *
+ * Одного времени «14:03» мало: по нему не видно, сегодняшнее это сообщение
+ * или недельной давности, а лента открытой переписки спокойно переваливает
+ * за полночь. Вид повторяет системные сообщения, чтобы в ленте не заводился
+ * третий стиль ради одной строки.
+ */
+@Composable
+private fun DaySeparator(timestamp: Instant) {
+    val colors = LocalFearColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = dayLabel(timestamp),
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(colors.surface.copy(alpha = 0.85f))
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        )
+    }
+}
+
+/**
+ * «Today», «Yesterday» или сама дата.
+ *
+ * Порядок частей даты берётся из локали через getBestDateTimePattern: из
+ * одного скелета выходит «August 5» по-английски и «5 августа» по-русски.
+ * Год пишется только тогда, когда он не нынешний - иначе он стоит в каждой
+ * строке и ни о чём не говорит.
+ */
+@Composable
+private fun dayLabel(timestamp: Instant): String {
+    val zone = ZoneId.systemDefault()
+    return when (dayLabelKind(timestamp, Instant.now(), zone)) {
+        DayLabelKind.TODAY -> stringResource(R.string.date_today)
+        DayLabelKind.YESTERDAY -> stringResource(R.string.date_yesterday)
+        DayLabelKind.THIS_YEAR -> formatDay(timestamp, zone, "dMMMM")
+        DayLabelKind.OTHER_YEAR -> formatDay(timestamp, zone, "dMMMMy")
+    }
+}
+
+private fun formatDay(timestamp: Instant, zone: ZoneId, skeleton: String): String {
+    val locale = Locale.getDefault()
+    val pattern = android.text.format.DateFormat.getBestDateTimePattern(locale, skeleton)
+    return DateTimeFormatter.ofPattern(pattern, locale).withZone(zone).format(timestamp)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
