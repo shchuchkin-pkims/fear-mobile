@@ -291,6 +291,11 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
         override fun onContactsUpdated(contacts: List<String>) {
             reportedCount = contacts.size
             for (c in contacts) {
+                // «?метка» - участник, который ещё не объявился: сервер назвал
+                // его меткой, имя придёт отдельным анонсом мгновением позже.
+                // seenPeers копится и не очищается, поэтому огрызок остался бы
+                // в нём навсегда призрачным собеседником.
+                if (c.startsWith("?")) continue
                 if (c.isNotBlank() && c != _form.value.name) seenPeers.add(c)
             }
             // Снимаем актуальный список и кладём в state — заголовку чата

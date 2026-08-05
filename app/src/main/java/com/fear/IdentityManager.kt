@@ -298,16 +298,30 @@ class IdentityManager(private val context: Context) {
 
     /**
      * Build the payload for MSG_TYPE_IDENTITY_ANNOUNCE.
-     * Format: [pk(32)][sig_over_name(64)]
+     *
+     * Раскладка: [pk(32)][sig(64)][name_len(2)][name].
+     *
+     * Это единственное место, где отображаемое имя вообще уезжает с
+     * телефона, и уезжает оно уже запечатанным ключом комнаты. Подпись
+     * покрывает не одно имя, а метку сессии вместе с ним: иначе чужой анонс
+     * можно было бы взять целиком и повторить под своей меткой, получив
+     * вместе с ним и имя.
      */
-    fun buildIdentityAnnouncePayload(name: String): ByteArray? {
+    fun buildIdentityAnnouncePayload(sessionTag: String, name: String): ByteArray? {
         val pk = publicKey ?: return null
         val nameBytes = name.toByteArray(Charsets.UTF_8)
-        val sig = sign(nameBytes) ?: return null
+        if (nameBytes.size > 0xFFFF) return null
+        val sig = sign(com.fear.crypto.SessionTag.announceSignedBytes(sessionTag, name))
+            ?: return null
 
-        val payload = ByteArray(Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES)
+        val payload = ByteArray(
+            Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES + 2 + nameBytes.size)
         System.arraycopy(pk, 0, payload, 0, Common.IDENTITY_PK_BYTES)
         System.arraycopy(sig, 0, payload, Common.IDENTITY_PK_BYTES, Common.IDENTITY_SIG_BYTES)
+        val at = Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES
+        payload[at] = ((nameBytes.size shr 8) and 0xFF).toByte()
+        payload[at + 1] = (nameBytes.size and 0xFF).toByte()
+        System.arraycopy(nameBytes, 0, payload, at + 2, nameBytes.size)
         return payload
     }
 
