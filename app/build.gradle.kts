@@ -29,8 +29,8 @@ android {
         applicationId = "com.fear"
         minSdk = 24
         targetSdk = 34
-        versionCode = 50
-        versionName = "0.5.0"
+        versionCode = 60
+        versionName = "0.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

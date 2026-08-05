@@ -11,7 +11,9 @@ enum class ConnectMode {
 }
 
 data class ConnectFormState(
-    val host: String = "fear-project.ru",
+    /* Сервер по умолчанию - Меппел. Запомненный выбор человека важнее и
+     * подставляется поверх этого значения при запуске. */
+    val host: String = "77.221.145.132",
     val port: Int = 8888,
     val room: String = "general",          // default public room (general channel)
     val name: String = "",
