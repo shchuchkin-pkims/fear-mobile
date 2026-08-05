@@ -309,15 +309,26 @@ class FearClient(
 
                 notifyConnected(mySession)
 
-                // Send registration message (empty text) so server registers us
-                sendRegistrationMessage(s)
-
                 // Нулевое поколение K_room и реестр состава - до анонса,
                 // чтобы в реестре уже были мы сами.
                 initRoomKeys()
 
-                // Send identity announce if we have a key
-                sendIdentityAnnounce(s)
+                /* Регистрирует нас на сервере первый же отправленный кадр:
+                 * имя и комнату он берёт из его заголовка. Годится любой
+                 * кадр, который сервер ретранслирует, и анонс личности как
+                 * раз такой - отдельное пустое сообщение для этого не нужно.
+                 * А видно его было всем: сервер раздавал его в комнату, и у
+                 * собеседников появлялся пустой пузырь. Консольный клиент
+                 * так и делает - регистрируется анонсом. */
+                val idm = identityManager
+                if (idm != null && idm.hasIdentity()) {
+                    sendIdentityAnnounce(s)
+                } else {
+                    /* Без личности анонса нет, а зарегистрироваться надо:
+                     * иначе нас не будет в списке участников, пока мы не
+                     * заговорим. */
+                    sendRegistrationMessage(s)
+                }
 
                 // Start receiving messages and the heartbeat loop.
                 startReceiving(mySession)
@@ -1741,6 +1752,10 @@ class FearClient(
             when (msgType) {
                 Common.MSG_TYPE_TEXT -> {
                     val content = String(plaintext, Charsets.UTF_8)
+                    /* Пустое сообщение никто не пишет намеренно - так
+                     * регистрировались на сервере сборки постарше, и в чате
+                     * от них оставался пустой пузырь. */
+                    if (content.isBlank()) return true
                     val message = Message(room, senderName, content, System.currentTimeMillis())
                     notifyMessageReceived(message)
                 }
