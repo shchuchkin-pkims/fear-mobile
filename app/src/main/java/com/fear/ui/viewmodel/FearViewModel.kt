@@ -201,6 +201,9 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             switchingRoom = false
             intendedConnected = true
             connectedAtMs = System.currentTimeMillis()
+            /* Сначала перенос: ящики и чаты адресуются новым идентификатором,
+             * и переехать надо до того, как ими воспользуются. */
+            migrateDmRooms()
             /* Ящики контактов - сразу после подключения: письмо могло прийти,
              * пока нас не было. */
             registerMailboxes()
@@ -388,6 +391,41 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
      * просто не увидим его писем, поэтому вызывается это и при подключении, и
      * при каждом изменении списка.
      */
+    /**
+     * Перенести переписку под новый идентификатор личной комнаты.
+     *
+     * Старый выводился из двух открытых ключей без секрета, и ретранслятор,
+     * знающий ключи всех, кто занял имя, мог перебрать пары и подписать
+     * каждую личную комнату именами обоих собеседников. Новый выводится под
+     * ключом пары, повторить его снаружи нельзя.
+     *
+     * Цена - смена адреса у существующих чатов, поэтому переписка переезжает
+     * здесь же. Повторный вызов безвреден: переносить будет нечего.
+     */
+    private fun migrateDmRooms() {
+        viewModelScope.launch {
+            val im = client.getIdentityManager() ?: return@launch
+            if (!im.hasIdentity()) return@launch
+            val dao = com.fear.data.AppDatabase.get(getApplication()).messageDao()
+            for (c in contactsRepo.all()) {
+                val pk = try {
+                    android.util.Base64.decode(
+                        c.identityPkB64,
+                        android.util.Base64.URL_SAFE or
+                            android.util.Base64.NO_PADDING or
+                            android.util.Base64.NO_WRAP,
+                    )
+                } catch (e: Exception) {
+                    continue
+                }
+                if (pk.size != 32) continue
+                val oldId = im.pmRoomIdV1(pk) ?: continue
+                val newId = im.pmRoomId(pk) ?: continue
+                if (oldId != newId) dao.renameRoom(oldId, newId)
+            }
+        }
+    }
+
     private fun registerMailboxes() {
         viewModelScope.launch {
             val im = client.getIdentityManager() ?: return@launch

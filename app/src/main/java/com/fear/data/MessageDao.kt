@@ -30,6 +30,16 @@ interface MessageDao {
     """)
     fun observeRecent(roomId: String, limit: Int = 500): Flow<List<MessageEntity>>
 
+    /**
+     * Перенести переписку из одной комнаты в другую.
+     *
+     * Нужно ровно однажды: при смене вывода идентификатора личной комнаты.
+     * Без переноса она осталась бы под прежним адресом и выглядела бы
+     * пропавшей.
+     */
+    @Query("UPDATE messages SET roomId = :toRoomId WHERE roomId = :fromRoomId")
+    suspend fun renameRoom(fromRoomId: String, toRoomId: String)
+
     @Query("DELETE FROM messages WHERE roomId = :roomId")
     suspend fun clearRoom(roomId: String)
 

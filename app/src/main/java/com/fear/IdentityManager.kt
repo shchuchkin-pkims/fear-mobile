@@ -135,7 +135,15 @@ class IdentityManager(private val context: Context) {
      * Префикс "pm:" + base64url(blake2b(min(pk_a,pk_b)||max(pk_a,pk_b),16)).
      * Обе стороны вычисляют одинаковое значение без координации.
      */
-    fun pmRoomId(otherPk: ByteArray): String? {
+    /**
+     * Идентификатор личной комнаты - устаревший вывод, только для переноса.
+     *
+     * Считается из двух открытых ключей и без секрета, а значит его может
+     * посчитать кто угодно, кому эти ключи известны. Ретранслятор знает
+     * открытые ключи всех, кто занял имя, и потому мог перебрать пары и
+     * подписать каждую личную комнату именами обоих собеседников.
+     */
+    fun pmRoomIdV1(otherPk: ByteArray): String? {
         val mine = publicKey ?: return null
         require(otherPk.size == Common.IDENTITY_PK_BYTES) { "other pk wrong size" }
 
@@ -147,11 +155,32 @@ class IdentityManager(private val context: Context) {
         }
         val digest = ByteArray(16)
         ls.cryptoGenericHash(digest, 16, concat, concat.size.toLong(), null, 0)
-        val b64 = android.util.Base64.encodeToString(
+        return "pm:" + android.util.Base64.encodeToString(
             digest,
-            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or
+                android.util.Base64.NO_PADDING,
         )
-        return "pm:$b64"
+    }
+
+    /**
+     * Идентификатор личной комнаты: BLAKE2b под ключом пары.
+     *
+     * K_pm выводят только двое, поэтому для ретранслятора это непрозрачная
+     * метка - перебрать пары открытых ключей и узнать, кто с кем переписывается,
+     * больше нельзя. Зеркалит identity_pm_room_id_v2 из C-библиотеки; разойдясь,
+     * телефон и ПК оказались бы в разных комнатах и молча не видели друг друга.
+     */
+    fun pmRoomId(otherPk: ByteArray): String? {
+        val kPm = pmRoomKey(otherPk) ?: return null
+        val ctx = "fear.pm.room.v2".toByteArray(Charsets.US_ASCII)
+        val digest = ByteArray(16)
+        ls.cryptoGenericHash(digest, 16, ctx, ctx.size.toLong(), kPm, kPm.size)
+        kPm.fill(0)
+        return "pm:" + android.util.Base64.encodeToString(
+            digest,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or
+                android.util.Base64.NO_PADDING,
+        )
     }
 
     /**
