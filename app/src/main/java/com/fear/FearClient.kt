@@ -4,6 +4,7 @@ import com.fear.crypto.CallInvite
 import com.fear.crypto.ChatFrame
 import com.fear.crypto.Mailbox
 import com.fear.crypto.RoomKeys
+import com.fear.crypto.WireRoom
 import com.fear.crypto.RotationBundle
 import com.fear.crypto.KeySchedule
 import com.fear.crypto.MediaKeys
@@ -88,6 +89,19 @@ class FearClient(
     private var clientName = ""
     private var serverHost = ""
     private var serverPort = 0
+    /**
+     * Комната, какой её видит ретранслятор: хеш от названия.
+     *
+     * currentRoom остаётся настоящим названием - оно нужно там, где речь о
+     * нашей собственной стороне: история, почтовые ящики, выбор личной
+     * комнаты. На провод же уходит метка.
+     */
+    private var wireRoom: String = ""
+
+    private fun wireRoomBytes(): ByteArray =
+        (if (wireRoom.isNotEmpty()) wireRoom else WireRoom.of(currentRoom))
+            .toByteArray(Charsets.UTF_8)
+
     private var roomKey = ByteArray(0)
 
     /*
@@ -154,8 +168,20 @@ class FearClient(
     private val mailboxLock = Any()
     private var mailboxJob: Job? = null
 
-    /** Как часто спрашиваем почту. */
-    private val mailboxPollMs = 20_000L
+    /**
+     * Как часто спрашиваем почту.
+     *
+     * На переднем плане человек ждёт ответа и смотрит на экран - двадцать
+     * секунд там заметны. В фоне их никто не считает, а батарею тратит
+     * каждое пробуждение радио, поэтому шаг реже. Настоящего push тут нет и
+     * не будет: он на Android означает Google FCM, то есть чужой сервис,
+     * знающий время каждого вашего сообщения.
+     */
+    private val mailboxPollForegroundMs = 20_000L
+    private val mailboxPollBackgroundMs = 60_000L
+
+    private fun mailboxPollDelay(): Long =
+        if (isInForeground) mailboxPollForegroundMs else mailboxPollBackgroundMs
 
     /** Срок хранения, о котором сказал сервер; 0 - не хранит ничего. */
     @Volatile var relayInboxTtlSeconds: Int = -1
@@ -333,6 +359,10 @@ class FearClient(
                     }
                 }
 
+                /* Метка комнаты - до обмена ключами: он идёт уже под ней,
+                 * иначе входящий постучится не туда. */
+                wireRoom = WireRoom.of(currentRoom)
+
                 // If join mode, perform ECDH key exchange before proceeding
                 if (effectiveMode == ConnectMode.JOIN_ROOM) {
                     notifyMessageReceived(Message(room, "system",
@@ -392,7 +422,7 @@ class FearClient(
     private fun sendRegistrationMessage(socket: Socket) {
         val plaintext = " ".toByteArray(Charsets.UTF_8)
         val nonce = Crypto.generateNonce()
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
+        val roomBytes = wireRoomBytes()
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
         val ciphertext = ChatFrame.seal(chatKey() ?: return, roomBytes, nameBytes, plaintext, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, Common.MSG_TYPE_TEXT, ciphertext)
@@ -690,7 +720,7 @@ class FearClient(
      * Used for KEY_REQUEST and KEY_RESPONSE.
      */
     private fun sendServiceFrame(socket: Socket, type: Byte, payload: ByteArray) {
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
+        val roomBytes = wireRoomBytes()
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
         val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
         val frame = buildFrame(roomBytes, nameBytes, zeroNonce, type, payload)
@@ -904,7 +934,7 @@ class FearClient(
 
                 // Check if this is a KEY_RESPONSE service message
                 val isZeroNonce = nonce.all { it == 0.toByte() }
-                if (typeBuf[0] != Common.MSG_TYPE_KEY_RESPONSE || !isZeroNonce || room != currentRoom) {
+                if (typeBuf[0] != Common.MSG_TYPE_KEY_RESPONSE || !isZeroNonce || room != wireRoom) {
                     continue
                 }
 
@@ -1268,7 +1298,7 @@ class FearClient(
         key: ChatFrame.RoomKey? = null,
     ) {
         val nonce = Crypto.generateNonce()
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
+        val roomBytes = wireRoomBytes()
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
         val sealKey = key ?: chatKey() ?: return
         val ciphertext = ChatFrame.seal(sealKey, roomBytes, nameBytes, payload, nonce) ?: return
@@ -1280,7 +1310,7 @@ class FearClient(
         try {
             val textBytes = text.toByteArray(Charsets.UTF_8)
             val nonce = Crypto.generateNonce()
-            val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
+            val roomBytes = wireRoomBytes()
             val nameBytes = clientName.toByteArray(Charsets.UTF_8)
 
             // If we have identity, send as SIGNED_TEXT
@@ -1416,7 +1446,7 @@ class FearClient(
 
     private fun sendFileMessage(socket: Socket, type: Byte, payload: ByteArray): Boolean {
         val nonce = Crypto.generateNonce()
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
+        val roomBytes = wireRoomBytes()
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
         val key = roomKey ?: return false
         val ciphertext = ChatFrame.seal(chatKey() ?: return false, roomBytes, nameBytes, payload, nonce)
@@ -1587,7 +1617,7 @@ class FearClient(
                 } catch (e: Exception) {
                     Log.w("FearClient", "[inbox] poll failed: ${e.message}")
                 }
-                kotlinx.coroutines.delay(mailboxPollMs)
+                kotlinx.coroutines.delay(mailboxPollDelay())
             }
         }
     }
@@ -1873,7 +1903,7 @@ class FearClient(
             if (!Common.recvAll(socket, ciphertext, clen.toInt())) return false
 
             // Skip messages from other rooms
-            if (room != currentRoom) return true
+            if (room != wireRoom) return true
 
             // Check if this is a service message (all-zero nonce)
             val isServiceMessage = nonce.all { it == 0.toByte() }
