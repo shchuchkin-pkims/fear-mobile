@@ -201,6 +201,9 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             switchingRoom = false
             intendedConnected = true
             connectedAtMs = System.currentTimeMillis()
+            /* Ящики контактов - сразу после подключения: письмо могло прийти,
+             * пока нас не было. */
+            registerMailboxes()
             saveFormToPrefs()
             val f = _form.value
             _uiState.update {
@@ -376,6 +379,35 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Отложенный пересчёт статуса; см. recomputeStatus. */
     private var statusRefresh: kotlinx.coroutines.Job? = null
+
+    /**
+     * Сказать клиенту, за какими ящиками следить.
+     *
+     * Список контактов ведёт эта модель, а ключ пары выводится из двух личных
+     * ключей - клиент про контакты ничего не знает. Пропустив контакт, мы
+     * просто не увидим его писем, поэтому вызывается это и при подключении, и
+     * при каждом изменении списка.
+     */
+    private fun registerMailboxes() {
+        viewModelScope.launch {
+            val im = client.getIdentityManager() ?: return@launch
+            if (!im.hasIdentity()) return@launch
+            client.forgetMailboxes()
+            for (c in contactsRepo.all()) {
+                val pk = try {
+                    android.util.Base64.decode(
+                        c.identityPkB64,
+                        android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or
+                            android.util.Base64.NO_WRAP)
+                } catch (e: Exception) { continue }
+                if (pk.size != 32) continue   // длина Ed25519-ключа
+                val room = im.pmRoomId(pk) ?: continue
+                val kPm = im.pmRoomKey(pk) ?: continue
+                client.watchMailbox(room, kPm)
+                kPm.fill(0)
+            }
+        }
+    }
 
     private fun recomputeStatus() {
         val total = maxOf(reportedCount, seenPeers.size + 1)

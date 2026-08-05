@@ -2,6 +2,7 @@ package com.fear
 
 import com.fear.crypto.CallInvite
 import com.fear.crypto.ChatFrame
+import com.fear.crypto.Mailbox
 import com.fear.crypto.RoomKeys
 import com.fear.crypto.RotationBundle
 import com.fear.crypto.KeySchedule
@@ -137,6 +138,48 @@ class FearClient(
 
     /** Реестр и кольцо трогают и приёмный цикл, и таймер ротации. */
     private val rotationLock = Any()
+
+    /*
+     * Почтовые ящики контактов.
+     *
+     * Личная переписка - это комната, чей идентификатор и ключ выводятся из
+     * двух личных ключей. Пока обе стороны в ней, всё идёт как обычно; если
+     * собеседника нет, письмо ложится в ящик, и он забирает его, когда
+     * придёт - в том числе сидя в совсем другой комнате. Ради этого клиент
+     * следит сразу за всеми ящиками и спрашивает их одним запросом.
+     */
+    private class Mail(val room: String, val kPm: ByteArray, val addr: ByteArray)
+
+    private val mailboxes = LinkedHashMap<String, Mail>()
+    private val mailboxLock = Any()
+    private var mailboxJob: Job? = null
+
+    /** Как часто спрашиваем почту. */
+    private val mailboxPollMs = 20_000L
+
+    /** Срок хранения, о котором сказал сервер; 0 - не хранит ничего. */
+    @Volatile var relayInboxTtlSeconds: Int = -1
+        private set
+
+    /**
+     * Взять ящик пары под наблюдение.
+     *
+     * Список контактов ведёт интерфейс, поэтому ключи приходят снаружи.
+     */
+    fun watchMailbox(room: String, kPm: ByteArray) {
+        val addr = Mailbox.address(kPm)
+        synchronized(mailboxLock) {
+            mailboxes[room] = Mail(room, kPm.copyOf(), addr)
+        }
+    }
+
+    fun forgetMailboxes() {
+        synchronized(mailboxLock) {
+            for (m in mailboxes.values) m.kPm.fill(0)
+            mailboxes.clear()
+        }
+    }
+
 
 
     fun getServerHost(): String = serverHost
@@ -334,6 +377,7 @@ class FearClient(
                 startReceiving(mySession)
                 startPingLoop(mySession)
                 startRotationLoop(mySession)
+                startMailboxLoop(mySession)
 
             } catch (e: Exception) {
                 notifyError("Connection failed: ${e.message}", mySession)
@@ -428,6 +472,7 @@ class FearClient(
             receiveJob?.cancel()
             pingJob?.cancel()
             rotationJob?.cancel()
+            mailboxJob?.cancel()
             /* Поколения принадлежат этой сессии в этой комнате: унести их в
              * следующую значит запечатать сообщение ключом, которого у той
              * комнаты нет. */
@@ -458,9 +503,18 @@ class FearClient(
             try {
                 val socket = socket ?: return@launch
 
+                val mailbox = mailboxForCurrentRoom()
                 if (text.startsWith("/sendfile ")) {
                     val filename = text.substring(10).trim()
                     sendFile(socket, filename)
+                } else if (mailbox != null) {
+                    /* Собеседника в личной комнате нет - письмо ложится в его
+                     * ящик. Ответ сервера скажет, легло ли: если хранение
+                     * выключено, пользователь узнает правду, а не увидит
+                     * вторую галочку. */
+                    if (!sendToMailbox(socket, mailbox, text)) {
+                        notifyError("Could not post the message")
+                    }
                 } else {
                     sendTextMessage(socket, text)
                 }
@@ -1408,6 +1462,136 @@ class FearClient(
         return frame
     }
 
+    // --- Офлайн-ящик ---
+
+    /**
+     * Некому доставить прямо сейчас?
+     *
+     * Это личная комната, и собеседника в ней нет. Тогда письмо идёт в ящик,
+     * а не в пустоту: сервер рассылает только тем, кто в комнате, и сам
+     * ничего не хранит.
+     */
+    private fun mailboxForCurrentRoom(): Mail? {
+        if (!currentRoom.startsWith("pm:")) return null
+        val m = synchronized(mailboxLock) { mailboxes[currentRoom] } ?: return null
+        val alone = synchronized(rotationLock) {
+            roster.none { (name, e) -> e.present && name != clientName }
+        }
+        return if (alone) m else null
+    }
+
+    /** Положить письмо в ящик собеседника. */
+    private fun sendToMailbox(socket: Socket, m: Mail, text: String): Boolean {
+        val nonce = Crypto.generateNonce()
+        val body = Mailbox.seal(m.room, m.kPm, clientName,
+                                text.toByteArray(Charsets.UTF_8), nonce) ?: return false
+        return try {
+            sendServiceFrame(socket, Common.MSG_TYPE_INBOX_PUT, m.addr + body)
+            true
+        } catch (e: Exception) {
+            Log.w("FearClient", "[inbox] could not post: ${e.message}")
+            false
+        }
+    }
+
+    /** Спросить все ящики разом. */
+    private fun pollMailboxes(socket: Socket) {
+        val addrs = synchronized(mailboxLock) { mailboxes.values.map { it.addr } }
+        if (addrs.isEmpty()) return
+
+        val body = ByteArray(2 + addrs.size * Mailbox.ADDR_BYTES)
+        Common.writeUInt16(body, 0, addrs.size)
+        var off = 2
+        for (a in addrs) { a.copyInto(body, off); off += Mailbox.ADDR_BYTES }
+        sendServiceFrame(socket, Common.MSG_TYPE_INBOX_FETCH, body)
+    }
+
+    /** Подтвердить получение - только после того, как письмо показано. */
+    private fun ackMailbox(socket: Socket, m: Mail, id: Long) {
+        val body = ByteArray(Mailbox.ADDR_BYTES + 2 + 8)
+        m.addr.copyInto(body, 0)
+        Common.writeUInt16(body, Mailbox.ADDR_BYTES, 1)
+        var v = id
+        for (b in 0 until 8) {
+            body[Mailbox.ADDR_BYTES + 2 + b] = (v and 0xFF).toByte()
+            v = v ushr 8
+        }
+        sendServiceFrame(socket, Common.MSG_TYPE_INBOX_DELETE, body)
+    }
+
+    /** Разобрать ответ сервера: письма и объявленный срок хранения. */
+    private fun handleInboxResult(socket: Socket, p: ByteArray) {
+        if (p.size < 1 + 4 + 2) return
+        val status = p[0].toInt() and 0xFF
+        relayInboxTtlSeconds = ((p[1].toInt() and 0xFF)) or
+                               ((p[2].toInt() and 0xFF) shl 8) or
+                               ((p[3].toInt() and 0xFF) shl 16) or
+                               ((p[4].toInt() and 0xFF) shl 24)
+
+        if (status != 0) {
+            /* Сказать вслух стоит об одном: сервер не хранит ничего, и письмо
+             * никуда не легло. Молчание тут - худшее, что можно сделать:
+             * отправитель будет думать, что доставил. */
+            if (status == 1) {
+                notifyMessageReceived(Message(currentRoom, "system",
+                    "Not delivered: the recipient is offline and this relay " +
+                    "keeps nothing.", System.currentTimeMillis()))
+            }
+            return
+        }
+
+        val count = Common.readUInt16(p, 5)
+        var off = 7
+        repeat(count) {
+            if (off + 8 + Mailbox.ADDR_BYTES + 4 > p.size) return
+            var id = 0L
+            for (b in 0 until 8) id = id or ((p[off + b].toLong() and 0xFF) shl (8 * b))
+            off += 8
+            val addr = p.copyOfRange(off, off + Mailbox.ADDR_BYTES)
+            off += Mailbox.ADDR_BYTES
+            val len = ((p[off].toInt() and 0xFF)) or
+                      ((p[off + 1].toInt() and 0xFF) shl 8) or
+                      ((p[off + 2].toInt() and 0xFF) shl 16) or
+                      ((p[off + 3].toInt() and 0xFF) shl 24)
+            off += 4
+            if (off + len > p.size) return
+            val body = p.copyOfRange(off, off + len)
+            off += len
+
+            val m = synchronized(mailboxLock) {
+                mailboxes.values.firstOrNull { it.addr.contentEquals(addr) }
+            } ?: return@repeat
+
+            val letter = Mailbox.open(m.room, m.kPm, body) ?: return@repeat
+            /* Письмо адресовано другой комнате, чем та, в которой мы сидим -
+             * в этом весь смысл ящика. Комната едет вместе с сообщением,
+             * чтобы интерфейс положил его в нужный чат. */
+            notifyMessageReceived(Message(m.room, letter.sender, letter.text,
+                                          System.currentTimeMillis()))
+            ackMailbox(socket, m, id)
+        }
+    }
+
+    /**
+     * Таймер опроса.
+     *
+     * Приёмный цикл стоит на чтении сокета, так что сам он о новой почте не
+     * узнает.
+     */
+    private fun startMailboxLoop(forSession: Long) {
+        mailboxJob?.cancel()
+        mailboxJob = CoroutineScope(Dispatchers.IO).launch {
+            while (forSession == sessionId && isConnected) {
+                try {
+                    socket?.let { pollMailboxes(it) }
+                } catch (e: Exception) {
+                    Log.w("FearClient", "[inbox] poll failed: ${e.message}")
+                }
+                kotlinx.coroutines.delay(mailboxPollMs)
+            }
+        }
+    }
+
     // --- Ротация ключа комнаты ---
 
     /** Запомнить или обновить личный ключ участника. */
@@ -1697,6 +1881,13 @@ class FearClient(
             // Handle USER_LIST (service message, not encrypted)
             if (isServiceMessage && msgType == Common.MSG_TYPE_USER_LIST) {
                 handleUserList(ciphertext)
+                return true
+            }
+
+            // Ответ ящика приходит на то соединение, которое спрашивало, и
+            // несёт письма для других комнат - поэтому комнату не сверяем.
+            if (isServiceMessage && msgType == Common.MSG_TYPE_INBOX_RESULT) {
+                handleInboxResult(socket, ciphertext)
                 return true
             }
 

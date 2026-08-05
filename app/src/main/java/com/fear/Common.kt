@@ -123,6 +123,13 @@ object Common {
      *  всех, только что вошёл и текущего K_room ещё не имеет. */
     const val MSG_TYPE_ROTATION:              Byte = 33
 
+    /* Офлайн-ящик. Письмо адресовано слепым адресом - хешем от ключа пары, -
+     * поэтому ретранслятор не знает, ни кому оно, ни от кого. */
+    const val MSG_TYPE_INBOX_PUT:             Byte = 34
+    const val MSG_TYPE_INBOX_FETCH:           Byte = 35
+    const val MSG_TYPE_INBOX_RESULT:          Byte = 36
+    const val MSG_TYPE_INBOX_DELETE:          Byte = 37
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32
