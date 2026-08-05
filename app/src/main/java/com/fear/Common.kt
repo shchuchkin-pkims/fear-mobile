@@ -116,6 +116,13 @@ object Common {
     /* Phase C: a room member announces a call. Payload: CallInvite. */
     const val MSG_TYPE_CALL_INVITE:           Byte = 32
 
+    /** Участник комнаты -> комнате: у K_room новое поколение.
+     *  Полезная нагрузка - конверт ротации (crypto/RotationBundle.kt): по
+     *  записи на участника, каждая запечатана его личным ключом. Поэтому
+     *  кадр служебный, не запечатанный ключом комнаты: тот, кому он нужнее
+     *  всех, только что вошёл и текущего K_room ещё не имеет. */
+    const val MSG_TYPE_ROTATION:              Byte = 33
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32

@@ -10,6 +10,7 @@ import com.goterl.lazysodium.interfaces.GenericHash
 import com.goterl.lazysodium.interfaces.Sign
 import java.io.ByteArrayOutputStream
 import java.io.File
+import com.fear.crypto.RotationBundle
 
 /**
  * Ed25519 identity manager for FEAR messenger.
@@ -189,6 +190,35 @@ class IdentityManager(private val context: Context) {
         java.util.Arrays.fill(myXSk, 0)
         java.util.Arrays.fill(shared, 0)
         return out
+    }
+
+    /**
+     * Собрать конверт ротации: новое K_room, запечатанное каждому
+     * участнику по отдельности (identity/rotation_bundle.c).
+     *
+     * Операция живёт здесь, а не в вызывающем коде, по той же причине, что и
+     * sign(): наружу отдавать секретный ключ незачем, а ротации нужен именно
+     * он - из него выводится curve25519-ключ для crypto_box.
+     */
+    fun buildRotationBundle(
+        roomId: String,
+        newVersion: Int,
+        newKRoom: ByteArray,
+        recipientPks: List<ByteArray>,
+    ): ByteArray? {
+        val myPk = publicKey ?: return null
+        val mySk = secretKey ?: return null
+        return RotationBundle.build(roomId, newVersion, newKRoom, mySk, myPk, recipientPks)
+    }
+
+    /** Открыть адресованную нам запись из чужого конверта ротации. */
+    fun openRotationBundle(
+        view: RotationBundle.View,
+        roomId: String,
+    ): ByteArray? {
+        val myPk = publicKey ?: return null
+        val mySk = secretKey ?: return null
+        return RotationBundle.openFor(view, roomId, mySk, myPk)
     }
 
     private fun compareUnsigned(a: ByteArray, b: ByteArray): Int {

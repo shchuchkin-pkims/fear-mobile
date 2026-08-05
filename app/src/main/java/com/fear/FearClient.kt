@@ -2,6 +2,8 @@ package com.fear
 
 import com.fear.crypto.CallInvite
 import com.fear.crypto.ChatFrame
+import com.fear.crypto.RoomKeys
+import com.fear.crypto.RotationBundle
 import com.fear.crypto.KeySchedule
 import com.fear.crypto.MediaKeys
 
@@ -86,6 +88,56 @@ class FearClient(
     private var serverHost = ""
     private var serverPort = 0
     private var roomKey = ByteArray(0)
+
+    /*
+     * Ротация ключа комнаты. Зеркало того, что делает консольный клиент, и
+     * формат должен совпадать байт в байт: комната, где сидят телефон и
+     * десктоп, ротируется только если обе стороны собирают одни и те же
+     * байты, а иначе она молча разъезжается надвое.
+     *
+     * roomKey остаётся ключом основания комнаты и после ротаций: под ним
+     * едут анонсы личности, потому что только что вошедший другого ключа
+     * ещё не знает, а без анонса ему некому адресовать конверт.
+     */
+    private val roomKeys = RoomKeys()
+    private var roomKeysReady = false
+
+    /** Реестр состава: кому адресовать конверт и кто кого выбирает. */
+    private class RosterEntry(
+        var pk: ByteArray? = null,
+        var present: Boolean = true,
+        /** Был ли участник здесь до той смены состава, которую разбираем. */
+        var wasPresent: Boolean = false,
+    )
+
+    private val roster = LinkedHashMap<String, RosterEntry>()
+    private var sawFirstUserList = false
+
+    /**
+     * Есть ли у нас «до».
+     *
+     * Список, которым нас встретили при входе, - не та смена состава, которую
+     * мы видели: что было в комнате мгновением раньше, мы не знаем, а те, кто
+     * там был, нас не считают. Пока смена состава не произойдёт при нас, мы в
+     * выборах не участвуем и принимаем того ротатора, которого выбрала
+     * комната.
+     */
+    private var haveBefore = false
+
+    private var rotationPending = false
+    private var rotationSettleAt = 0L
+    private var rotationDeadline = 0L
+    private var rotationJob: Job? = null
+
+    /** Тишина после последней смены состава, за которую реестры сходятся. */
+    private val rotationSettleMs = 1500L
+
+    /** Сколько ждать участника, который так и не сказал, кто он. */
+    private val rotationDeadlineMs = 6000L
+
+    /** Реестр и кольцо трогают и приёмный цикл, и таймер ротации. */
+    private val rotationLock = Any()
+
 
     fun getServerHost(): String = serverHost
     fun getServerPort(): Int = serverPort
@@ -260,12 +312,17 @@ class FearClient(
                 // Send registration message (empty text) so server registers us
                 sendRegistrationMessage(s)
 
+                // Нулевое поколение K_room и реестр состава - до анонса,
+                // чтобы в реестре уже были мы сами.
+                initRoomKeys()
+
                 // Send identity announce if we have a key
                 sendIdentityAnnounce(s)
 
                 // Start receiving messages and the heartbeat loop.
                 startReceiving(mySession)
                 startPingLoop(mySession)
+                startRotationLoop(mySession)
 
             } catch (e: Exception) {
                 notifyError("Connection failed: ${e.message}", mySession)
@@ -282,7 +339,7 @@ class FearClient(
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ciphertext = ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, roomKey ?: return), roomBytes, nameBytes, plaintext, nonce) ?: return
+        val ciphertext = ChatFrame.seal(chatKey() ?: return, roomBytes, nameBytes, plaintext, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, Common.MSG_TYPE_TEXT, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -306,7 +363,8 @@ class FearClient(
             return
         }
         Log.d("FearClient", "sendIdentityAnnounce: sending ${payload.size} bytes for name='$clientName'")
-        sendEncryptedMessage(socket, Common.MSG_TYPE_IDENTITY_ANNOUNCE, payload)
+        sendEncryptedMessage(socket, Common.MSG_TYPE_IDENTITY_ANNOUNCE, payload,
+                             key = foundingKey())
     }
 
     fun getIdentityManager(): IdentityManager? = identityManager
@@ -358,6 +416,18 @@ class FearClient(
             if (forSession != sessionId) return@launch
             receiveJob?.cancel()
             pingJob?.cancel()
+            rotationJob?.cancel()
+            /* Поколения принадлежат этой сессии в этой комнате: унести их в
+             * следующую значит запечатать сообщение ключом, которого у той
+             * комнаты нет. */
+            synchronized(rotationLock) {
+                roomKeys.clear()
+                roomKeysReady = false
+                roster.clear()
+                sawFirstUserList = false
+                haveBefore = false
+                rotationPending = false
+            }
             socket?.close()
             socket = null
             isConnected = false
@@ -1075,11 +1145,68 @@ class FearClient(
     fun beginCallHex(video: Boolean): String? =
         beginCall(video, sendOnIo = true)?.joinToString("") { "%02x".format(it) }
 
-    private fun sendEncryptedMessage(socket: Socket, type: Byte, payload: ByteArray) {
+    /**
+     * Поколение, под которым запечатываем: текущее, никогда не старое.
+     *
+     * До первой ротации - и в комнате, которая ещё не ротировалась ни разу -
+     * это ключ основания под нулевым номером.
+     */
+    private fun chatKey(): ChatFrame.RoomKey? {
+        val founding = roomKey
+        if (founding.isEmpty()) return null
+        synchronized(rotationLock) {
+            if (roomKeysReady) roomKeys.current()?.let { return it }
+        }
+        return ChatFrame.RoomKey(ChatFrame.KEY_VERSION, founding)
+    }
+
+    /**
+     * Все поколения, которые ещё читаются, текущее первым.
+     *
+     * Ротация не останавливает то, что уже летит под заменяемым поколением:
+     * такие сообщения приходят после неё, и получатель, успевший забыть, как
+     * их читать, отказал бы во вполне законных сообщениях.
+     */
+    private fun chatRing(): List<ChatFrame.RoomKey>? {
+        val founding = roomKey
+        if (founding.isEmpty()) return null
+        synchronized(rotationLock) {
+            if (roomKeysReady) {
+                roomKeys.expire(System.currentTimeMillis() / 1000L)
+                val ring = roomKeys.ring()
+                if (ring.isNotEmpty()) return ring
+            }
+        }
+        return listOf(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, founding))
+    }
+
+    /**
+     * Ключ основания - тот, под которым едут анонсы личности.
+     *
+     * Запечатывать их текущим поколением нельзя: вход в комнату, которая
+     * хоть раз ротировалась, стал бы невозможен, а через две ротации ключ
+     * основания уходит из кольца и вошедшему уже никогда не адресовать
+     * конверт. Секретностью тут не жертвуем: внутри открытый ключ и подпись
+     * над именем. Запечатано вообще - чтобы сервер не получил список тех,
+     * кто в комнате.
+     */
+    private fun foundingKey(): ChatFrame.RoomKey? {
+        val founding = roomKey
+        if (founding.isEmpty()) return null
+        return ChatFrame.RoomKey(ChatFrame.KEY_VERSION, founding)
+    }
+
+    private fun sendEncryptedMessage(
+        socket: Socket,
+        type: Byte,
+        payload: ByteArray,
+        key: ChatFrame.RoomKey? = null,
+    ) {
         val nonce = Crypto.generateNonce()
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ciphertext = ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, roomKey ?: return), roomBytes, nameBytes, payload, nonce) ?: return
+        val sealKey = key ?: chatKey() ?: return
+        val ciphertext = ChatFrame.seal(sealKey, roomBytes, nameBytes, payload, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -1115,7 +1242,7 @@ class FearClient(
 
             val key = roomKey
             val ciphertext = if (key == null) null
-                             else ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, key), roomBytes, nameBytes, plaintext, nonce)
+                             else ChatFrame.seal(chatKey() ?: return, roomBytes, nameBytes, plaintext, nonce)
             if (ciphertext == null) {
                 notifyError("Encryption failed")
                 return
@@ -1227,7 +1354,7 @@ class FearClient(
         val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
         val nameBytes = clientName.toByteArray(Charsets.UTF_8)
         val key = roomKey ?: return false
-        val ciphertext = ChatFrame.seal(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, key), roomBytes, nameBytes, payload, nonce)
+        val ciphertext = ChatFrame.seal(chatKey() ?: return false, roomBytes, nameBytes, payload, nonce)
             ?: return false
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         return Common.sendAll(socket, frame)
@@ -1268,6 +1395,213 @@ class FearClient(
         System.arraycopy(ciphertext, 0, frame, offset, ciphertext.size)
 
         return frame
+    }
+
+    // --- Ротация ключа комнаты ---
+
+    /** Запомнить или обновить личный ключ участника. */
+    private fun rosterNoteIdentity(name: String, pk: ByteArray) {
+        synchronized(rotationLock) {
+            val e = roster.getOrPut(name) { RosterEntry() }
+            e.pk = pk.copyOf()
+        }
+    }
+
+    /** Отметить состав, который назвал сервер. Возвращает true, если он изменился. */
+    private fun rosterSetPresent(names: List<String>): Boolean {
+        var changed = false
+        for ((name, e) in roster) {
+            val here = names.contains(name)
+            if (e.present != here) { e.present = here; changed = true }
+        }
+        for (name in names) {
+            if (roster.containsKey(name)) continue
+            roster[name] = RosterEntry(pk = null, present = true, wasPresent = false)
+            changed = true
+        }
+        return changed
+    }
+
+    /** Заморозить нынешний состав как «до» следующей смены. */
+    private fun rosterSnapshotPresent() {
+        for (e in roster.values) e.wasPresent = e.present
+    }
+
+    /** Все ли, кого назвал сервер, уже сказали, кто они. */
+    private fun rosterIdentitiesComplete(): Boolean =
+        roster.values.none { it.present && it.pk == null }
+
+    /**
+     * Кого можно выбирать: те, кто был здесь до смены состава и остался.
+     *
+     * Только что вошедшего выбирать нельзя, и причина арифметическая. Он
+     * держит нулевое поколение и не знает, что комната на четвёртом, так что
+     * «следующее» поколение у него - уже использованное: остальные отбросят
+     * его как повтор, а сам он поставит себе и оглохнет.
+     */
+    private fun rosterContinuing(): List<RoomKeys.Member> =
+        roster.values.filter { it.present && it.wasPresent }.map {
+            RoomKeys.Member(it.pk ?: ByteArray(Common.IDENTITY_PK_BYTES), it.pk != null)
+        }
+
+    /** Нулевое поколение: то, что дал обмен ключами комнаты. */
+    private fun initRoomKeys() {
+        val founding = roomKey
+        if (founding.isEmpty()) return
+        synchronized(rotationLock) {
+            roomKeys.init(ChatFrame.KEY_VERSION, founding)
+            roomKeysReady = true
+            roster.clear()
+            sawFirstUserList = false
+            haveBefore = false
+            rotationPending = false
+        }
+        identityManager?.getPublicKey()?.let { rosterNoteIdentity(clientName, it) }
+    }
+
+    /**
+     * Ротировать, если смена состава ждёт и комната успела сойтись.
+     *
+     * Ждём мы потому, что сервер объявляет смену состава раньше, чем её
+     * участники успели сказать, кто они: выборы, проведённые на разъехавшихся
+     * реестрах, избирают всех сразу. Ожидание не бесконечно - участник,
+     * который так и не назвался, иначе держал бы комнату вечно.
+     */
+    private fun rotationTick() {
+        val myPk = identityManager?.getPublicKey() ?: return
+        var doRotate = false
+        synchronized(rotationLock) {
+            if (!rotationPending || !roomKeysReady) return
+            val now = System.currentTimeMillis()
+            if (now < rotationSettleAt) return
+            if (!rosterIdentitiesComplete() && now < rotationDeadline) return
+            rotationPending = false
+            doRotate = RoomKeys.isRotator(rosterContinuing(), myPk)
+        }
+        if (doRotate) rotateNow()
+    }
+
+    /**
+     * Взять новое K_room и раздать его всем, кто в комнате.
+     *
+     * Конверт уходит служебным кадром, не запечатанным ключом комнаты: каждая
+     * запись в нём уже запечатана личным ключом получателя, читать там
+     * серверу нечего, а тому, кому конверт нужнее всех - только что
+     * вошедшему, - открывать внешний конверт нечем.
+     *
+     * Участник без личного ключа записи не получает: адресовать её некуда. Он
+     * читает под старым поколением, пока оно не истечёт, и на этом выбывает -
+     * это и значит быть в ротирующейся комнате без личности.
+     */
+    private fun rotateNow() {
+        val im = identityManager ?: return
+        val s = socket ?: return
+
+        val recipients: List<ByteArray>
+        val next: Int
+        synchronized(rotationLock) {
+            if (!roomKeysReady) return
+            recipients = roster.values.filter { it.present && it.pk != null }.map { it.pk!! }
+            next = roomKeys.currentVersion + 1
+        }
+        if (recipients.isEmpty()) return
+        /* Номер поколения - это то, чем ротация отличается от повтора, так
+         * что переполнение сделало бы старый конверт похожим на свежий.
+         * Шестьдесят пять тысяч смен состава в одной комнате - чужая беда, и
+         * честный ответ на неё - отказаться. */
+        if (next > 0xFFFF) {
+            Log.w("FearClient", "[rotation] generation counter exhausted; not rotating")
+            return
+        }
+
+        val kNew = ByteArray(Common.CRYPTO_AEAD_AES256GCM_KEYBYTES)
+        SecureRandom().nextBytes(kNew)
+
+        val bundle = im.buildRotationBundle(currentRoom, next, kNew, recipients)
+        if (bundle == null) {
+            java.util.Arrays.fill(kNew, 0)
+            Log.w("FearClient", "[rotation] could not build a bundle")
+            return
+        }
+
+        try {
+            sendServiceFrame(s, Common.MSG_TYPE_ROTATION, bundle)
+        } catch (e: Exception) {
+            java.util.Arrays.fill(kNew, 0)
+            Log.w("FearClient", "[rotation] could not send the bundle: ${e.message}")
+            return
+        }
+
+        synchronized(rotationLock) {
+            roomKeys.install(next, kNew, System.currentTimeMillis() / 1000L)
+        }
+        java.util.Arrays.fill(kNew, 0)
+        Log.i("FearClient", "[rotation] room key is now generation $next, " +
+                            "sealed for ${recipients.size} member(s)")
+    }
+
+    /** Принять ротацию, которую прислал кто-то другой. */
+    private fun handleRotationBundle(senderName: String, payload: ByteArray) {
+        val im = identityManager ?: return
+        if (!im.hasIdentity()) return
+
+        val view = RotationBundle.parse(payload) ?: return
+
+        synchronized(rotationLock) {
+            if (!roomKeysReady) return
+            /* Только вперёд. Пришедшее с опозданием старое поколение - повтор. */
+            if (view.keyVersion <= roomKeys.currentVersion) return
+
+            /* Запечатавший должен быть тем, кого комната и выбрала: иначе
+             * ротировать мог бы любой в любой момент, а это отказ в
+             * обслуживании под видом обновления ключа. Но выборы требуют
+             * реестра, а у только что вошедшего его может ещё не быть -
+             * анонсы, из которых он строится, могли прозвучать до того, как
+             * мы начали слушать. Отказ тогда запер бы нас в комнате, в
+             * которую мы только что вошли, поэтому проверяем лишь когда
+             * действительно знаем, кто в ней. */
+            if (haveBefore && rosterIdentitiesComplete() &&
+                !RoomKeys.isRotator(rosterContinuing(), view.senderPk)) {
+                Log.w("FearClient", "[rotation] ignoring a bundle from $senderName: " +
+                                    "not this room's rotator")
+                return
+            }
+        }
+
+        val kNew = im.openRotationBundle(view, currentRoom)
+        if (kNew == null) {
+            Log.w("FearClient", "[rotation] could not open our entry from $senderName")
+            return
+        }
+
+        val installed = synchronized(rotationLock) {
+            roomKeys.install(view.keyVersion, kNew, System.currentTimeMillis() / 1000L)
+        }
+        java.util.Arrays.fill(kNew, 0)
+        if (installed) {
+            Log.i("FearClient", "[rotation] room key is now generation " +
+                                "${view.keyVersion}, from $senderName")
+        }
+    }
+
+    /**
+     * Таймер ротации.
+     *
+     * Приёмный цикл стоит на чтении сокета, так что взведённая ротация в
+     * молчащей комнате сама по себе не сработала бы.
+     */
+    private fun startRotationLoop(forSession: Long) {
+        rotationJob?.cancel()
+        rotationJob = CoroutineScope(Dispatchers.IO).launch {
+            while (forSession == sessionId && isConnected) {
+                kotlinx.coroutines.delay(250)
+                try {
+                    rotationTick()
+                } catch (e: Exception) {
+                    Log.w("FearClient", "[rotation] tick failed: ${e.message}")
+                }
+            }
+        }
     }
 
     // --- Receive loop ---
@@ -1350,6 +1684,13 @@ class FearClient(
                 return true
             }
 
+            // Конверт ротации: служебный кадр, не запечатанный ключом
+            // комнаты - см. rotateNow().
+            if (isServiceMessage && msgType == Common.MSG_TYPE_ROTATION) {
+                if (senderName != clientName) handleRotationBundle(senderName, ciphertext)
+                return true
+            }
+
             // Handle KEY_REQUEST (service message, not encrypted)
             if (isServiceMessage && msgType == Common.MSG_TYPE_KEY_REQUEST) {
                 if (ciphertext.size == Common.CRYPTO_BOX_PUBLICKEYBYTES &&
@@ -1377,12 +1718,13 @@ class FearClient(
             if (senderName == clientName) return true
 
             // Sealed: [key_version(2)][epoch(4)][AEAD]
-            val key = roomKey
-            /* A set, not a key: once rotation lands a receiver has to be
-             * able to read what was already in flight under the generation
-             * being replaced. There is one entry for now. */
-            val ring = if (key == null) null
-                       else listOf(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, key))
+            /* Анонс личности запечатан ключом основания - см. foundingKey().
+             * Только он: пустить туда же чат значило бы оставить каждое
+             * сообщение читаемым всякому, у кого этот ключ когда-либо был, а
+             * ровно от этого ротация и существует. */
+            val ring = if (msgType == Common.MSG_TYPE_IDENTITY_ANNOUNCE)
+                           foundingKey()?.let { listOf(it) }
+                       else chatRing()
             val plaintext = if (ring == null) null else ChatFrame.open(
                 ring, roomBuf.copyOf(roomLen), nameBuf.copyOf(nameLen),
                 ciphertext, nonce)
@@ -1441,6 +1783,13 @@ class FearClient(
                             val sigOk = im.verify(textBytes, sig, pk)
                             if (sigOk) {
                                 val status = im.checkPeerKey(senderName, pk)
+                                /* В реестр, а не только в хранилище доверенных
+                                 * ключей: ротации нужно знать, кто здесь
+                                 * сейчас, а хранилище лежит на диске и говорит,
+                                 * кого мы вообще когда-либо видели.
+                                 * Сменившийся ключ не записываем - это как раз
+                                 * тот случай, когда мы не знаем, кто это. */
+                                if (status != "changed") rosterNoteIdentity(senderName, pk)
                                 prefix = when (status) {
                                     "changed" -> {
                                         val fp = im.fingerprint(pk)
@@ -1591,6 +1940,44 @@ class FearClient(
 
         lastContacts = contacts
         handler.post { listener.onContactsUpdated(contacts) }
+
+        /* Смена состава - это и есть весь повод ротировать: кто-то вошёл, и
+         * ему нельзя читать сказанное раньше, или кто-то вышел, и ему нельзя
+         * читать то, что скажут дальше. */
+        var announce = false
+        synchronized(rotationLock) {
+            /* Снимок берётся до того, как применён новый список, и не
+             * берётся повторно, пока ротация уже взведена: череда входов -
+             * одна смена состава, от той комнаты, какой она была до них. */
+            if (sawFirstUserList && !rotationPending) {
+                rosterSnapshotPresent()
+                haveBefore = true
+            }
+
+            val changed = rosterSetPresent(contacts)
+
+            if (!sawFirstUserList) {
+                /* Наш собственный вход. Ротирует тот, кто был здесь раньше;
+                 * мы берём этот список за отправную точку и оставляем «до»
+                 * пустым, потому что мы его не видели. Записав себя в «уже
+                 * бывших здесь», мы влезли бы в выборы, которые те, кто
+                 * действительно был здесь, ведут без нас, - а два ротатора
+                 * это и есть разъехавшаяся надвое комната. */
+                sawFirstUserList = true
+            } else if (changed && roomKeysReady &&
+                       identityManager?.hasIdentity() == true) {
+                val now = System.currentTimeMillis()
+                rotationSettleAt = now + rotationSettleMs
+                if (!rotationPending) rotationDeadline = now + rotationDeadlineMs
+                rotationPending = true
+                announce = true
+            }
+        }
+
+        /* Сказать заново, кто мы. Только что вошедший нашего анонса не
+         * слышал - он прозвучал до его прихода, - а ротации нужно адресовать
+         * ему запись по личному ключу. */
+        if (announce) socket?.let { sendIdentityAnnounce(it) }
     }
 
     // --- File transfer handling ---
