@@ -10,17 +10,25 @@ import androidx.room.RoomDatabase
  * already-decrypted plaintext as the user actually saw it. The DB file
  * itself sits inside the app sandbox (filesDir).
  *
- * Schema versions:
- *   v1 — messages table (Phase A §9a)
- *   v2 — adds contacts table (Phase B-3 §3)
+ * Версии схемы:
+ *   v1 — таблица messages (Phase A §9a)
+ *   v2 — добавлена таблица contacts (Phase B-3 §3)
  *
- * fallbackToDestructiveMigration: contact list is re-fetchable from the
- * server's encrypted blob, so wiping local data on schema mismatch is OK.
+ * База открывается с явными миграциями (см. [Migrations]). Раньше здесь
+ * стоял fallbackToDestructiveMigration, и он был неправ: контакты
+ * действительно лежат копией на сервере, а переписка - нигде. Ретранслятор
+ * её не хранит, офлайн-ящик отдаёт письмо один раз. Стёртая история не
+ * восстанавливается ниоткуда, и человек узнал бы об этом, открыв пустой чат
+ * после обычного обновления.
+ *
+ * Меняешь сущность - поднимай версию и пиши переход. Пропущенный переход
+ * теперь роняет открытие базы (и падает тест миграций), а не вычищает чужую
+ * переписку молча.
  */
 @Database(
     entities = [MessageEntity::class, ContactEntity::class],
     version = 2,
-    exportSchema = false,
+    exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
 
@@ -36,7 +44,7 @@ abstract class AppDatabase : RoomDatabase() {
                     ctx.applicationContext,
                     AppDatabase::class.java,
                     "fear-history.db",
-                ).fallbackToDestructiveMigration()
+                ).addMigrations(*Migrations.ALL)
                  .build().also { INSTANCE = it }
             }
         }

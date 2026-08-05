@@ -33,6 +33,24 @@ android {
         versionName = "0.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        /*
+         * Схема базы выкладывается в файл и хранится в репозитории.
+         *
+         * Без неё Room нечем сверять миграцию: он узнаёт о расхождении уже
+         * на устройстве пользователя, и до этой правки отвечал на расхождение
+         * стиранием. Выложенная схема даёт две вещи - сверку при сборке и
+         * возможность прогнать миграцию тестом на старой базе, а не на чужой
+         * переписке.
+         */
+        ksp {
+            arg("room.schemaLocation", "$projectDir/schemas")
+        }
+    }
+
+    sourceSets {
+        // Схемы нужны инструментальному тесту миграций как ресурс.
+        getByName("androidTest").assets.srcDirs("$projectDir/schemas")
     }
 
     buildTypes {
@@ -109,6 +127,11 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
+    // Прогон миграций на настоящей старой базе, а не на догадке о ней.
+    androidTestImplementation("androidx.room:room-testing:2.6.1")
+    // На голой JVM org.json - заглушка из android.jar, бросающая "not mocked".
+    // Тесту миграции нужно читать выложенную схему, поэтому берём настоящую.
+    testImplementation("org.json:json:20240303")
 
     // ZXing for QR code generation (identity backup) and scanning (import).
     // Need transitive deps now: CameraView + the embedded CaptureActivity used
