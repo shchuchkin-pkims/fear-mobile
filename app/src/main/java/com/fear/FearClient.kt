@@ -1897,8 +1897,11 @@ class FearClient(
 
         val kNew = im.openRotationBundle(view, wireRoomStr())
         if (kNew == null) {
-            Log.w("FearClient", "[rotation] could not open our entry" +
-                                (if (BuildConfig.DEBUG) " from $senderName" else ""))
+            /* Отправитель и комната - в рабочей сборке тоже: без них строка
+             * говорит лишь «что-то не открылось», а разбираться приходится
+             * именно на живом телефоне. */
+            Log.w("FearClient", "[rotation] could not open our entry from $senderName " +
+                                "(room=${wireRoomStr()}, ver=${view.keyVersion})")
             return
         }
 
@@ -2192,7 +2195,10 @@ class FearClient(
                 }
 
                 Common.MSG_TYPE_IDENTITY_ANNOUNCE -> {
-                    if (BuildConfig.DEBUG) Log.d("FearClient",
+                    /* Не под BuildConfig.DEBUG: в рабочей сборке эти строки
+                     * вырезаются, а разбираться приходится именно в ней - на
+                     * живом телефоне, а не на эмуляторе. */
+                    Log.i("FearClient",
                         "[roster] announce from $senderName, ${plaintext.size} bytes")
                     // [pk(32)][sig(64)][name_len(2)][name]
                     val sigPrefixLen = Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES
@@ -2202,12 +2208,20 @@ class FearClient(
                         val dlen = Common.readUInt16(plaintext, sigPrefixLen)
                         val im = identityManager
                         // Длина пришла по проводу, значит выбрана не нами.
+                        if (im == null || sigPrefixLen + 2 + dlen > plaintext.size || dlen <= 0) {
+                            Log.w("FearClient",
+                                "[roster] announce from $senderName unusable: " +
+                                    "dlen=$dlen size=${plaintext.size} im=${im != null}")
+                        }
                         if (im != null && sigPrefixLen + 2 + dlen <= plaintext.size && dlen > 0) {
                             val display = String(plaintext, sigPrefixLen + 2, dlen, Charsets.UTF_8)
                             val signed = com.fear.crypto.SessionTag
                                 .announceSignedBytes(senderName, display)
                             val sigOk = im.verify(signed, sig, pk)
                             val fp = im.fingerprint(pk)
+                            Log.i("FearClient",
+                                "[roster] announce '$display' from $senderName: " +
+                                    "sig=" + (if (sigOk) "ok" else "BAD") + " fp=$fp")
                             if (sigOk) {
                                 val status = im.checkPeerKey(display, pk)
                                 /* Именно здесь реестр и пополняется в обычной
@@ -2228,7 +2242,28 @@ class FearClient(
                                  * этого анонса участник стоял в нём огрызком
                                  * метки. Пересобираем - иначе объявившийся
                                  * после списка так и остался бы неизвестным. */
-                                if (wasUnnamed && status != "changed") publishContacts()
+                                if (wasUnnamed && status != "changed") {
+                                    publishContacts()
+                                    /*
+                                     * Назовись в ответ.
+                                     *
+                                     * Вошедший получает ключ комнаты не
+                                     * мгновенно, а анонс запечатан
+                                     * ключом-родоначальником: наш анонс,
+                                     * посланный на смену состава, приходит
+                                     * раньше ключа, и открыть его нечем.
+                                     * Второго повода объявиться нет - смена
+                                     * состава уже прошла, - и собеседник
+                                     * остаётся с огрызком метки вместо имени.
+                                     *
+                                     * Услышали незнакомую метку - значит её
+                                     * хозяин уже с ключом. Отвечаем ровно
+                                     * один раз на метку: wasUnnamed истинно
+                                     * только при первом опознании, поэтому
+                                     * перезвон невозможен.
+                                     */
+                                    socket?.let { sendIdentityAnnounce(it) }
+                                }
                             }
                         }
                     }

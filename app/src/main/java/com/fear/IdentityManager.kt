@@ -319,8 +319,20 @@ class IdentityManager(private val context: Context) {
         System.arraycopy(pk, 0, payload, 0, Common.IDENTITY_PK_BYTES)
         System.arraycopy(sig, 0, payload, Common.IDENTITY_PK_BYTES, Common.IDENTITY_SIG_BYTES)
         val at = Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES
-        payload[at] = ((nameBytes.size shr 8) and 0xFF).toByte()
-        payload[at + 1] = (nameBytes.size and 0xFF).toByte()
+        /*
+         * Через Common.writeUInt16, а не руками.
+         *
+         * Здесь стояли две строки, писавшие длину старшим байтом вперёд, -
+         * против принятого на проводе порядка (wr_u16 в C кладёт младший
+         * первым, и Common.readUInt16 читает так же). Имя длиной 29 байт
+         * прочитывалось как 7424, анонс отбрасывался как негодный, и имена
+         * не разрешались ни на одной платформе.
+         *
+         * Ломалось молча: получатель просто показывал огрызок метки вместо
+         * имени. Готовая пара функций для того и есть, чтобы порядок байтов
+         * не приходилось помнить в каждом месте заново.
+         */
+        Common.writeUInt16(payload, at, nameBytes.size)
         System.arraycopy(nameBytes, 0, payload, at + 2, nameBytes.size)
         return payload
     }
