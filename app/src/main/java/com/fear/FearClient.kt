@@ -109,6 +109,17 @@ class FearClient(
      */
     private var wireRoom: String = ""
 
+    /**
+     * Комната строкой, как её видит ретранслятор.
+     *
+     * Всё, что скрепляется криптографически, должно брать именно её, а не
+     * название: у собеседника на другой платформе название может даже не
+     * совпадать по регистру, а метка выводится одинаково. Разойдись
+     * стороны здесь - подписи и привязки перестанут сходиться молча.
+     */
+    private fun wireRoomStr(): String =
+        if (wireRoom.isNotEmpty()) wireRoom else WireRoom.of(currentRoom)
+
     private fun wireRoomBytes(): ByteArray =
         (if (wireRoom.isNotEmpty()) wireRoom else WireRoom.of(currentRoom))
             .toByteArray(Charsets.UTF_8)
@@ -1829,7 +1840,11 @@ class FearClient(
         val kNew = ByteArray(Common.CRYPTO_AEAD_AES256GCM_KEYBYTES)
         SecureRandom().nextBytes(kNew)
 
-        val bundle = im.buildRotationBundle(currentRoom, next, kNew, recipients)
+        /* Метка, а не название: ровно её кладёт в привязку настольный
+         * клиент. Здесь стояло currentRoom, и записи, адресованные
+         * собеседнику на ПК, у него не открывались - без единой ошибки,
+         * просто «участник не появился». */
+        val bundle = im.buildRotationBundle(wireRoomStr(), next, kNew, recipients)
         if (bundle == null) {
             java.util.Arrays.fill(kNew, 0)
             Log.w("FearClient", "[rotation] could not build a bundle")
@@ -1880,7 +1895,7 @@ class FearClient(
             }
         }
 
-        val kNew = im.openRotationBundle(view, currentRoom)
+        val kNew = im.openRotationBundle(view, wireRoomStr())
         if (kNew == null) {
             Log.w("FearClient", "[rotation] could not open our entry" +
                                 (if (BuildConfig.DEBUG) " from $senderName" else ""))
