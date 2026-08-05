@@ -836,8 +836,11 @@ class ComposeMainActivity : ComponentActivity() {
             putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, keyHex)
             putExtra(VideoCallActivity.EXTRA_QUALITY,      "medium")
             putExtra(VideoCallActivity.EXTRA_IS_RELAY,     true)
-            putExtra(VideoCallActivity.EXTRA_RELAY_ROOM,   viewModel.roomName())
-            putExtra(VideoCallActivity.EXTRA_RELAY_NAME,   viewModel.userName())
+            /* Метки, а не название и имя: сервер сводит участников звонка по
+             * этой паре, и она должна совпасть с той, под которой
+             * зарегистрирован чат - в том числе у собеседника на ПК. */
+            putExtra(VideoCallActivity.EXTRA_RELAY_ROOM,   viewModel.relayRoomLabel())
+            putExtra(VideoCallActivity.EXTRA_RELAY_NAME,   viewModel.relaySessionTag())
         }
         startActivity(intent)
     }

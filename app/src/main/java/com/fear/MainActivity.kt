@@ -403,8 +403,8 @@ class MainActivity : AppCompatActivity(), FearClient.FearClientListener {
                     putExtra(VideoCallActivity.EXTRA_ENCRYPTION_KEY, encryptionKey)
                     putExtra(VideoCallActivity.EXTRA_QUALITY, quality)
                     putExtra(VideoCallActivity.EXTRA_IS_RELAY, true)
-                    putExtra(VideoCallActivity.EXTRA_RELAY_ROOM, fearClient.getCurrentRoom())
-                    putExtra(VideoCallActivity.EXTRA_RELAY_NAME, fearClient.getCurrentName())
+                    putExtra(VideoCallActivity.EXTRA_RELAY_ROOM, fearClient.relayRoomLabel())
+                    putExtra(VideoCallActivity.EXTRA_RELAY_NAME, fearClient.relaySessionTag())
                     putExtra(VideoCallActivity.EXTRA_CALL_ID, callIdHex)
                 }
                 startActivity(intent)

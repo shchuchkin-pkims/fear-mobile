@@ -1089,6 +1089,10 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     fun roomName(): String   = client.getCurrentRoom()
     fun userName(): String   = client.getCurrentName()
 
+    /* Для регистрации звонка на ретрансляторе - метки, а не название и имя. */
+    fun relayRoomLabel(): String  = client.relayRoomLabel()
+    fun relaySessionTag(): String = client.relaySessionTag()
+
     /**
      * The call_id for a video call, hex: the one a peer announced in this room
      * a moment ago, or a fresh one that the client announces there. Null when

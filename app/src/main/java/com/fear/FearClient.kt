@@ -242,6 +242,18 @@ class FearClient(
     fun getServerHost(): String = serverHost
     fun getServerPort(): Int = serverPort
     fun getCurrentRoom(): String = currentRoom
+
+    /**
+     * Чем называться ретранслятору при регистрации звонка.
+     *
+     * Звонок идёт своим соединением и регистрируется на сервере отдельно.
+     * Передай он название комнаты и настоящее имя - на ретрансляторе снова
+     * появилась бы строка, которую чат только что перестал показывать, а
+     * собеседник на другой платформе (там регистрация идёт по метке) просто
+     * не нашёлся бы: сервер сводит участников звонка по этой самой паре.
+     */
+    fun relayRoomLabel(): String = wireRoomStr()
+    fun relaySessionTag(): String = sessionTag
     fun getCurrentName(): String = clientName
 
     /** Метка сессии в байтах - то, чем нас зовёт ретранслятор. */
@@ -1224,7 +1236,16 @@ class FearClient(
      * nothing about a call here, and its key material is a different room's.
      */
     private fun inviteStillCounts(): Boolean =
-        lastInviteRoom == currentRoom &&
+        /* Сравнивать метку с меткой.
+         *
+         * lastInviteRoom берётся из заголовка кадра, а там с некоторых пор
+         * едет метка комнаты, а не её название. Сравнение с currentRoom не
+         * сходилось никогда: приглашение всегда считалось чужим, принимающий
+         * заводил собственный идентификатор звонка - и ключи мультимедиа
+         * расходились. Звонок при этом соединялся и молча отвергал каждый
+         * пакет собеседника с ERR_MAC.
+         */
+        lastInviteRoom == wireRoomStr() &&
             System.currentTimeMillis() - lastInviteAt < INVITE_FRESH_MS
 
     /** 16 fresh bytes. All-zero means "unset" on both sides, so never that. */
