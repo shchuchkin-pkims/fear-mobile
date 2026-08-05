@@ -333,7 +333,9 @@ class VideoCallManager(
 
         callKey = masterKey.copyOf()
         this.callId = keepId
-        quality = preset
+        /* Поправки, выставленные человеком, поверх выбранного набора:
+         * поток и частота кадров решают, поспевает звонок или сыпется. */
+        quality = VideoQualityPreset.fromPrefs(context, preset)
         sendWidth = preset.width
         sendHeight = preset.height
         identityManager = identityMgr

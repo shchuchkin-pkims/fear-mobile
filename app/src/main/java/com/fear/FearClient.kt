@@ -633,6 +633,7 @@ class FearClient(
                 }
 
                 val manager = getOrCreateAudioCallManager()
+                manager.applyMicSettings(context)
                 manager.initialize(roomKey, callId, identityManager)
                 mediaCallId = callId
 
@@ -693,6 +694,7 @@ class FearClient(
                     return@launch
                 }
                 val manager = getOrCreateAudioCallManager()
+                manager.applyMicSettings(context)
                 manager.initialize(encryptionKey, callId, identityManager)
                 mediaCallId = callId
                 manager.startCallDirect(serverIp, serverPort, localPort, encryptionKey)
@@ -720,6 +722,7 @@ class FearClient(
                     return@launch
                 }
                 val manager = getOrCreateAudioCallManager()
+                manager.applyMicSettings(context)
                 manager.initialize(encryptionKey, callId, identityManager)
                 mediaCallId = callId
                 /* Комната - меткой, участник - меткой сессии. Звонок идёт через тот
@@ -749,6 +752,7 @@ class FearClient(
                     return@launch
                 }
                 val manager = getOrCreateAudioCallManager()
+                manager.applyMicSettings(context)
                 manager.initialize(encryptionKey, callId, identityManager)
                 mediaCallId = callId
                 manager.startListenDirect(localPort, encryptionKey)
@@ -2251,7 +2255,8 @@ class FearClient(
                         // talking would otherwise re-derive our keys and our
                         // SID under everyone's feet.
                         if (!callId.contentEquals(mediaCallId)) {
-                            manager.initialize(roomKey, callId, identityManager)
+                            manager.applyMicSettings(context)
+                manager.initialize(roomKey, callId, identityManager)
                             mediaCallId = callId
                         }
                         manager.startCall(udpInfo.user, host, udpInfo.udpPort, udpInfo.noncePrefix)

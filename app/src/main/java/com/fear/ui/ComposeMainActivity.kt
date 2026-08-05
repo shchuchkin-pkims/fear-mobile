@@ -35,6 +35,7 @@ import com.fear.ThemeManager
 import com.fear.ui.components.IdentityBackupSheet
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.fear.ui.components.CallSettingsDialog
 import com.fear.ui.components.MenuSheet
 import com.fear.ui.components.NewChatSheet
 import com.fear.ui.components.PasswordPromptDialog
@@ -121,6 +122,7 @@ class ComposeMainActivity : ComponentActivity() {
                 var searchOpen by remember { mutableStateOf(false) }
                 var profileOpen by remember { mutableStateOf(false) }
                 var contactsOpen by remember { mutableStateOf(false) }
+                var callSettingsOpen by remember { mutableStateOf(false) }
                 /* Когда не null — открыт диалог регистрации handle для
                  * указанного сервера. Делаем общим для всех экранов:
                  * запускается и из ProfileScreen, и из ConnectScreen. */
@@ -541,6 +543,14 @@ class ComposeMainActivity : ComponentActivity() {
                             onSearch = { searchOpen = true },
                             onProfile = { profileOpen = true },
                             onContacts = { contactsOpen = true },
+                            onCallSettings = { callSettingsOpen = true },
+                        )
+                    }
+
+                    if (callSettingsOpen) {
+                        CallSettingsDialog(
+                            ctx = this@ComposeMainActivity,
+                            onDismiss = { callSettingsOpen = false },
                         )
                     }
 

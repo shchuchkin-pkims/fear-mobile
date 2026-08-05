@@ -62,6 +62,23 @@ class AudioCallManager(
     private var remoteAddress: InetAddress? = null
     private var remoteUdpPort: Int = 0
     private var audioRecord: AudioRecord? = null
+
+    /*
+     * Настройки микрофона.
+     *
+     * Чувствительность руками нужна потому, что микрофоны разные: у
+     * телефона в кармане чехла и у гарнитуры разница в добрый десяток
+     * децибел, а автоматика системы выравнивает это не всегда.
+     *
+     * Подавление шума здесь - штатное, системное (NoiseSuppressor). На
+     * телефоне оно лучше всего, что можно написать самому: часто сделано
+     * прямо в звуковом тракте устройства. Раньше включалось всегда; теперь
+     * его можно выключить - на некоторых аппаратах оно ощутимо режет тихую
+     * речь, и человеку виднее, что для него хуже.
+     */
+    private var micGainDb: Int = 0
+    private var noiseSuppressEnabled: Boolean = true
+    private var micGain: Float = 1.0f
     private var audioTrack: AudioTrack? = null
     private var recordJob: Job? = null
     private var playJob: Job? = null
@@ -1024,8 +1041,8 @@ class AudioCallManager(
             }
             if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
                 val ns = android.media.audiofx.NoiseSuppressor.create(sessionId)
-                ns?.enabled = true
-                println("ACM_DEBUG: NoiseSuppressor enabled")
+                ns?.enabled = noiseSuppressEnabled
+                println("ACM_DEBUG: NoiseSuppressor enabled=$noiseSuppressEnabled")
             }
 
             println("ACM_DEBUG: Creating AudioTrack...")
@@ -1193,6 +1210,42 @@ class AudioCallManager(
         }
     }
 
+    /**
+     * Взять настройки микрофона из общих настроек приложения.
+     *
+     * Читаются перед каждым звонком, а не запоминаются при запуске: человек
+     * может подвинуть ползунок между звонками, и следующий должен пойти уже
+     * с новым значением.
+     */
+    fun applyMicSettings(ctx: android.content.Context) {
+        val p = ctx.getSharedPreferences("fear_prefs", android.content.Context.MODE_PRIVATE)
+        micGainDb = p.getInt("audio_mic_gain_db", 0).coerceIn(-24, 24)
+        noiseSuppressEnabled = p.getBoolean("audio_noise_suppress", true)
+        micGain = Math.pow(10.0, micGainDb / 20.0).toFloat()
+    }
+
+    /**
+     * Усиление на месте, с насыщением.
+     *
+     * Насыщение, а не перенос через край: переполнение Short звучит как
+     * треск, который громче любого шума, ради которого сюда лезли.
+     */
+    private fun applyGain(buf: ByteArray, len: Int) {
+        if (micGain == 1.0f) return
+        var i = 0
+        while (i + 1 < len) {
+            val lo = buf[i].toInt() and 0xFF
+            val hi = buf[i + 1].toInt()
+            var v = ((hi shl 8) or lo) * micGain
+            if (v > 32767f) v = 32767f
+            if (v < -32768f) v = -32768f
+            val o = v.toInt()
+            buf[i] = (o and 0xFF).toByte()
+            buf[i + 1] = ((o shr 8) and 0xFF).toByte()
+            i += 2
+        }
+    }
+
     private fun startAudioRecording() {
         println("ACM_DEBUG: startAudioRecording called")
         recordJob = CoroutineScope(Dispatchers.IO).launch {
@@ -1210,6 +1263,9 @@ class AudioCallManager(
                 try {
                     val bytesRead = recorder.read(audioBuffer, 0, audioBuffer.size)
                     if (bytesRead > 0) {
+                        /* Между микрофоном и кодировщиком: кодировщику
+                         * достаётся уже то, что услышит собеседник. */
+                        applyGain(audioBuffer, bytesRead)
                         frameCount++
                         if (frameCount % 50 == 0) {
                             println("ACM_DEBUG: Recording frame $frameCount, bytes: $bytesRead")

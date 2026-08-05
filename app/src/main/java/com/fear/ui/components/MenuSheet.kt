@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Delete
@@ -50,6 +51,7 @@ fun MenuSheet(
     onSearch: () -> Unit,
     onProfile: () -> Unit,
     onContacts: () -> Unit,
+    onCallSettings: () -> Unit,
 ) {
     val colors = LocalFearColors.current
     val sheetState = rememberModalBottomSheetState()
@@ -74,6 +76,9 @@ fun MenuSheet(
             }
             MenuItem(Icons.Filled.SystemUpdate, "Check for updates", colors.textPrimary) {
                 onCheckUpdates(); onDismiss()
+            }
+            MenuItem(Icons.Filled.Tune, "Call settings…", colors.textPrimary) {
+                onCallSettings(); onDismiss()
             }
             MenuItem(Icons.Filled.VpnKey, "Trusted keys", colors.textPrimary) {
                 onTrustedKeys(); onDismiss()

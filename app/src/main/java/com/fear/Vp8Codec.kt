@@ -370,5 +370,25 @@ data class VideoQualityPreset(
         val LOW = VideoQualityPreset(320, 240, 15, 200)
         val MEDIUM = VideoQualityPreset(640, 480, 25, 500)
         val HIGH = VideoQualityPreset(1280, 720, 30, 1500)
+
+        /**
+         * Набор с поправками, которые человек выставил руками.
+         *
+         * Готовые три покрывают обычные случаи, но не мобильный интернет в
+         * дороге и не гигабитный вайфай дома. Разрешение при этом берётся
+         * из выбранного набора: его меняет и камера, и собеседник, а поток
+         * и частоту кадров человек чувствует напрямую - именно они решают,
+         * поспевает звонок или сыпется.
+         *
+         * Границы не вкусовые: ниже 128 кбит/с VP8 даёт кашу вместо лица, а
+         * ниже 10 кадров в секунду разговор перестаёт читаться по губам и
+         * начинает раздражать рывками.
+         */
+        fun fromPrefs(ctx: android.content.Context, base: VideoQualityPreset): VideoQualityPreset {
+            val p = ctx.getSharedPreferences("fear_prefs", android.content.Context.MODE_PRIVATE)
+            val kbps = p.getInt("video_bitrate_kbps", base.bitrateKbps).coerceIn(128, 4000)
+            val fps = p.getInt("video_fps", base.fps).coerceIn(10, 30)
+            return base.copy(fps = fps, bitrateKbps = kbps)
+        }
     }
 }
