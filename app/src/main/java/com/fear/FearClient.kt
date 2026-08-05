@@ -1401,6 +1401,7 @@ class FearClient(
 
     /** Запомнить или обновить личный ключ участника. */
     private fun rosterNoteIdentity(name: String, pk: ByteArray) {
+        if (BuildConfig.DEBUG) Log.d("FearClient", "[roster] identity of '$name' recorded")
         synchronized(rotationLock) {
             val e = roster.getOrPut(name) { RosterEntry() }
             e.pk = pk.copyOf()
@@ -1504,6 +1505,9 @@ class FearClient(
             recipients = roster.values.filter { it.present && it.pk != null }.map { it.pk!! }
             next = roomKeys.currentVersion + 1
         }
+        if (BuildConfig.DEBUG) Log.d("FearClient", "[rotation] roster: " +
+            roster.entries.joinToString {
+                "${it.key}(present=${it.value.present},id=${it.value.pk != null})" })
         if (recipients.isEmpty()) return
         /* Номер поколения - это то, чем ротация отличается от повтора, так
          * что переполнение сделало бы старый конверт похожим на свежий.
@@ -1562,15 +1566,16 @@ class FearClient(
              * действительно знаем, кто в ней. */
             if (haveBefore && rosterIdentitiesComplete() &&
                 !RoomKeys.isRotator(rosterContinuing(), view.senderPk)) {
-                Log.w("FearClient", "[rotation] ignoring a bundle from $senderName: " +
-                                    "not this room's rotator")
+                Log.w("FearClient", "[rotation] ignoring a bundle: not this room's rotator" +
+                                    (if (BuildConfig.DEBUG) " (from $senderName)" else ""))
                 return
             }
         }
 
         val kNew = im.openRotationBundle(view, currentRoom)
         if (kNew == null) {
-            Log.w("FearClient", "[rotation] could not open our entry from $senderName")
+            Log.w("FearClient", "[rotation] could not open our entry" +
+                                (if (BuildConfig.DEBUG) " from $senderName" else ""))
             return
         }
 
@@ -1579,8 +1584,8 @@ class FearClient(
         }
         java.util.Arrays.fill(kNew, 0)
         if (installed) {
-            Log.i("FearClient", "[rotation] room key is now generation " +
-                                "${view.keyVersion}, from $senderName")
+            Log.i("FearClient", "[rotation] room key is now generation ${view.keyVersion}" +
+                                (if (BuildConfig.DEBUG) ", from $senderName" else ""))
         }
     }
 
@@ -1840,6 +1845,8 @@ class FearClient(
                 }
 
                 Common.MSG_TYPE_IDENTITY_ANNOUNCE -> {
+                    if (BuildConfig.DEBUG) Log.d("FearClient",
+                        "[roster] announce from $senderName, ${plaintext.size} bytes")
                     // [pk(32)][sig_over_name(64)]
                     val sigPrefixLen = Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES
                     if (plaintext.size >= sigPrefixLen) {
@@ -1852,6 +1859,11 @@ class FearClient(
                             val fp = im.fingerprint(pk)
                             if (sigOk) {
                                 val status = im.checkPeerKey(senderName, pk)
+                                /* Именно здесь реестр и пополняется в обычной
+                                 * жизни: анонс - первое, что участник говорит,
+                                 * войдя в комнату, и до него ротации некому
+                                 * адресовать запись. */
+                                if (status != "changed") rosterNoteIdentity(senderName, pk)
                                 if (status == "changed") {
                                     val msg = Message(room, "system",
                                         "WARNING: Key CHANGED for $senderName! Fingerprint: $fp. Possible MITM attack!",

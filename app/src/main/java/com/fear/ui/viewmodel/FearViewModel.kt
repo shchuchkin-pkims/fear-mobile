@@ -212,7 +212,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                         id = f.room, title = f.room,
                         preview = "", lastActivity = Instant.now())),
                     messages = emptyList(),
-                    statusText = "online",
+                    statusText = "Online…",
                     errorBanner = null,
                 )
             }
@@ -371,23 +371,41 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
      *  recomputeStatus. */
     @Volatile private var connectedAtMs: Long = 0
 
+    /** Сколько ждём первый USER_LIST, прежде чем поверить, что мы одни. */
+    private val statusSettleMs = 3_000L
+
+    /** Отложенный пересчёт статуса; см. recomputeStatus. */
+    private var statusRefresh: kotlinx.coroutines.Job? = null
+
     private fun recomputeStatus() {
         val total = maxOf(reportedCount, seenPeers.size + 1)
         val isPm  = _form.value.room.startsWith("pm:") || _form.value.room.startsWith("dm:")
         // Сервер шлёт USER_LIST через несколько мс после успешного
-        // подключения. До его прихода (grace-period 3 секунды) не
-        // показываем «just you online» / «offline» — иначе пользователь
-        // видит «один в комнате» хотя собеседник уже там.
-        val recentlyConnected =
-            (System.currentTimeMillis() - connectedAtMs) < 3_000
+        // подключения. До его прихода не утверждаем, что мы одни, — иначе
+        // пользователь видит «один в комнате», когда собеседник уже там.
+        val sinceConnect = System.currentTimeMillis() - connectedAtMs
+        val settling = sinceConnect < statusSettleMs
         val text = when {
             !_uiState.value.isConnected -> ""
-            isPm && total >= 2  -> "online"
-            isPm                -> if (recentlyConnected) "connecting…" else "offline"
-            total <= 1          -> if (recentlyConnected) "online…"      else "just you online"
-            else                -> "$total online"
+            isPm && total >= 2     -> "Online"
+            isPm                   -> if (settling) "Connecting…" else "Offline"
+            total <= 1 && settling -> "Online…"
+            else                   -> "Online $total"
         }
         _uiState.update { it.copy(statusText = text) }
+
+        /* Без этого надпись замерзает. Пересчитывают её только события, а
+         * «ещё подключаемся» перестаёт быть правдой само по себе: если после
+         * входа в комнате больше ничего не происходит, «Online…» остаётся на
+         * экране навсегда. */
+        statusRefresh?.cancel()
+        statusRefresh = null
+        if (settling && _uiState.value.isConnected) {
+            statusRefresh = viewModelScope.launch {
+                kotlinx.coroutines.delay(statusSettleMs - sinceConnect + 100)
+                recomputeStatus()
+            }
+        }
     }
 
     fun updateForm(transform: (ConnectFormState) -> ConnectFormState) {
