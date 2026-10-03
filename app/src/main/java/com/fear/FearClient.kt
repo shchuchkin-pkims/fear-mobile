@@ -149,7 +149,18 @@ class FearClient(
      */
     private class RosterEntry(
         var pk: ByteArray? = null,
-        var present: Boolean = true,
+        /**
+         * Присутствие - слово сервера, а не вывод из услышанного кадра,
+         * поэтому по умолчанию его нет.
+         *
+         * Вошедший объявляется сразу, и его анонс обгоняет список участников
+         * от ретранслятора. Заведи мы запись присутствующей - пришедший
+         * следом список не изменил бы ничего, смена состава пропала бы
+         * молча, и ротация не взвелась бы. Вошедший остался бы на нулевом
+         * поколении: он не читает комнату, а комната не читает его, едва
+         * истечёт льготная минута прошлого поколения.
+         */
+        var present: Boolean = false,
         /** Был ли участник здесь до той смены состава, которую разбираем. */
         var wasPresent: Boolean = false,
         /** Имя из анонса. null - ещё не объявился. */
@@ -169,6 +180,23 @@ class FearClient(
      * комната.
      */
     private var haveBefore = false
+
+    /**
+     * Список участников, пришедший, пока мы ждали ключ комнаты.
+     *
+     * Ретранслятор рассылает его, как только зарегистрировал нас, - а
+     * регистрирует нас KEY_REQUEST, задолго до ответа с ключом. ecdhJoinRoom
+     * читает кадры сама и раньше выбрасывала всё, что не ответ, а с прочим и
+     * этот список - единственную весть о нашем собственном приходе. Тогда
+     * первым учтённым списком становилась следующая смена состава, и мы
+     * принимали чужой вход за свой, в выборах не участвуя. Окажись избранным
+     * ротатором мы - не ротировал бы никто, и вошедший остался бы на нулевом
+     * поколении, глухим к комнате.
+     *
+     * Хранится последний: если состав за время ожидания менялся ещё раз, наш
+     * приход - это комната, какой она стала к его концу.
+     */
+    @Volatile private var joinUserList: ByteArray? = null
 
     private var rotationPending = false
     private var rotationSettleAt = 0L
@@ -448,6 +476,12 @@ class FearClient(
                 // Нулевое поколение K_room и реестр состава - до анонса,
                 // чтобы в реестре уже были мы сами.
                 initRoomKeys()
+
+                /* Свой приход, услышанный во время ожидания ключа: учесть его
+                 * первым списком, ровно так, как учёл бы цикл приёма. После
+                 * initRoomKeys, который реестр очищает, и до startReceiving. */
+                joinUserList?.let { handleUserList(it) }
+                joinUserList = null
 
                 /* Регистрирует нас на сервере первый же отправленный кадр:
                  * имя и комнату он берёт из его заголовка. Годится любой
@@ -924,6 +958,7 @@ class FearClient(
         ls.cryptoBoxKeypair(myPk, mySk)
 
         // Send KEY_REQUEST with our ephemeral public key
+        joinUserList = null
         sendServiceFrame(socket, Common.MSG_TYPE_KEY_REQUEST, myPk)
         Log.i("FearClient", "[join] Sent KEY_REQUEST, waiting for response...")
 
@@ -1007,6 +1042,10 @@ class FearClient(
 
                 // Check if this is a KEY_RESPONSE service message
                 val isZeroNonce = nonce.all { it == 0.toByte() }
+                /* Свой приход: сохранить, а не выбросить. См. joinUserList. */
+                if (typeBuf[0] == Common.MSG_TYPE_USER_LIST && isZeroNonce && room == wireRoom) {
+                    joinUserList = payload.copyOf()
+                }
                 if (typeBuf[0] != Common.MSG_TYPE_KEY_RESPONSE || !isZeroNonce || room != wireRoom) {
                     continue
                 }
@@ -1712,7 +1751,9 @@ class FearClient(
     private fun rosterNoteIdentity(tag: String, pk: ByteArray, display: String?) {
         if (BuildConfig.DEBUG) Log.d("FearClient", "[roster] identity of '$tag' recorded")
         synchronized(rotationLock) {
-            val e = roster.getOrPut(tag) { RosterEntry() }
+            /* Только личность: присутствие выставит rosterSetPresent, когда
+             * сервер скажет, и ровно тогда это будет сменой состава. */
+            val e = roster.getOrPut(tag) { RosterEntry(present = false) }
             e.pk = pk.copyOf()
             if (!display.isNullOrEmpty()) e.display = display
         }
