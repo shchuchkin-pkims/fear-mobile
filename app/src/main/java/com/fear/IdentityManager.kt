@@ -91,25 +91,17 @@ class IdentityManager(private val context: Context) {
     }
 
     /**
-     * Compute BLAKE2b fingerprint of a public key (first 8 bytes).
-     * Returns hex string like "ab:cd:ef:01:23:45:67:89".
+     * Fingerprint of a public key: BLAKE2b with an 8-byte output, the same on
+     * every platform. Hex string like "ab:cd:ef:01:23:45:67:89".
      */
-    fun fingerprint(pk: ByteArray): String {
-        val hash = ByteArray(8)
-        ls.cryptoGenericHash(hash, 8, pk, pk.size.toLong(), null, 0)
-        return hash.joinToString(":") { "%02x".format(it) }
-    }
+    fun fingerprint(pk: ByteArray): String = com.fear.crypto.Fingerprint.of(pk)
 
     /**
-     * Short fingerprint per §1 of the architecture doc: first 4 bytes of
-     * BLAKE2b(identity_pk) as 8 lowercase hex chars. Used to disambiguate
+     * Short fingerprint per §1 of the architecture doc: the first 4 bytes of
+     * the fingerprint above as 8 lowercase hex chars. Used to disambiguate
      * users with the same display name (`evgenii#a3b9c1d2`).
      */
-    fun fpshort(pk: ByteArray): String {
-        val hash = ByteArray(4)
-        ls.cryptoGenericHash(hash, 4, pk, pk.size.toLong(), null, 0)
-        return hash.joinToString("") { "%02x".format(it) }
-    }
+    fun fpshort(pk: ByteArray): String = com.fear.crypto.Fingerprint.short(pk)
 
     /** Convenience: name#fpshort or null if no identity. */
     fun shortIdentity(displayName: String): String? {
@@ -370,7 +362,7 @@ class IdentityManager(private val context: Context) {
 
     fun loadKnownKeys(): List<KnownKey> {
         val text = readEncryptedText(knownKeysFile) ?: return emptyList()
-        return text.lineSequence().mapNotNull { line ->
+        val keys = text.lineSequence().mapNotNull { line ->
             if (line.isBlank()) return@mapNotNull null
             val parts = line.split('\t')
             if (parts.size >= 2) {
@@ -382,6 +374,10 @@ class IdentityManager(private val context: Context) {
                 } else null
             } else null
         }.toList()
+        // Один раз после обновления с версии до 0.6.0: дальше менять нечего.
+        val relabeled = relabelLegacyShortFingerprints(keys) ?: return keys
+        saveAllKnownKeys(relabeled)
+        return relabeled
     }
 
     /**
@@ -583,4 +579,31 @@ class IdentityManager(private val context: Context) {
     companion object {
         private const val TAG = "FearIdentity"
     }
+}
+
+/**
+ * Переименовать записи, которые звонки завели под коротким отпечатком до
+ * 0.6.0. Тогда он считался BLAKE2b с 4-байтовым выходом, теперь это начало
+ * полного отпечатка (см. crypto/Fingerprint). Без переименования следующий
+ * звонок завёл бы рядом вторую запись того же ключа, а отметка «проверен»
+ * осталась бы на старой. Совпавшие после переименования записи сливаются;
+ * «проверен» сохраняется, если стоял хоть на одной.
+ *
+ * @return новый список или null, если менять нечего.
+ */
+internal fun relabelLegacyShortFingerprints(
+    keys: List<IdentityManager.KnownKey>,
+    hasher: com.fear.crypto.KeyedHash = com.fear.crypto.SodiumKeyedHash,
+): List<IdentityManager.KnownKey>? {
+    var changed = false
+    val renamed = keys.map { k ->
+        if (k.name.length == 8 && k.name == com.fear.crypto.Fingerprint.legacyShort(k.pk, hasher)) {
+            changed = true
+            k.copy(name = com.fear.crypto.Fingerprint.short(k.pk, hasher))
+        } else k
+    }
+    if (!changed) return null
+    return renamed
+        .groupBy { it.name to it.pk.toList() }
+        .map { (_, same) -> same.first().copy(verified = same.any { it.verified }) }
 }
