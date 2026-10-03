@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Bundle
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -30,13 +31,52 @@ class Vp8Encoder(
     private val bufferInfo = MediaCodec.BufferInfo()
     private var frameCount = 0L
 
-    private fun makeFormat(mime: String): MediaFormat {
+    private fun makeFormat(mime: String, info: MediaCodecInfo? = null): MediaFormat {
         return MediaFormat.createVideoFormat(mime, width, height).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1000)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            /*
+             * CBR, если кодек его умеет. По умолчанию программный VP8 работает
+             * в VBR и на живом звонке перебирал заданный поток примерно на
+             * пятую часть - а сверх нормы он перебирает как раз на сложных
+             * сценах, когда сеть и так на пределе. CBR держит поток ровнее,
+             * и BitrateGovernor управляет тем, что действительно уходит.
+             */
+            if (supportsCbr(info, mime)) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            }
+        }
+    }
+
+    private fun supportsCbr(info: MediaCodecInfo?, mime: String): Boolean = try {
+        info?.getCapabilitiesForType(mime)?.encoderCapabilities
+            ?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) == true
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Цель, с которой кодировщик работает сейчас. */
+    @Volatile var currentBitrateKbps: Int = bitrateKbps
+        private set
+
+    /**
+     * Сменить битрейт на ходу, не перезапуская кодировщик: перезапуск стоил бы
+     * ключевого кадра и паузы, а менять цель приходится как раз тогда, когда
+     * сеть и так не успевает.
+     */
+    fun setBitrateKbps(kbps: Int) {
+        val c = codec ?: return
+        try {
+            c.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, kbps * 1000)
+            })
+            currentBitrateKbps = kbps
+        } catch (e: IllegalStateException) {
+            // Кодировщик уже остановлен: звонок заканчивается, менять нечего.
         }
     }
 
@@ -51,13 +91,15 @@ class Vp8Encoder(
             throw IllegalStateException("VP8 encoder not available")
         }
 
-        Log.d(TAG, "VP8 encoder started: ${codec?.name} ${width}x${height}@${fps}")
+        val cbr = codec?.let { supportsCbr(it.codecInfo, it.codecInfo.supportedTypes.firstOrNull() ?: MIME_VP8) } == true
+        Log.i(TAG, "VP8 encoder started: ${codec?.name} ${width}x${height}@${fps} " +
+                   "$bitrateKbps kbps ${if (cbr) "CBR" else "default rate mode"}")
     }
 
     private fun tryCreateEncoder(mime: String): MediaCodec? {
         return try {
             MediaCodec.createEncoderByType(mime).also {
-                it.configure(makeFormat(mime), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                it.configure(makeFormat(mime, it.codecInfo), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 it.start()
                 Log.d(TAG, "Created encoder by type: $mime -> ${it.name}")
             }
@@ -73,7 +115,7 @@ class Vp8Encoder(
             for (name in SW_ENCODER_NAMES) {
                 try {
                     return MediaCodec.createByCodecName(name).also {
-                        it.configure(makeFormat(mime), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                        it.configure(makeFormat(mime, it.codecInfo), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                         it.start()
                         Log.d(TAG, "Created encoder by name: $name (mime=$mime)")
                     }

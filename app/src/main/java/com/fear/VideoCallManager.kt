@@ -306,6 +306,12 @@ class VideoCallManager(
     @Volatile private var lastPeerPingTs = 0
     @Volatile private var peerPingRecvTime = 0L
     @Volatile private var measuredRttMs = 0
+
+    /** Подстройка битрейта под выгрузку. Живёт вместе с кодировщиком. */
+    @Volatile private var bitrateGovernor: BitrateGovernor? = null
+
+    /** Предел частоты кадров из настроек. Живёт вместе с кодировщиком. */
+    @Volatile private var frameLimiter: FrameRateLimiter? = null
     private var lastStatsSendTime = 0L
 
     data class PendingFrame(
@@ -1011,8 +1017,12 @@ class VideoCallManager(
             vp8Encoder = Vp8Encoder(sendWidth, sendHeight, quality.fps, quality.bitrateKbps).also {
                 it.start()
             }
+            // Настройка человека - потолок: больше неё не шлём никогда.
+            bitrateGovernor = BitrateGovernor(quality.bitrateKbps)
+            frameLimiter = FrameRateLimiter(quality.fps)
             encoderReady = true
-            Log.d(TAG, "VP8 encoder started: ${sendWidth}x${sendHeight}@${quality.fps}")
+            Log.d(TAG, "VP8 encoder started: ${sendWidth}x${sendHeight}@${quality.fps}, " +
+                       "ceiling ${quality.bitrateKbps} kbps")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VP8 encoder", e)
         }
@@ -1033,6 +1043,10 @@ class VideoCallManager(
 
         val encoder = vp8Encoder ?: return
         val vKey = ownVideoKey ?: return
+
+        /* Кадры сверх заказанной частоты - до кодировщика, а не после: камера
+         * даёт свои 30, настройка просит меньше. См. FrameRateLimiter. */
+        if (frameLimiter?.admit(SystemClock.elapsedRealtime()) == false) return
 
         val pts = System.nanoTime() / 1000
 
@@ -1059,10 +1073,21 @@ class VideoCallManager(
                 pts
             ) ?: return
 
+            val sendStart = SystemClock.elapsedRealtime()
             sendFragmentedFrame(encoded, vKey)
+            val now = SystemClock.elapsedRealtime()
+
+            /* Запись встаёт, когда буфер сокета полон: сеть не уносит то, что
+             * мы ей даём. Это и есть сигнал снижать поток. */
+            bitrateGovernor?.let { g ->
+                g.onFrameSent(now, now - sendStart)
+                g.evaluate(now)?.let { kbps ->
+                    encoder.setBitrateKbps(kbps)
+                    Log.i(TAG, "[quality] bitrate -> $kbps kbps (${g.lastReason})")
+                }
+            }
 
             // Send stats every 2 seconds
-            val now = SystemClock.elapsedRealtime()
             if (now - lastStatsSendTime >= 2000L) {
                 lastStatsSendTime = now
                 sendStatsPacket(vKey)
@@ -1341,6 +1366,8 @@ class VideoCallManager(
         // Now safe to release codecs and audio
         try { vp8Encoder?.stop() } catch (_: Exception) {}
         vp8Encoder = null
+        bitrateGovernor = null
+        frameLimiter = null
         synchronized(videoLock) {
             for (pv in peerVideo.values) {
                 try { pv.decoder?.stop() } catch (_: Exception) {}
@@ -1951,7 +1978,10 @@ class VideoCallManager(
             if (pongTs != 0) {
                 val now32 = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
                 val rtt = now32 - pongTs
-                if (rtt in 0..RTT_SANE_MAX_MS) measuredRttMs = rtt
+                if (rtt in 0..RTT_SANE_MAX_MS) {
+                    measuredRttMs = rtt
+                    bitrateGovernor?.onRtt(SystemClock.elapsedRealtime(), rtt)
+                }
             }
             lastPeerPingTs = pingTs
             peerPingRecvTime = SystemClock.elapsedRealtime()
