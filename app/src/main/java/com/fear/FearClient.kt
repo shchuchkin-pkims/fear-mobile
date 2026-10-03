@@ -366,6 +366,8 @@ class FearClient(
     fun connect(host: String, port: Int, room: String, name: String,
                 keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY,
                 joinTimeoutMs: Int = 30000) {
+        CallNames.resolver = ::displayNameForTag
+
         // Новая сессия — все notify*, относящиеся к старому socket-у,
         // будут отброшены, чтобы не сбрасывать UI после reconnect.
         val mySession = ++sessionId
@@ -1773,6 +1775,18 @@ class FearClient(
         }
         lastContacts = names
         handler.post { listener.onContactsUpdated(names) }
+    }
+
+    /**
+     * Отображаемое имя по метке сессии или её началу - для подписей в звонке,
+     * где от метки едут первые 16 знаков. См. CallNames.
+     */
+    fun displayNameForTag(tagOrPrefix: String): String? {
+        if (tagOrPrefix.isEmpty()) return null
+        return synchronized(rotationLock) {
+            roster.entries.firstOrNull { (tag, e) -> e.present && tag.startsWith(tagOrPrefix) }
+                ?.value?.display
+        }
     }
 
     /** Отметить состав, который назвал сервер. Возвращает true, если он изменился. */

@@ -976,7 +976,8 @@ class VideoCallManager(
                 val size = peerSize[slot]
                 Participant(
                     slot = slot,
-                    name = peerName[slot] ?: "%06x".format(slot),
+                    // Имя из реестра чата, а не метка из HELLO2 - см. CallNames.
+                    name = peerName[slot]?.let { CallNames.labelFor(it) } ?: "%06x".format(slot),
                     main = slot == mainSlot,
                     speaking = speaking.contains(slot),
                     pinned = slot == pinnedSlot,
