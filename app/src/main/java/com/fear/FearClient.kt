@@ -384,6 +384,12 @@ class FearClient(
                 isConnected = false
 
                 currentRoom = room
+                /* Метка комнаты - сразу вместе с названием: под ней идут и
+                 * проба AUTO, и обмен ключами, и всё дальше. Проба под меткой
+                 * прошлой комнаты (а при переходе из личного чата в группу та
+                 * пуста) отвечала «никого» - и телефон создавал уже живую
+                 * комнату заново, со своим ключом, глухой к остальным. */
+                wireRoom = WireRoom.of(room)
                 clientName = name
                 // Новое подключение - новая метка. В этом весь смысл: две
                 // сессии одного человека не должны быть связаны для сервера.
@@ -455,10 +461,6 @@ class FearClient(
                         roomKey = ByteArray(0)
                     }
                 }
-
-                /* Метка комнаты - до обмена ключами: он идёт уже под ней,
-                 * иначе входящий постучится не туда. */
-                wireRoom = WireRoom.of(currentRoom)
 
                 // If join mode, perform ECDH key exchange before proceeding
                 if (effectiveMode == ConnectMode.JOIN_ROOM) {
