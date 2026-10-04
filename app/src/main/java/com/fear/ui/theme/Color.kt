@@ -36,7 +36,7 @@ object FearColorsLight {
     val BubblePeer          = Color(0xFFFFFFFF)
     val BubbleSelfText      = Color(0xFF000000)
     val BubblePeerText      = Color(0xFF000000)
-    val UnreadBadge         = Color(0xFF4DCD5E)
+    val UnreadBadge         = Color(0xFF40A7E3)   // голубой, как у Telegram
 }
 
 // Hash-based avatar palette (matches desktop).

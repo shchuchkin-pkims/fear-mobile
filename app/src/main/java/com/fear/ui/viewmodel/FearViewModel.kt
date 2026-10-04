@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -50,6 +51,39 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _form = MutableStateFlow(loadFormFromPrefs())
     val form: StateFlow<ConnectFormState> = _form.asStateFlow()
+
+    /*
+     * Непрочитанные - по комнатам. Растут, когда сообщение пришло в чат,
+     * которого сейчас нет на экране: письмо из ящика в личный чат, пока
+     * сидим в общей комнате, или сообщение в комнату, пока открыт список
+     * чатов. Обнуляются, когда чат открывают. Хранятся в настройках: письмо
+     * из ящика второй раз не придёт, и после перезапуска счётчик должен
+     * помнить, что его не прочли.
+     */
+    private val unreadPrefs = app.getSharedPreferences("fear_unread", Context.MODE_PRIVATE)
+    private val _unread = MutableStateFlow(
+        unreadPrefs.all.mapNotNull { (k, v) -> (v as? Int)?.let { k to it } }.toMap())
+
+    private fun bumpUnread(room: String) {
+        val n = (_unread.value[room] ?: 0) + 1
+        _unread.update { it + (room to n) }
+        unreadPrefs.edit().putInt(room, n).apply()
+    }
+
+    private fun markRead(room: String) {
+        if (!_unread.value.containsKey(room)) return
+        _unread.update { it - room }
+        unreadPrefs.edit().remove(room).apply()
+    }
+
+    init {
+        /* Открыл чат - прочёл: где бы ни выставлялся открытый чат. */
+        viewModelScope.launch {
+            uiState.map { it.activeChatId }.distinctUntilChanged().collect { id ->
+                if (id != null) markRead(id)
+            }
+        }
+    }
 
     /** Состояние регистрации текущей идентичности на выбранном сервере. */
     enum class RegStatus { Unknown, Probing, Registered, NotRegistered, Error }
@@ -139,7 +173,8 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
             uiState,
             _form,
             dao.observeChatSummaries(),
-        ) { contacts, ui, f, summaries ->
+            _unread,
+        ) { contacts, ui, f, summaries, unread ->
             val im = IdentityManager(app)
             val lastTsByRoom: Map<String, Long> =
                 summaries.associate { it.roomId to it.lastTs }
@@ -159,6 +194,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                         if (c.server != null) "@$h@${c.server}" else "@$h"
                     } ?: "",
                     lastActivity = Instant.ofEpochMilli(historyTs ?: c.addedAt),
+                    unread = if (pmId == ui.activeChatId) 0 else unread[pmId] ?: 0,
                     kind = ChatKind.DM,
                     peerPkB64 = c.identityPkB64,
                 )
@@ -181,6 +217,7 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                     title = roomId,
                     preview = "",
                     lastActivity = ts?.let { Instant.ofEpochMilli(it) } ?: Instant.now(),
+                    unread = if (roomId == ui.activeChatId) 0 else unread[roomId] ?: 0,
                     kind = ChatKind.GROUP,
                 )
             }
@@ -280,9 +317,22 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 fromSelf  = false,
                 delivered = true,
             )
-            _uiState.update { it.copy(messages = it.messages + msg) }
-            persistMessage(msg)
-            if (message.sender.isNotBlank() && message.sender != "system") {
+            /*
+             * Сообщение - в свою комнату, а на экран - только если этот чат
+             * открыт. Живое приходит из комнаты, к которой подключены; письмо
+             * из ящика - из своей личной, пока мы, может быть, сидим в общей.
+             * Раньше всё добавлялось в открытый чат, и личное сообщение
+             * оказывалось посреди general и в её истории.
+             */
+            val room = message.room.ifEmpty { _form.value.room }
+            persistMessage(msg, room)
+            if (room == _uiState.value.activeChatId) {
+                _uiState.update { it.copy(messages = it.messages + msg) }
+            } else if (message.sender != "system") {
+                bumpUnread(room)
+            }
+            if (room == _form.value.room &&
+                message.sender.isNotBlank() && message.sender != "system") {
                 seenPeers.add(message.sender)
                 recomputeStatus()
             }
@@ -446,7 +496,10 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 if (pk.size != 32) continue   // длина Ed25519-ключа
                 val room = im.pmRoomId(pk) ?: continue
                 val kPm = im.pmRoomKey(pk) ?: continue
-                client.watchMailbox(room, kPm)
+                /* Свой ключ - чтобы спрашивать свой ящик, ключ собеседника -
+                 * чтобы писать в его (см. Mailbox). */
+                val myPk = im.getPublicKey() ?: continue
+                client.watchMailbox(room, kPm, myPk, pk)
                 kPm.fill(0)
             }
         }
@@ -1066,8 +1119,14 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Append `msg` to the persisted history of the currently active chat. */
-    private fun persistMessage(msg: ChatMessage) {
-        val roomId = _uiState.value.activeChatId ?: return
+    /**
+     * Записать сообщение в историю комнаты [room]; по умолчанию - открытого
+     * чата. Комнату передают явно, когда сообщение не для экрана: письмо из
+     * ящика в другой чат, сообщение, пришедшее, пока открыт список, - иначе
+     * оно не попадало в историю вовсе и пропадало при открытии чата.
+     */
+    private fun persistMessage(msg: ChatMessage, room: String? = null) {
+        val roomId = room ?: _uiState.value.activeChatId ?: return
         val ownName = _form.value.name
         viewModelScope.launch(Dispatchers.IO) {
             dao.insert(MessageEntity(

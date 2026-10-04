@@ -221,7 +221,10 @@ class FearClient(
      * придёт - в том числе сидя в совсем другой комнате. Ради этого клиент
      * следит сразу за всеми ящиками и спрашивает их одним запросом.
      */
-    private class Mail(val room: String, val kPm: ByteArray, val addr: ByteArray)
+    /** addrIn - ящик, куда пишут нам (его и спрашиваем); addrOut - ящик
+     *  собеседника, куда пишем мы. См. Mailbox. */
+    private class Mail(val room: String, val kPm: ByteArray,
+                       val addrIn: ByteArray, val addrOut: ByteArray)
 
     private val mailboxes = LinkedHashMap<String, Mail>()
     private val mailboxLock = Any()
@@ -251,10 +254,11 @@ class FearClient(
      *
      * Список контактов ведёт интерфейс, поэтому ключи приходят снаружи.
      */
-    fun watchMailbox(room: String, kPm: ByteArray) {
-        val addr = Mailbox.address(kPm)
+    fun watchMailbox(room: String, kPm: ByteArray, myPk: ByteArray, theirPk: ByteArray) {
+        val addrIn = Mailbox.address(kPm, myPk)
+        val addrOut = Mailbox.address(kPm, theirPk)
         synchronized(mailboxLock) {
-            mailboxes[room] = Mail(room, kPm.copyOf(), addr)
+            mailboxes[room] = Mail(room, kPm.copyOf(), addrIn, addrOut)
         }
     }
 
@@ -1641,7 +1645,7 @@ class FearClient(
         val body = Mailbox.seal(m.room, m.kPm, clientName,
                                 text.toByteArray(Charsets.UTF_8), nonce) ?: return false
         return try {
-            sendServiceFrame(socket, Common.MSG_TYPE_INBOX_PUT, m.addr + body)
+            sendServiceFrame(socket, Common.MSG_TYPE_INBOX_PUT, m.addrOut + body)
             true
         } catch (e: Exception) {
             Log.w("FearClient", "[inbox] could not post: ${e.message}")
@@ -1651,7 +1655,7 @@ class FearClient(
 
     /** Спросить все ящики разом. */
     private fun pollMailboxes(socket: Socket) {
-        val addrs = synchronized(mailboxLock) { mailboxes.values.map { it.addr } }
+        val addrs = synchronized(mailboxLock) { mailboxes.values.map { it.addrIn } }
         if (addrs.isEmpty()) return
 
         val body = ByteArray(2 + addrs.size * Mailbox.ADDR_BYTES)
@@ -1664,7 +1668,7 @@ class FearClient(
     /** Подтвердить получение - только после того, как письмо показано. */
     private fun ackMailbox(socket: Socket, m: Mail, id: Long) {
         val body = ByteArray(Mailbox.ADDR_BYTES + 2 + 8)
-        m.addr.copyInto(body, 0)
+        m.addrIn.copyInto(body, 0)
         Common.writeUInt16(body, Mailbox.ADDR_BYTES, 1)
         var v = id
         for (b in 0 until 8) {
@@ -1714,7 +1718,7 @@ class FearClient(
             off += len
 
             val m = synchronized(mailboxLock) {
-                mailboxes.values.firstOrNull { it.addr.contentEquals(addr) }
+                mailboxes.values.firstOrNull { it.addrIn.contentEquals(addr) }
             } ?: return@repeat
 
             val letter = Mailbox.open(m.room, m.kPm, body) ?: return@repeat
@@ -2154,7 +2158,11 @@ class FearClient(
                      * регистрировались на сервере сборки постарше, и в чате
                      * от них оставался пустой пузырь. */
                     if (content.isBlank()) return true
-                    val message = Message(room, senderLabel(senderName), content,
+                    /* currentRoom, а не room из заголовка: там метка комнаты на
+                     * проводе (хеш), а интерфейс раскладывает сообщения по
+                     * названиям. Чужая комната сюда не попадёт - ретранслятор
+                     * шлёт соединению только кадры его же комнаты. */
+                    val message = Message(currentRoom, senderLabel(senderName), content,
                                          System.currentTimeMillis())
                     notifyMessageReceived(message)
                 }
@@ -2222,7 +2230,7 @@ class FearClient(
                                 prefix = when (status) {
                                     "changed" -> {
                                         val fp = im.fingerprint(pk)
-                                        val warn = Message(room, "system",
+                                        val warn = Message(currentRoom, "system",
                                             "WARNING: Key CHANGED for $announced! " +
                                             "Fingerprint: $fp. Possible MITM attack!",
                                             System.currentTimeMillis())
@@ -2242,7 +2250,7 @@ class FearClient(
                             prefix = "[?] "
                         }
 
-                        val message = Message(room, senderLabel(senderName), prefix + text,
+                        val message = Message(currentRoom, senderLabel(senderName), prefix + text,
                             System.currentTimeMillis(), Common.MSG_TYPE_SIGNED_TEXT)
                         notifyMessageReceived(message)
                     }
@@ -2309,7 +2317,7 @@ class FearClient(
                                 }
                                 if (status != "changed") rosterNoteIdentity(senderName, pk, display)
                                 if (status == "changed") {
-                                    val msg = Message(room, "system",
+                                    val msg = Message(currentRoom, "system",
                                         "WARNING: Key CHANGED for $display! Fingerprint: $fp. Possible MITM attack!",
                                         System.currentTimeMillis())
                                     notifyMessageReceived(msg)
@@ -2492,7 +2500,7 @@ class FearClient(
                 File(savePath).createNewFile()
                 notifyFileTransferProgress(basename, 0f)
 
-                val msg = Message(room, sender, "Sending file: $basename ($fileSize bytes)",
+                val msg = Message(currentRoom, sender, "Sending file: $basename ($fileSize bytes)",
                     System.currentTimeMillis())
                 notifyMessageReceived(msg)
             }

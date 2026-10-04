@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -111,16 +112,23 @@ fun ChatListRow(
                     modifier = Modifier.weight(1f),
                 )
                 if (entry.unread > 0) {
-                    Text(
-                        text = if (entry.unread > 99) "99+" else entry.unread.toString(),
-                        color = androidx.compose.ui.graphics.Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
+                    /* Круг для одной цифры, капсула для двух и больше - как
+                     * счётчик у Telegram. */
+                    Box(
+                        contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .clip(CircleShape)
+                            .defaultMinSize(minWidth = 22.dp, minHeight = 22.dp)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(50))
                             .background(colors.unreadBadge)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    )
+                            .padding(horizontal = 6.dp),
+                    ) {
+                        Text(
+                            text = if (entry.unread > 99) "99+" else entry.unread.toString(),
+                            color = androidx.compose.ui.graphics.Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
                 }
             }
         }
