@@ -1,5 +1,14 @@
 package com.fear
 
+import com.fear.crypto.CallInvite
+import com.fear.crypto.ChatFrame
+import com.fear.crypto.Mailbox
+import com.fear.crypto.RoomKeys
+import com.fear.crypto.WireRoom
+import com.fear.crypto.RotationBundle
+import com.fear.crypto.KeySchedule
+import com.fear.crypto.MediaKeys
+
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -14,6 +23,20 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.security.SecureRandom
 import java.util.*
+
+/**
+ * How long a call announced by another member counts as still running. A
+ * start inside this window joins that call instead of opening a second one.
+ */
+private const val INVITE_FRESH_MS = 60_000L
+
+private const val ERR_NO_ROOM_FOR_ID =
+    "Cannot start the call: the call id has to be announced to the room, and " +
+    "this client is not connected to one."
+
+private const val ERR_NO_INVITE =
+    "Cannot answer the call: the caller announced no call id, so there is " +
+    "nothing to derive the media keys from."
 
 class FearClient(
     private val context: Context,
@@ -31,12 +54,29 @@ class FearClient(
         fun onCallStarted(remoteUser: String, isInitiator: Boolean)
         fun onCallEnded()
         fun onAudioStatsUpdated(rttMs: Int) {}
+
+        /**
+         * A room member announced a call.
+         *
+         * The invite carries the call_id every media key of that call is
+         * bound to; without using this exact value the two ends derive
+         * different keys and hear nothing. Defaulted so screens that do not
+         * handle calls need no change.
+         */
+        fun onCallInviteReceived(fromUser: String, invite: CallInvite.Invite) {}
         fun onContactsUpdated(contacts: List<String>)
     }
 
     private var socket: Socket? = null
     private var receiveJob: Job? = null
+    private var pingJob: Job? = null
     @Volatile private var isConnected = false
+    // Каждый вызов connect() инкрементит sessionId. Все notify-методы и
+    // disconnect() проверяют, что событие принадлежит активной сессии,
+    // иначе игнорируют — иначе старый receive-loop, отвалившийся при
+    // reconnect-е, мог бы вызвать onDisconnected поверх свежего
+    // onConnected и сбросить UI на ConnectScreen.
+    @Volatile private var sessionId: Long = 0L
     @Volatile var isInForeground = true
     @Volatile var lastContacts: List<String> = emptyList()
 
@@ -47,14 +87,230 @@ class FearClient(
     fun isConnected(): Boolean = isConnected
     private var currentRoom = ""
     private var clientName = ""
+
+    /**
+     * Метка этой сессии на проводе.
+     *
+     * В поле имени кадра теперь едет она, а не clientName: ретранслятору
+     * незачем видеть, как зовут людей. Метка новая на каждое подключение,
+     * поэтому связать по ней два сеанса одного человека нельзя.
+     *
+     * Настоящее имя уезжает внутрь шифра, анонсом личности.
+     */
+    private var sessionTag = ""
     private var serverHost = ""
     private var serverPort = 0
+    /**
+     * Комната, какой её видит ретранслятор: хеш от названия.
+     *
+     * currentRoom остаётся настоящим названием - оно нужно там, где речь о
+     * нашей собственной стороне: история, почтовые ящики, выбор личной
+     * комнаты. На провод же уходит метка.
+     */
+    private var wireRoom: String = ""
+
+    /**
+     * Комната строкой, как её видит ретранслятор.
+     *
+     * Всё, что скрепляется криптографически, должно брать именно её, а не
+     * название: у собеседника на другой платформе название может даже не
+     * совпадать по регистру, а метка выводится одинаково. Разойдись
+     * стороны здесь - подписи и привязки перестанут сходиться молча.
+     */
+    private fun wireRoomStr(): String =
+        if (wireRoom.isNotEmpty()) wireRoom else WireRoom.of(currentRoom)
+
+    private fun wireRoomBytes(): ByteArray =
+        (if (wireRoom.isNotEmpty()) wireRoom else WireRoom.of(currentRoom))
+            .toByteArray(Charsets.UTF_8)
+
     private var roomKey = ByteArray(0)
+
+    /*
+     * Ротация ключа комнаты. Зеркало того, что делает консольный клиент, и
+     * формат должен совпадать байт в байт: комната, где сидят телефон и
+     * десктоп, ротируется только если обе стороны собирают одни и те же
+     * байты, а иначе она молча разъезжается надвое.
+     *
+     * roomKey остаётся ключом основания комнаты и после ротаций: под ним
+     * едут анонсы личности, потому что только что вошедший другого ключа
+     * ещё не знает, а без анонса ему некому адресовать конверт.
+     */
+    private val roomKeys = RoomKeys()
+    private var roomKeysReady = false
+
+    /** Реестр состава: кому адресовать конверт и кто кого выбирает. */
+    /**
+     * Кто в комнате, под какой меткой и с каким именем.
+     *
+     * Ключ реестра - метка сессии, а не имя: имя сервер больше не видит и
+     * список участников присылает метками. Имя приходит отдельно, анонсом
+     * личности, вместе с подписью, привязывающей его к этой метке.
+     */
+    private class RosterEntry(
+        var pk: ByteArray? = null,
+        /**
+         * Присутствие - слово сервера, а не вывод из услышанного кадра,
+         * поэтому по умолчанию его нет.
+         *
+         * Вошедший объявляется сразу, и его анонс обгоняет список участников
+         * от ретранслятора. Заведи мы запись присутствующей - пришедший
+         * следом список не изменил бы ничего, смена состава пропала бы
+         * молча, и ротация не взвелась бы. Вошедший остался бы на нулевом
+         * поколении: он не читает комнату, а комната не читает его, едва
+         * истечёт льготная минута прошлого поколения.
+         */
+        var present: Boolean = false,
+        /** Был ли участник здесь до той смены состава, которую разбираем. */
+        var wasPresent: Boolean = false,
+        /** Имя из анонса. null - ещё не объявился. */
+        var display: String? = null,
+    )
+
+    private val roster = LinkedHashMap<String, RosterEntry>()
+    private var sawFirstUserList = false
+
+    /**
+     * Есть ли у нас «до».
+     *
+     * Список, которым нас встретили при входе, - не та смена состава, которую
+     * мы видели: что было в комнате мгновением раньше, мы не знаем, а те, кто
+     * там был, нас не считают. Пока смена состава не произойдёт при нас, мы в
+     * выборах не участвуем и принимаем того ротатора, которого выбрала
+     * комната.
+     */
+    private var haveBefore = false
+
+    /**
+     * Список участников, пришедший, пока мы ждали ключ комнаты.
+     *
+     * Ретранслятор рассылает его, как только зарегистрировал нас, - а
+     * регистрирует нас KEY_REQUEST, задолго до ответа с ключом. ecdhJoinRoom
+     * читает кадры сама и раньше выбрасывала всё, что не ответ, а с прочим и
+     * этот список - единственную весть о нашем собственном приходе. Тогда
+     * первым учтённым списком становилась следующая смена состава, и мы
+     * принимали чужой вход за свой, в выборах не участвуя. Окажись избранным
+     * ротатором мы - не ротировал бы никто, и вошедший остался бы на нулевом
+     * поколении, глухим к комнате.
+     *
+     * Хранится последний: если состав за время ожидания менялся ещё раз, наш
+     * приход - это комната, какой она стала к его концу.
+     */
+    @Volatile private var joinUserList: ByteArray? = null
+
+    private var rotationPending = false
+    private var rotationSettleAt = 0L
+    private var rotationDeadline = 0L
+    private var rotationJob: Job? = null
+
+    /** Тишина после последней смены состава, за которую реестры сходятся. */
+    private val rotationSettleMs = 1500L
+
+    /** Сколько ждать участника, который так и не сказал, кто он. */
+    private val rotationDeadlineMs = 6000L
+
+    /** Реестр и кольцо трогают и приёмный цикл, и таймер ротации. */
+    private val rotationLock = Any()
+
+    /*
+     * Почтовые ящики контактов.
+     *
+     * Личная переписка - это комната, чей идентификатор и ключ выводятся из
+     * двух личных ключей. Пока обе стороны в ней, всё идёт как обычно; если
+     * собеседника нет, письмо ложится в ящик, и он забирает его, когда
+     * придёт - в том числе сидя в совсем другой комнате. Ради этого клиент
+     * следит сразу за всеми ящиками и спрашивает их одним запросом.
+     */
+    /** addrIn - ящик, куда пишут нам (его и спрашиваем); addrOut - ящик
+     *  собеседника, куда пишем мы. См. Mailbox. */
+    private class Mail(val room: String, val kPm: ByteArray,
+                       val addrIn: ByteArray, val addrOut: ByteArray)
+
+    private val mailboxes = LinkedHashMap<String, Mail>()
+    private val mailboxLock = Any()
+
+    /* Уже показанные письма - по номеру от ретранслятора. Удалить письмо мы
+     * просим после показа, и если два запроса оказались в полёте разом,
+     * одно письмо пришло бы в обоих ответах (на ПК так одно сообщение
+     * показалось трижды). Номера - одного сервера: сбрасываются при
+     * подключении. */
+    private val seenLetters = LinkedHashSet<Long>()
+    private var mailboxJob: Job? = null
+
+    /**
+     * Как часто спрашиваем почту.
+     *
+     * На переднем плане человек ждёт ответа и смотрит на экран - двадцать
+     * секунд там заметны. В фоне их никто не считает, а батарею тратит
+     * каждое пробуждение радио, поэтому шаг реже. Настоящего push тут нет и
+     * не будет: он на Android означает Google FCM, то есть чужой сервис,
+     * знающий время каждого вашего сообщения.
+     */
+    private val mailboxPollForegroundMs = 20_000L
+    private val mailboxPollBackgroundMs = 60_000L
+
+    private fun mailboxPollDelay(): Long =
+        if (isInForeground) mailboxPollForegroundMs else mailboxPollBackgroundMs
+
+    /** Срок хранения, о котором сказал сервер; 0 - не хранит ничего. */
+    @Volatile var relayInboxTtlSeconds: Int = -1
+        private set
+
+    /**
+     * Взять ящик пары под наблюдение.
+     *
+     * Список контактов ведёт интерфейс, поэтому ключи приходят снаружи.
+     */
+    fun watchMailbox(room: String, kPm: ByteArray, myPk: ByteArray, theirPk: ByteArray) {
+        val addrIn = Mailbox.address(kPm, myPk)
+        val addrOut = Mailbox.address(kPm, theirPk)
+        synchronized(mailboxLock) {
+            mailboxes[room] = Mail(room, kPm.copyOf(), addrIn, addrOut)
+        }
+    }
+
+    fun forgetMailboxes() {
+        synchronized(mailboxLock) {
+            for (m in mailboxes.values) m.kPm.fill(0)
+            mailboxes.clear()
+        }
+    }
+
+
 
     fun getServerHost(): String = serverHost
     fun getServerPort(): Int = serverPort
     fun getCurrentRoom(): String = currentRoom
+
+    /**
+     * Чем называться ретранслятору при регистрации звонка.
+     *
+     * Звонок идёт своим соединением и регистрируется на сервере отдельно.
+     * Передай он название комнаты и настоящее имя - на ретрансляторе снова
+     * появилась бы строка, которую чат только что перестал показывать, а
+     * собеседник на другой платформе (там регистрация идёт по метке) просто
+     * не нашёлся бы: сервер сводит участников звонка по этой самой паре.
+     */
+    fun relayRoomLabel(): String = wireRoomStr()
+    fun relaySessionTag(): String = sessionTag
     fun getCurrentName(): String = clientName
+
+    /** Метка сессии в байтах - то, чем нас зовёт ретранслятор. */
+    private fun wireNameBytes(): ByteArray =
+        sessionTag.toByteArray(Charsets.US_ASCII)
+
+    /**
+     * Как показать отправителя кадра.
+     *
+     * Метка - не имя, и превратить одно в другое мы вправе только после
+     * анонса, подпись которого сошлась. Пока участник не объявился,
+     * показываем огрызок метки: «пришло, от кого - пока неизвестно» честнее
+     * правдоподобного имени, взятого непонятно откуда.
+     */
+    private fun senderLabel(tag: String): String {
+        val d = synchronized(rotationLock) { roster[tag]?.display }
+        return d ?: ("?" + tag.take(8))
+    }
 
     fun getRoomKeyHex(): String {
         if (roomKey.isEmpty()) return ""
@@ -64,11 +320,32 @@ class FearClient(
     private val handler = Handler(Looper.getMainLooper())
     private var currentFileTransfer: FileTransfer? = null
 
-    enum class ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM }
+    enum class ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM, AUTO }
 
     private var audioCallManager: AudioCallManager? = null
     private var pendingCallRequest: AudioCallRequest? = null
     private var identityManager: IdentityManager? = null
+
+    /**
+     * The call_id of the call being set up: 16 bytes, drawn by whoever starts
+     * a call and announced to the room in a CallInvite. Every media key is
+     * bound to it, so the value handed to a call manager has to be the very
+     * same one the room was told - one id in the invite and another in the
+     * keys gives a call that connects and then sits in silence.
+     */
+    @Volatile private var currentCallId: ByteArray? = null
+
+    /** The last call another member announced, in which room, and when. */
+    @Volatile private var lastInvite: CallInvite.Invite? = null
+    @Volatile private var lastInviteRoom = ""
+    @Volatile private var lastInviteAt = 0L
+
+    /**
+     * The call_id the audio manager was last configured for. initialize()
+     * re-derives every key and rebuilds the codecs, so it must not be called
+     * again on a call that is already running.
+     */
+    @Volatile private var mediaCallId: ByteArray? = null
 
     private fun getOrCreateAudioCallManager(): AudioCallManager {
         if (audioCallManager == null) {
@@ -98,7 +375,13 @@ class FearClient(
     }
 
     fun connect(host: String, port: Int, room: String, name: String,
-                keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY) {
+                keyBase64: String, mode: ConnectMode = ConnectMode.MANUAL_KEY,
+                joinTimeoutMs: Int = 30000) {
+        CallNames.resolver = ::displayNameForTag
+
+        // Новая сессия — все notify*, относящиеся к старому socket-у,
+        // будут отброшены, чтобы не сбрасывать UI после reconnect.
+        val mySession = ++sessionId
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 // Close any previous connection before starting a new one
@@ -106,13 +389,27 @@ class FearClient(
                 try { socket?.close() } catch (_: Exception) {}
                 socket = null
                 isConnected = false
+                synchronized(mailboxLock) { seenLetters.clear() }
 
                 currentRoom = room
+                /* Метка комнаты - сразу вместе с названием: под ней идут и
+                 * проба AUTO, и обмен ключами, и всё дальше. Проба под меткой
+                 * прошлой комнаты (а при переходе из личного чата в группу та
+                 * пуста) отвечала «никого» - и телефон создавал уже живую
+                 * комнату заново, со своим ключом, глухой к остальным. */
+                wireRoom = WireRoom.of(room)
                 clientName = name
+                // Новое подключение - новая метка. В этом весь смысл: две
+                // сессии одного человека не должны быть связаны для сервера.
+                sessionTag = com.fear.crypto.SessionTag.random()
                 serverHost = host
                 serverPort = port
 
-                when (mode) {
+                // For non-AUTO modes pre-derive the room key. AUTO postpones
+                // this until the ROOM_INFO probe tells us whether the room is
+                // empty (CREATE — generate fresh key) or populated (JOIN —
+                // wait for KEY_RESPONSE).
+                if (mode != ConnectMode.AUTO) when (mode) {
                     ConnectMode.MANUAL_KEY -> {
                         val key = Common.base64Decode(keyBase64)
                         if (key == null || key.size != Common.CRYPTO_AEAD_AES256GCM_KEYBYTES) {
@@ -133,6 +430,7 @@ class FearClient(
                         // Key will be obtained via ECDH exchange after socket connection
                         roomKey = ByteArray(0)
                     }
+                    ConnectMode.AUTO -> { /* unreachable */ }
                 }
 
                 socket = Socket(host, port)
@@ -149,13 +447,36 @@ class FearClient(
 
                 val s = socket ?: return@launch
 
+                // AUTO: ask the server how many members are in this room.
+                // Empty → generate a fresh key (effectively CREATE);
+                // populated → fall through to the JOIN/ECDH branch.
+                var effectiveMode = mode
+                if (mode == ConnectMode.AUTO) {
+                    val members = probeRoomInfo(s, timeoutMs = 3000)
+                    effectiveMode = if (members != null && members > 0) {
+                        Log.i("FearClient", "[auto] room '$room' has $members member(s) → JOIN")
+                        ConnectMode.JOIN_ROOM
+                    } else {
+                        Log.i("FearClient", "[auto] room '$room' empty (probe=$members) → CREATE")
+                        ConnectMode.CREATE_ROOM
+                    }
+                    if (effectiveMode == ConnectMode.CREATE_ROOM) {
+                        roomKey = ByteArray(Common.CRYPTO_AEAD_AES256GCM_KEYBYTES)
+                        SecureRandom().nextBytes(roomKey)
+                        notifyMessageReceived(Message(room, "system",
+                            "[auto] Created room with new key", System.currentTimeMillis()))
+                    } else {
+                        roomKey = ByteArray(0)
+                    }
+                }
+
                 // If join mode, perform ECDH key exchange before proceeding
-                if (mode == ConnectMode.JOIN_ROOM) {
+                if (effectiveMode == ConnectMode.JOIN_ROOM) {
                     notifyMessageReceived(Message(room, "system",
                         "[join] Requesting room key via ECDH exchange...", System.currentTimeMillis()))
-                    val receivedKey = ecdhJoinRoom(s)
+                    val receivedKey = ecdhJoinRoom(s, joinTimeoutMs)
                     if (receivedKey == null) {
-                        notifyError("Key exchange failed: no response (timeout)")
+                        notifyError(joinFailureText(lastJoinFailure))
                         socket?.close()
                         socket = null
                         isConnected = false
@@ -166,19 +487,43 @@ class FearClient(
                         "[join] Room key received!", System.currentTimeMillis()))
                 }
 
-                notifyConnected()
+                notifyConnected(mySession)
 
-                // Send registration message (empty text) so server registers us
-                sendRegistrationMessage(s)
+                // Нулевое поколение K_room и реестр состава - до анонса,
+                // чтобы в реестре уже были мы сами.
+                initRoomKeys()
 
-                // Send identity announce if we have a key
-                sendIdentityAnnounce(s)
+                /* Свой приход, услышанный во время ожидания ключа: учесть его
+                 * первым списком, ровно так, как учёл бы цикл приёма. После
+                 * initRoomKeys, который реестр очищает, и до startReceiving. */
+                joinUserList?.let { handleUserList(it) }
+                joinUserList = null
 
-                // Start receiving messages
-                startReceiving()
+                /* Регистрирует нас на сервере первый же отправленный кадр:
+                 * имя и комнату он берёт из его заголовка. Годится любой
+                 * кадр, который сервер ретранслирует, и анонс личности как
+                 * раз такой - отдельное пустое сообщение для этого не нужно.
+                 * А видно его было всем: сервер раздавал его в комнату, и у
+                 * собеседников появлялся пустой пузырь. Консольный клиент
+                 * так и делает - регистрируется анонсом. */
+                val idm = identityManager
+                if (idm != null && idm.hasIdentity()) {
+                    sendIdentityAnnounce(s)
+                } else {
+                    /* Без личности анонса нет, а зарегистрироваться надо:
+                     * иначе нас не будет в списке участников, пока мы не
+                     * заговорим. */
+                    sendRegistrationMessage(s)
+                }
+
+                // Start receiving messages and the heartbeat loop.
+                startReceiving(mySession)
+                startPingLoop(mySession)
+                startRotationLoop(mySession)
+                startMailboxLoop(mySession)
 
             } catch (e: Exception) {
-                notifyError("Connection failed: ${e.message}")
+                notifyError("Connection failed: ${e.message}", mySession)
             }
         }
     }
@@ -190,10 +535,9 @@ class FearClient(
     private fun sendRegistrationMessage(socket: Socket) {
         val plaintext = " ".toByteArray(Charsets.UTF_8)
         val nonce = Crypto.generateNonce()
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
-        val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ad = buildAd(roomBytes, nameBytes)
-        val ciphertext = Crypto.encrypt(plaintext, ad, nonce, roomKey) ?: return
+        val roomBytes = wireRoomBytes()
+        val nameBytes = wireNameBytes()
+        val ciphertext = ChatFrame.seal(chatKey() ?: return, roomBytes, nameBytes, plaintext, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, Common.MSG_TYPE_TEXT, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -211,16 +555,40 @@ class FearClient(
             Log.w("FearClient", "sendIdentityAnnounce: no identity key")
             return
         }
-        val payload = im.buildIdentityAnnouncePayload(clientName)
+        val payload = im.buildIdentityAnnouncePayload(sessionTag, clientName)
         if (payload == null) {
             Log.e("FearClient", "sendIdentityAnnounce: buildPayload returned null (signing failed?)")
             return
         }
         Log.d("FearClient", "sendIdentityAnnounce: sending ${payload.size} bytes for name='$clientName'")
-        sendEncryptedMessage(socket, Common.MSG_TYPE_IDENTITY_ANNOUNCE, payload)
+        sendEncryptedMessage(socket, Common.MSG_TYPE_IDENTITY_ANNOUNCE, payload,
+                             key = foundingKey())
     }
 
     fun getIdentityManager(): IdentityManager? = identityManager
+
+    /**
+     * Update the display name used in outbound frames without dropping the
+     * session. If the new name differs from the current one and a peer is
+     * still connected, an IDENTITY_ANNOUNCE is broadcast so participants
+     * refresh their cached (identity_pk → name) mapping immediately.
+     *
+     * No-op when the name is unchanged or empty (server enforces uniqueness
+     * per room, so renaming to a name another peer holds would be rejected
+     * — the caller should validate beforehand).
+     */
+    fun setClientName(newName: String) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty() || trimmed == clientName) return
+        Log.i("FearClient", "setClientName: '$clientName' → '$trimmed'")
+        clientName = trimmed
+        if (isConnected) {
+            CoroutineScope(Dispatchers.IO).launch {
+                val s = socket ?: return@launch
+                sendIdentityAnnounce(s)
+            }
+        }
+    }
 
     /**
      * Reload identity from disk and re-send IDENTITY_ANNOUNCE if connected.
@@ -238,15 +606,33 @@ class FearClient(
         }
     }
 
-    fun disconnect() {
+    fun disconnect() = disconnect(sessionId)
+
+    private fun disconnect(forSession: Long) {
         CoroutineScope(Dispatchers.IO).launch {
+            // Отбрасываем устаревший сигнал от старого receive-loop'а.
+            if (forSession != sessionId) return@launch
             receiveJob?.cancel()
+            pingJob?.cancel()
+            rotationJob?.cancel()
+            mailboxJob?.cancel()
+            /* Поколения принадлежат этой сессии в этой комнате: унести их в
+             * следующую значит запечатать сообщение ключом, которого у той
+             * комнаты нет. */
+            synchronized(rotationLock) {
+                roomKeys.clear()
+                roomKeysReady = false
+                roster.clear()
+                sawFirstUserList = false
+                haveBefore = false
+                rotationPending = false
+            }
             socket?.close()
             socket = null
             isConnected = false
             serverHost = ""
             serverPort = 0
-            notifyDisconnected()
+            notifyDisconnected(forSession)
         }
     }
 
@@ -260,9 +646,18 @@ class FearClient(
             try {
                 val socket = socket ?: return@launch
 
+                val mailbox = mailboxForCurrentRoom()
                 if (text.startsWith("/sendfile ")) {
                     val filename = text.substring(10).trim()
                     sendFile(socket, filename)
+                } else if (mailbox != null) {
+                    /* Собеседника в личной комнате нет - письмо ложится в его
+                     * ящик. Ответ сервера скажет, легло ли: если хранение
+                     * выключено, пользователь узнает правду, а не увидит
+                     * вторую галочку. */
+                    if (!sendToMailbox(socket, mailbox, text)) {
+                        notifyError("Could not post the message")
+                    }
                 } else {
                     sendTextMessage(socket, text)
                 }
@@ -276,6 +671,15 @@ class FearClient(
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val socket = socket ?: return@launch
+
+                // The call id goes out first, and this waits for it: the other
+                // end answers through acceptAudioCall(), which has nothing to
+                // bind its media keys to until the invite has arrived.
+                if (beginCall(video = false, sendOnIo = false) == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
+
                 val request = AudioCallRequest(currentRoom, clientName, targetUser)
                 sendAudioCallMessage(socket, Common.MSG_TYPE_AUDIO_CALL_REQUEST, request)
             } catch (e: Exception) {
@@ -290,8 +694,21 @@ class FearClient(
                 val socket = socket ?: return@launch
                 val request = pendingCallRequest ?: return@launch
 
+                // Answering, so the id is the caller's, taken from the invite
+                // they announced. Drawing one here would derive keys the
+                // caller cannot, and deriving one from the room key would hand
+                // every call in this room the same id.
+                val callId = invitedCallId()
+                if (callId == null) {
+                    notifyError(ERR_NO_INVITE)
+                    pendingCallRequest = null
+                    return@launch
+                }
+
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(roomKey)
+                manager.applyMicSettings(context)
+                manager.initialize(roomKey, callId, identityManager)
+                mediaCallId = callId
 
                 val udpInfo = AudioUdpInfo(
                     currentRoom, clientName,
@@ -327,6 +744,10 @@ class FearClient(
                 val endMsg = AudioCallRequest(currentRoom, clientName, "")
                 sendAudioCallMessage(socket, Common.MSG_TYPE_AUDIO_CALL_END, endMsg)
                 audioCallManager?.endCall()
+                // The next call draws its own id: silently reusing this one is
+                // the cross-call replay window the id exists to close.
+                currentCallId = null
+                mediaCallId = null
             } catch (e: Exception) {
                 notifyError("Failed to end audio call: ${e.message}")
             }
@@ -340,8 +761,15 @@ class FearClient(
                     notifyError("Invalid encryption key size: ${encryptionKey.size}, expected 32 bytes")
                     return@launch
                 }
+                val callId = beginCall(video = false, sendOnIo = false)
+                if (callId == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(encryptionKey)
+                manager.applyMicSettings(context)
+                manager.initialize(encryptionKey, callId, identityManager)
+                mediaCallId = callId
                 manager.startCallDirect(serverIp, serverPort, localPort, encryptionKey)
                 notifyCallStarted("$serverIp:$serverPort", true)
             } catch (e: Exception) {
@@ -361,9 +789,22 @@ class FearClient(
                     notifyError("Not connected to a server")
                     return@launch
                 }
+                val callId = beginCall(video = false, sendOnIo = false)
+                if (callId == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(encryptionKey)
-                manager.startRelay(serverHost, serverPort, currentRoom, clientName, 0, encryptionKey)
+                manager.applyMicSettings(context)
+                manager.initialize(encryptionKey, callId, identityManager)
+                mediaCallId = callId
+                /* Комната - меткой, участник - меткой сессии. Звонок идёт через тот
+                 * же сервер отдельной регистрацией: передай он название и имя
+                 * как есть, на ретрансляторе снова появилась бы строка с
+                 * настоящей комнатой и настоящим именем - ровно та, которую
+                 * чат только что перестал показывать. */
+                manager.startRelay(serverHost, serverPort,
+                                   WireRoom.of(currentRoom), sessionTag, 0, encryptionKey)
                 notifyCallStarted("Relay $serverHost:$serverPort", true)
             } catch (e: Exception) {
                 notifyError("Failed to start relay audio call: ${e.message}")
@@ -378,8 +819,15 @@ class FearClient(
                     notifyError("Invalid encryption key size: ${encryptionKey.size}, expected 32 bytes")
                     return@launch
                 }
+                val callId = beginCall(video = false, sendOnIo = false)
+                if (callId == null) {
+                    notifyError(ERR_NO_ROOM_FOR_ID)
+                    return@launch
+                }
                 val manager = getOrCreateAudioCallManager()
-                manager.initialize(encryptionKey)
+                manager.applyMicSettings(context)
+                manager.initialize(encryptionKey, callId, identityManager)
+                mediaCallId = callId
                 manager.startListenDirect(localPort, encryptionKey)
                 notifyCallStarted("Listening on :$localPort", false)
             } catch (e: Exception) {
@@ -395,57 +843,45 @@ class FearClient(
      * Used for KEY_REQUEST and KEY_RESPONSE.
      */
     private fun sendServiceFrame(socket: Socket, type: Byte, payload: ByteArray) {
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
-        val nameBytes = clientName.toByteArray(Charsets.UTF_8)
+        val roomBytes = wireRoomBytes()
+        val nameBytes = wireNameBytes()
         val zeroNonce = ByteArray(Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES)
         val frame = buildFrame(roomBytes, nameBytes, zeroNonce, type, payload)
         Common.sendAll(socket, frame)
     }
 
     /**
-     * Perform ECDH key exchange as joiner: send KEY_REQUEST, wait for KEY_RESPONSE.
-     * Returns the room key on success, null on failure/timeout.
+     * AUTO probe: ask the server how many non-media members are in [currentRoom].
+     * Sends MSG_TYPE_ROOM_INFO_REQUEST and reads the next ROOM_INFO_RESULT
+     * frame; ignores any other frame in between (e.g. a residual broadcast).
+     *
+     * Returns the member count (0 = nobody in the room yet) or null if the
+     * exchange fails / times out — caller treats null as "assume empty,
+     * fall back to CREATE" so a flaky network never blocks AUTO.
      */
-    private fun ecdhJoinRoom(socket: Socket): ByteArray? {
-        val ls = LazySodiumAndroid(SodiumAndroid())
-        val myPk = ByteArray(Common.CRYPTO_BOX_PUBLICKEYBYTES)
-        val mySk = ByteArray(Common.CRYPTO_BOX_SECRETKEYBYTES)
-        ls.cryptoBoxKeypair(myPk, mySk)
-
-        // Send KEY_REQUEST with our ephemeral public key
-        sendServiceFrame(socket, Common.MSG_TYPE_KEY_REQUEST, myPk)
-        Log.i("FearClient", "[join] Sent KEY_REQUEST, waiting for response...")
-
-        // Set socket timeout to 30 seconds
+    private fun probeRoomInfo(socket: Socket, timeoutMs: Int = 3000): Int? {
+        sendServiceFrame(socket, Common.MSG_TYPE_ROOM_INFO_REQUEST, ByteArray(0))
         val oldTimeout = socket.soTimeout
-        socket.soTimeout = 30000
-
+        socket.soTimeout = timeoutMs
         try {
-            while (true) {
-                // Read frame header
+            repeat(8) {
                 val roomLenBuf = ByteArray(2)
                 if (!Common.recvAll(socket, roomLenBuf, 2)) return null
                 val roomLen = Common.readUInt16(roomLenBuf, 0)
                 if (roomLen > Common.MAX_ROOM) return null
-
                 val roomBuf = ByteArray(roomLen)
                 if (!Common.recvAll(socket, roomBuf, roomLen)) return null
-                val room = String(roomBuf, Charsets.UTF_8)
 
                 val nameLenBuf = ByteArray(2)
                 if (!Common.recvAll(socket, nameLenBuf, 2)) return null
                 val nameLen = Common.readUInt16(nameLenBuf, 0)
                 if (nameLen > Common.MAX_NAME) return null
-
                 val nameBuf = ByteArray(nameLen)
                 if (!Common.recvAll(socket, nameBuf, nameLen)) return null
-                val senderName = String(nameBuf, Charsets.UTF_8)
 
                 val nonceLenBuf = ByteArray(2)
                 if (!Common.recvAll(socket, nonceLenBuf, 2)) return null
                 val nonceLen = Common.readUInt16(nonceLenBuf, 0)
-                if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) return null
-
                 val nonce = ByteArray(nonceLen)
                 if (!Common.recvAll(socket, nonce, nonceLen)) return null
 
@@ -456,13 +892,177 @@ class FearClient(
                 if (!Common.recvAll(socket, clenBuf, 4)) return null
                 val clen = Common.readUInt32(clenBuf, 0).toInt()
                 if (clen > Common.MAX_FRAME) return null
-
                 val payload = ByteArray(clen)
                 if (!Common.recvAll(socket, payload, clen)) return null
 
+                if (typeBuf[0] == Common.MSG_TYPE_ROOM_INFO_RESULT && clen >= 5) {
+                    val count = Common.readUInt32(payload, 1).toInt()
+                    return count
+                }
+                // Otherwise: server-side broadcast snuck in before our reply,
+                // skip and keep reading.
+            }
+            return null
+        } catch (_: java.net.SocketTimeoutException) {
+            return null
+        } catch (_: Exception) {
+            return null
+        } finally {
+            socket.soTimeout = oldTimeout
+        }
+    }
+
+    /**
+     * Application-level heartbeat: send MSG_TYPE_PING every 60s while
+     * connected. Server idle scan kicks anyone silent for 240s, so 60s
+     * gives ~4 missed pings of slack before a real network hiccup turns
+     * into a kick. Cancelled by disconnect().
+     */
+    private fun startPingLoop(forSession: Long) {
+        pingJob?.cancel()
+        pingJob = CoroutineScope(Dispatchers.IO).launch {
+            while (forSession == sessionId && isConnected) {
+                delay(60_000)
+                if (forSession != sessionId || !isConnected) break
+                val s = socket ?: break
+                try {
+                    sendServiceFrame(s, Common.MSG_TYPE_PING, ByteArray(0))
+                } catch (_: Exception) {
+                    break  // socket dead; receive loop will handle reconnect
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform ECDH key exchange as joiner: send KEY_REQUEST, wait for KEY_RESPONSE.
+     * Returns the room key on success, null on failure/timeout.
+     */
+    /**
+     * Why a join gave up. Every one of these used to be reported as a
+     * timeout, which is how "Key exchange failed: no response (timeout)"
+     * came to appear 124 ms after the request went out - a quarter of a
+     * second is not a timeout, and being told it was sent the search in
+     * exactly the wrong direction.
+     */
+    private enum class JoinFailure {
+        /** Nobody answered within the window. The only honest timeout. */
+        TIMED_OUT,
+        /** The connection went away underneath us. */
+        DISCONNECTED,
+        /** A frame we cannot resynchronise after: declared lengths past our
+         *  limits, so we no longer know where the next frame begins. */
+        PROTOCOL,
+        /** Somebody answered and the answer did not verify. */
+        REJECTED,
+    }
+
+    private fun joinFailureText(f: JoinFailure): String = when (f) {
+        JoinFailure.TIMED_OUT -> "Key exchange failed: nobody in the room answered in time"
+        JoinFailure.DISCONNECTED -> "Key exchange failed: the connection closed"
+        JoinFailure.PROTOCOL -> "Key exchange failed: unreadable frame from the server"
+        JoinFailure.REJECTED -> "Key exchange failed: the answer did not verify"
+    }
+
+    /** Set by ecdhJoinRoom when it returns null, so the caller can say why. */
+    private var lastJoinFailure: JoinFailure = JoinFailure.TIMED_OUT
+
+    private fun ecdhJoinRoom(socket: Socket, timeoutMs: Int = 30000): ByteArray? {
+        val ls = LazySodiumAndroid(SodiumAndroid())
+        val myPk = ByteArray(Common.CRYPTO_BOX_PUBLICKEYBYTES)
+        val mySk = ByteArray(Common.CRYPTO_BOX_SECRETKEYBYTES)
+        ls.cryptoBoxKeypair(myPk, mySk)
+
+        // Send KEY_REQUEST with our ephemeral public key
+        joinUserList = null
+        sendServiceFrame(socket, Common.MSG_TYPE_KEY_REQUEST, myPk)
+        Log.i("FearClient", "[join] Sent KEY_REQUEST, waiting for response...")
+
+        val oldTimeout = socket.soTimeout
+        socket.soTimeout = timeoutMs
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        /* A failed read is either the window closing or the peer going away,
+         * and the two deserve different words. Anything else that stops us is
+         * a frame we cannot resynchronise after. */
+        fun readFailure(): JoinFailure =
+            if (System.currentTimeMillis() >= deadline) JoinFailure.TIMED_OUT
+            else JoinFailure.DISCONNECTED
+
+        try {
+            while (true) {
+                // Read frame header
+                val roomLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, roomLenBuf, 2)) { lastJoinFailure = readFailure(); return null }
+                val roomLen = Common.readUInt16(roomLenBuf, 0)
+                if (roomLen > Common.MAX_ROOM) { lastJoinFailure = JoinFailure.PROTOCOL; return null }
+
+                val roomBuf = ByteArray(roomLen)
+                if (!Common.recvAll(socket, roomBuf, roomLen)) { lastJoinFailure = readFailure(); return null }
+                val room = String(roomBuf, Charsets.UTF_8)
+
+                val nameLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, nameLenBuf, 2)) { lastJoinFailure = readFailure(); return null }
+                val nameLen = Common.readUInt16(nameLenBuf, 0)
+                if (nameLen > Common.MAX_NAME) { lastJoinFailure = JoinFailure.PROTOCOL; return null }
+
+                val nameBuf = ByteArray(nameLen)
+                if (!Common.recvAll(socket, nameBuf, nameLen)) { lastJoinFailure = readFailure(); return null }
+                val senderName = String(nameBuf, Charsets.UTF_8)
+
+                val nonceLenBuf = ByteArray(2)
+                if (!Common.recvAll(socket, nonceLenBuf, 2)) { lastJoinFailure = readFailure(); return null }
+                val nonceLen = Common.readUInt16(nonceLenBuf, 0)
+                /* Not our frame, but still a well-formed one: read past it
+                 * rather than abandoning the join. Aborting here reported a
+                 * timeout for what was only an unfamiliar message. */
+                if (nonceLen > Common.MAX_FRAME) {
+                    lastJoinFailure = JoinFailure.PROTOCOL
+                    return null
+                }
+                if (nonceLen != Common.CRYPTO_AEAD_AES256GCM_NPUBBYTES) {
+                    val skip = ByteArray(nonceLen)
+                    if (!Common.recvAll(socket, skip, nonceLen)) {
+                        lastJoinFailure = readFailure(); return null
+                    }
+                    val t = ByteArray(1)
+                    val cl = ByteArray(4)
+                    if (!Common.recvAll(socket, t, 1) || !Common.recvAll(socket, cl, 4)) {
+                        lastJoinFailure = readFailure(); return null
+                    }
+                    val n = Common.readUInt32(cl, 0).toInt()
+                    if (n > Common.MAX_FRAME) {
+                        lastJoinFailure = JoinFailure.PROTOCOL
+                        return null
+                    }
+                    val body = ByteArray(n)
+                    if (!Common.recvAll(socket, body, n)) {
+                        lastJoinFailure = readFailure(); return null
+                    }
+                    continue
+                }
+
+                val nonce = ByteArray(nonceLen)
+                if (!Common.recvAll(socket, nonce, nonceLen)) { lastJoinFailure = readFailure(); return null }
+
+                val typeBuf = ByteArray(1)
+                if (!Common.recvAll(socket, typeBuf, 1)) { lastJoinFailure = readFailure(); return null }
+
+                val clenBuf = ByteArray(4)
+                if (!Common.recvAll(socket, clenBuf, 4)) { lastJoinFailure = readFailure(); return null }
+                val clen = Common.readUInt32(clenBuf, 0).toInt()
+                if (clen > Common.MAX_FRAME) { lastJoinFailure = JoinFailure.PROTOCOL; return null }
+
+                val payload = ByteArray(clen)
+                if (!Common.recvAll(socket, payload, clen)) { lastJoinFailure = readFailure(); return null }
+
                 // Check if this is a KEY_RESPONSE service message
                 val isZeroNonce = nonce.all { it == 0.toByte() }
-                if (typeBuf[0] != Common.MSG_TYPE_KEY_RESPONSE || !isZeroNonce || room != currentRoom) {
+                /* Свой приход: сохранить, а не выбросить. См. joinUserList. */
+                if (typeBuf[0] == Common.MSG_TYPE_USER_LIST && isZeroNonce && room == wireRoom) {
+                    joinUserList = payload.copyOf()
+                }
+                if (typeBuf[0] != Common.MSG_TYPE_KEY_RESPONSE || !isZeroNonce || room != wireRoom) {
                     continue
                 }
 
@@ -477,7 +1077,9 @@ class FearClient(
                     Common.CRYPTO_BOX_NONCEBYTES + 32 + Common.CRYPTO_BOX_MACBYTES > clen) continue
 
                 val targetName = String(payload, off, targetLen, Charsets.UTF_8); off += targetLen
-                if (targetName != clientName) continue
+                // Адресат ответа на обмен ключами назван меткой: имени
+                // сервер не видит, а отвечающий знает только её.
+                if (targetName != sessionTag) continue
 
                 val responderPk = payload.copyOfRange(off, off + Common.CRYPTO_BOX_PUBLICKEYBYTES)
                 off += Common.CRYPTO_BOX_PUBLICKEYBYTES
@@ -486,42 +1088,71 @@ class FearClient(
                 val boxCipher = payload.copyOfRange(off, off + 32 + Common.CRYPTO_BOX_MACBYTES)
                 off += 32 + Common.CRYPTO_BOX_MACBYTES
 
-                // Check for identity signature (anti-MITM)
+                // Identity signature (anti-MITM) - MANDATORY.
+                // A hostile relay, or any room member that answers KEY_REQUEST
+                // first, can otherwise hand us a room key it already knows and
+                // transparently MITM the conversation. This check used to "fail
+                // open": a missing or invalid signature only produced a system
+                // message and the key was accepted anyway. Anything short of a
+                // verified signature now aborts the join.
                 val remaining = clen - off
                 var sigVerified = false
-                if (remaining >= Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
+                if (remaining < Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
+                    notifyMessageReceived(Message(currentRoom, "system",
+                        "[join] REJECTED: '$senderName' sent an unsigned key response.",
+                        System.currentTimeMillis()))
+                } else {
                     val idPk = payload.copyOfRange(off, off + Common.IDENTITY_PK_BYTES)
                     val sig = payload.copyOfRange(off + Common.IDENTITY_PK_BYTES,
                         off + Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES)
                     val im = identityManager
-                    if (im != null && im.verify(responderPk, sig, idPk)) {
-                        sigVerified = true
+                    if (im == null || !im.verify(responderPk, sig, idPk)) {
+                        notifyMessageReceived(Message(currentRoom, "system",
+                            "[join] REJECTED: signature verification FAILED for '$senderName' - possible MITM.",
+                            System.currentTimeMillis()))
+                    } else {
                         val tofu = im.checkPeerKey(senderName, idPk)
                         val fp = im.fingerprint(idPk)
                         when (tofu) {
                             "verified", "trusted" -> {
+                                sigVerified = true
                                 notifyMessageReceived(Message(currentRoom, "system",
                                     "[join] Key exchange verified: $senderName [$fp]",
                                     System.currentTimeMillis()))
                             }
                             "new" -> {
+                                sigVerified = true
                                 notifyMessageReceived(Message(currentRoom, "system",
                                     "[join] New identity for '$senderName': $fp (trusted on first use)",
                                     System.currentTimeMillis()))
                             }
                             "changed" -> {
+                                // Blocking: a changed identity key is exactly what
+                                // an active MITM looks like, so we must not proceed.
                                 notifyMessageReceived(Message(currentRoom, "system",
-                                    "*** WARNING: Identity key for '$senderName' has CHANGED! ***\n" +
-                                    "*** This could indicate a MITM attack! ***\n" +
-                                    "*** Fingerprint: $fp ***",
+                                    "*** REJECTED: identity key for '$senderName' has CHANGED! ***\n" +
+                                    "*** This could indicate a MITM attack. Fingerprint: $fp ***",
+                                    System.currentTimeMillis()))
+                            }
+                            else -> {
+                                notifyMessageReceived(Message(currentRoom, "system",
+                                    "[join] REJECTED: could not check identity of '$senderName'.",
                                     System.currentTimeMillis()))
                             }
                         }
-                    } else {
-                        notifyMessageReceived(Message(currentRoom, "system",
-                            "[join] WARNING: Signature verification FAILED for '$senderName'!",
-                            System.currentTimeMillis()))
                     }
+                }
+
+                if (!sigVerified) {
+                    notifyMessageReceived(Message(currentRoom, "system",
+                        "[join] Aborting key exchange - room key not accepted.",
+                        System.currentTimeMillis()))
+                    java.util.Arrays.fill(mySk, 0.toByte())
+                    // Somebody answered and the answer did not verify. Saying
+                    // "nobody answered" here would be the opposite of true,
+                    // and this is the case where it matters most.
+                    lastJoinFailure = JoinFailure.REJECTED
+                    return null
                 }
 
                 // Decrypt room key using crypto_box_open_easy
@@ -535,7 +1166,7 @@ class FearClient(
                 java.util.Arrays.fill(mySk, 0.toByte())
 
                 if (ok) {
-                    val verStr = if (sigVerified) " (identity verified)" else " (unsigned)"
+                    val verStr = " (identity verified)"
                     if (BuildConfig.DEBUG) Log.i("FearClient", "[join] Room key received from '$senderName'$verStr")
                     notifyMessageReceived(Message(currentRoom, "system",
                         "[join] Room key received from '$senderName'$verStr",
@@ -614,25 +1245,202 @@ class FearClient(
 
     // --- Send helpers ---
 
-    private fun buildAd(roomBytes: ByteArray, nameBytes: ByteArray): ByteArray {
-        val ad = ByteArray(2 + roomBytes.size + 2 + nameBytes.size)
-        var offset = 0
-        Common.writeUInt16(ad, offset, roomBytes.size)
-        offset += 2
-        System.arraycopy(roomBytes, 0, ad, offset, roomBytes.size)
-        offset += roomBytes.size
-        Common.writeUInt16(ad, offset, nameBytes.size)
-        offset += 2
-        System.arraycopy(nameBytes, 0, ad, offset, nameBytes.size)
-        return ad
+    /**
+     * Additional data: what the server routes on, plus the six bytes that
+     * name the key. Binding the header means a relay can read it for nothing
+     * and cannot move a message to another epoch without the AEAD noticing.
+     */
+    /*
+     * Chat frames are sealed under an epoch key, not under K_room itself:
+     *
+     *     K_epoch = BLAKE2b(key = K_room, "fear.epoch.v1" || version || epoch)
+     *
+     * derived from the clock by every member independently, nothing
+     * exchanged. The six bytes naming it travel in front of the ciphertext,
+     * where the server - which reads msg_type and the length at fixed offsets
+     * and treats the ciphertext as opaque - neither sees a change nor needs
+     * to understand the schedule.
+     *
+     * key_version is zero until rotation bundles land. K_room has no
+     * generation counter yet, and a number nothing maintains would be worse
+     * on the wire than the honest zero.
+     */
+
+    /**
+     * Announce a call to the room.
+     *
+     * Draw the call_id with SecureRandom, hand the same value to the media
+     * manager, and send it here: it has to be fresh per call, since a value
+     * derived from the room key would be identical for every call in that
+     * room and a recording of one would replay into the next.
+     */
+    fun sendCallInvite(invite: CallInvite.Invite): Boolean {
+        val sock = socket ?: return false
+        return try {
+            sendEncryptedMessage(sock, Common.MSG_TYPE_CALL_INVITE, CallInvite.build(invite))
+            true
+        } catch (e: Exception) {
+            Log.w("FearClient", "call invite not sent: ${e.message}")
+            false
+        }
     }
 
-    private fun sendEncryptedMessage(socket: Socket, type: Byte, payload: ByteArray) {
+    /**
+     * Whether the last invite still stands: recent, and from the room this
+     * client is in now. A call announced in a room we have since left says
+     * nothing about a call here, and its key material is a different room's.
+     */
+    private fun inviteStillCounts(): Boolean =
+        /* Сравнивать метку с меткой.
+         *
+         * lastInviteRoom берётся из заголовка кадра, а там с некоторых пор
+         * едет метка комнаты, а не её название. Сравнение с currentRoom не
+         * сходилось никогда: приглашение всегда считалось чужим, принимающий
+         * заводил собственный идентификатор звонка - и ключи мультимедиа
+         * расходились. Звонок при этом соединялся и молча отвергал каждый
+         * пакет собеседника с ERR_MAC.
+         */
+        lastInviteRoom == wireRoomStr() &&
+            System.currentTimeMillis() - lastInviteAt < INVITE_FRESH_MS
+
+    /** 16 fresh bytes. All-zero means "unset" on both sides, so never that. */
+    private fun newCallId(): ByteArray {
+        val id = ByteArray(MediaKeys.CALLID_BYTES)
+        val rng = SecureRandom()
+        do { rng.nextBytes(id) } while (id.all { it == 0.toByte() })
+        return id
+    }
+
+    /**
+     * The call_id from the invite a peer announced, when that announcement is
+     * still current. Null means nobody announced a call, and there is no
+     * honest way to guess one: an id derived from the room key would be
+     * identical for every call in the room, which is precisely the cross-call
+     * replay barrier the id exists to provide.
+     */
+    private fun invitedCallId(): ByteArray? {
+        val inv = lastInvite ?: return null
+        if (!inviteStillCounts()) return null
+        val id = inv.callId.copyOf()
+        currentCallId = id
+        return id
+    }
+
+    /**
+     * The call_id to start a call under, or null when the room cannot be told
+     * about it.
+     *
+     * Joining beats starting: when someone announced a call here moments ago
+     * this runs under that id, because two participants that each draw their
+     * own would derive different keys and hear each other as silence.
+     * Otherwise it draws one and announces it - and when that cannot be sent
+     * it returns null rather than start a call whose keys no one else can
+     * derive.
+     *
+     * @param sendOnIo true when the caller may be on the main thread, where a
+     *                 socket write throws NetworkOnMainThreadException; the
+     *                 invite then goes out on an IO coroutine. Callers already
+     *                 off the main thread pass false and get the invite on the
+     *                 wire before this returns.
+     */
+    private fun beginCall(video: Boolean, sendOnIo: Boolean): ByteArray? {
+        val want = if (video) CallInvite.FLAG_VIDEO else CallInvite.FLAG_AUDIO
+        val inv = lastInvite
+        if (inv != null && inv.flags and want != 0 && inviteStillCounts()) {
+            Log.d("FearClient", "joining the call already announced in this room")
+            val joined = inv.callId.copyOf()
+            currentCallId = joined
+            return joined
+        }
+
+        if (socket == null || !isConnected) return null
+
+        val id = newCallId()
+        val flags = if (video) CallInvite.FLAG_AUDIO or CallInvite.FLAG_VIDEO
+                    else CallInvite.FLAG_AUDIO
+        // No host or port hint: the transport is arranged by the screen that
+        // starts the call, and this only has to carry the id.
+        val invite = CallInvite.Invite(flags, id)
+        if (sendOnIo) {
+            CoroutineScope(Dispatchers.IO).launch { sendCallInvite(invite) }
+        } else if (!sendCallInvite(invite)) {
+            return null
+        }
+        currentCallId = id
+        return id
+    }
+
+    /**
+     * The call_id for a call this screen is about to start, as 32 hex
+     * characters, for handing to VideoCallActivity through an intent. Null
+     * when there is no room to announce it in. Safe to call on the main
+     * thread: the announcement itself goes out on an IO coroutine.
+     */
+    fun beginCallHex(video: Boolean): String? =
+        beginCall(video, sendOnIo = true)?.joinToString("") { "%02x".format(it) }
+
+    /**
+     * Поколение, под которым запечатываем: текущее, никогда не старое.
+     *
+     * До первой ротации - и в комнате, которая ещё не ротировалась ни разу -
+     * это ключ основания под нулевым номером.
+     */
+    private fun chatKey(): ChatFrame.RoomKey? {
+        val founding = roomKey
+        if (founding.isEmpty()) return null
+        synchronized(rotationLock) {
+            if (roomKeysReady) roomKeys.current()?.let { return it }
+        }
+        return ChatFrame.RoomKey(ChatFrame.KEY_VERSION, founding)
+    }
+
+    /**
+     * Все поколения, которые ещё читаются, текущее первым.
+     *
+     * Ротация не останавливает то, что уже летит под заменяемым поколением:
+     * такие сообщения приходят после неё, и получатель, успевший забыть, как
+     * их читать, отказал бы во вполне законных сообщениях.
+     */
+    private fun chatRing(): List<ChatFrame.RoomKey>? {
+        val founding = roomKey
+        if (founding.isEmpty()) return null
+        synchronized(rotationLock) {
+            if (roomKeysReady) {
+                roomKeys.expire(System.currentTimeMillis() / 1000L)
+                val ring = roomKeys.ring()
+                if (ring.isNotEmpty()) return ring
+            }
+        }
+        return listOf(ChatFrame.RoomKey(ChatFrame.KEY_VERSION, founding))
+    }
+
+    /**
+     * Ключ основания - тот, под которым едут анонсы личности.
+     *
+     * Запечатывать их текущим поколением нельзя: вход в комнату, которая
+     * хоть раз ротировалась, стал бы невозможен, а через две ротации ключ
+     * основания уходит из кольца и вошедшему уже никогда не адресовать
+     * конверт. Секретностью тут не жертвуем: внутри открытый ключ и подпись
+     * над именем. Запечатано вообще - чтобы сервер не получил список тех,
+     * кто в комнате.
+     */
+    private fun foundingKey(): ChatFrame.RoomKey? {
+        val founding = roomKey
+        if (founding.isEmpty()) return null
+        return ChatFrame.RoomKey(ChatFrame.KEY_VERSION, founding)
+    }
+
+    private fun sendEncryptedMessage(
+        socket: Socket,
+        type: Byte,
+        payload: ByteArray,
+        key: ChatFrame.RoomKey? = null,
+    ) {
         val nonce = Crypto.generateNonce()
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
-        val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ad = buildAd(roomBytes, nameBytes)
-        val ciphertext = Crypto.encrypt(payload, ad, nonce, roomKey) ?: return
+        val roomBytes = wireRoomBytes()
+        val nameBytes = wireNameBytes()
+        val sealKey = key ?: chatKey() ?: return
+        val ciphertext = ChatFrame.seal(sealKey, roomBytes, nameBytes, payload, nonce) ?: return
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         Common.sendAll(socket, frame)
     }
@@ -641,9 +1449,8 @@ class FearClient(
         try {
             val textBytes = text.toByteArray(Charsets.UTF_8)
             val nonce = Crypto.generateNonce()
-            val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
-            val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-            val ad = buildAd(roomBytes, nameBytes)
+            val roomBytes = wireRoomBytes()
+            val nameBytes = wireNameBytes()
 
             // If we have identity, send as SIGNED_TEXT
             val im = identityManager
@@ -667,7 +1474,9 @@ class FearClient(
                 Log.w("FearClient", "No identity: im=${im != null}, hasIdentity=${im?.hasIdentity()}, sending TEXT (type=0)")
             }
 
-            val ciphertext = Crypto.encrypt(plaintext, ad, nonce, roomKey)
+            val key = roomKey
+            val ciphertext = if (key == null) null
+                             else ChatFrame.seal(chatKey() ?: return, roomBytes, nameBytes, plaintext, nonce)
             if (ciphertext == null) {
                 notifyError("Encryption failed")
                 return
@@ -776,10 +1585,11 @@ class FearClient(
 
     private fun sendFileMessage(socket: Socket, type: Byte, payload: ByteArray): Boolean {
         val nonce = Crypto.generateNonce()
-        val roomBytes = currentRoom.toByteArray(Charsets.UTF_8)
-        val nameBytes = clientName.toByteArray(Charsets.UTF_8)
-        val ad = buildAd(roomBytes, nameBytes)
-        val ciphertext = Crypto.encrypt(payload, ad, nonce, roomKey) ?: return false
+        val roomBytes = wireRoomBytes()
+        val nameBytes = wireNameBytes()
+        val key = roomKey ?: return false
+        val ciphertext = ChatFrame.seal(chatKey() ?: return false, roomBytes, nameBytes, payload, nonce)
+            ?: return false
         val frame = buildFrame(roomBytes, nameBytes, nonce, type, ciphertext)
         return Common.sendAll(socket, frame)
     }
@@ -821,21 +1631,425 @@ class FearClient(
         return frame
     }
 
+    // --- Офлайн-ящик ---
+
+    /**
+     * Некому доставить прямо сейчас?
+     *
+     * Это личная комната, и собеседника в ней нет. Тогда письмо идёт в ящик,
+     * а не в пустоту: сервер рассылает только тем, кто в комнате, и сам
+     * ничего не хранит.
+     */
+    private fun mailboxForCurrentRoom(): Mail? {
+        if (!currentRoom.startsWith("pm:")) return null
+        val m = synchronized(mailboxLock) { mailboxes[currentRoom] } ?: return null
+        val alone = synchronized(rotationLock) {
+            roster.none { (tag, e) -> e.present && tag != sessionTag }
+        }
+        return if (alone) m else null
+    }
+
+    /** Положить письмо в ящик собеседника. */
+    private fun sendToMailbox(socket: Socket, m: Mail, text: String): Boolean {
+        val nonce = Crypto.generateNonce()
+        val body = Mailbox.seal(m.room, m.kPm, clientName,
+                                text.toByteArray(Charsets.UTF_8), nonce) ?: return false
+        return try {
+            sendServiceFrame(socket, Common.MSG_TYPE_INBOX_PUT, m.addrOut + body)
+            true
+        } catch (e: Exception) {
+            Log.w("FearClient", "[inbox] could not post: ${e.message}")
+            false
+        }
+    }
+
+    /** Спросить все ящики разом. */
+    private fun pollMailboxes(socket: Socket) {
+        val addrs = synchronized(mailboxLock) { mailboxes.values.map { it.addrIn } }
+        if (addrs.isEmpty()) return
+
+        val body = ByteArray(2 + addrs.size * Mailbox.ADDR_BYTES)
+        Common.writeUInt16(body, 0, addrs.size)
+        var off = 2
+        for (a in addrs) { a.copyInto(body, off); off += Mailbox.ADDR_BYTES }
+        sendServiceFrame(socket, Common.MSG_TYPE_INBOX_FETCH, body)
+    }
+
+    /** Подтвердить получение - только после того, как письмо показано. */
+    private fun ackMailbox(socket: Socket, m: Mail, id: Long) {
+        val body = ByteArray(Mailbox.ADDR_BYTES + 2 + 8)
+        m.addrIn.copyInto(body, 0)
+        Common.writeUInt16(body, Mailbox.ADDR_BYTES, 1)
+        var v = id
+        for (b in 0 until 8) {
+            body[Mailbox.ADDR_BYTES + 2 + b] = (v and 0xFF).toByte()
+            v = v ushr 8
+        }
+        sendServiceFrame(socket, Common.MSG_TYPE_INBOX_DELETE, body)
+    }
+
+    /** Разобрать ответ сервера: письма и объявленный срок хранения. */
+    private fun handleInboxResult(socket: Socket, p: ByteArray) {
+        if (p.size < 1 + 4 + 2) return
+        val status = p[0].toInt() and 0xFF
+        relayInboxTtlSeconds = ((p[1].toInt() and 0xFF)) or
+                               ((p[2].toInt() and 0xFF) shl 8) or
+                               ((p[3].toInt() and 0xFF) shl 16) or
+                               ((p[4].toInt() and 0xFF) shl 24)
+
+        if (status != 0) {
+            /* Сказать вслух стоит об одном: сервер не хранит ничего, и письмо
+             * никуда не легло. Молчание тут - худшее, что можно сделать:
+             * отправитель будет думать, что доставил. */
+            if (status == 1) {
+                notifyMessageReceived(Message(currentRoom, "system",
+                    "Not delivered: the recipient is offline and this relay " +
+                    "keeps nothing.", System.currentTimeMillis()))
+            }
+            return
+        }
+
+        val count = Common.readUInt16(p, 5)
+        var off = 7
+        repeat(count) {
+            if (off + 8 + Mailbox.ADDR_BYTES + 4 > p.size) return
+            var id = 0L
+            for (b in 0 until 8) id = id or ((p[off + b].toLong() and 0xFF) shl (8 * b))
+            off += 8
+            val addr = p.copyOfRange(off, off + Mailbox.ADDR_BYTES)
+            off += Mailbox.ADDR_BYTES
+            val len = ((p[off].toInt() and 0xFF)) or
+                      ((p[off + 1].toInt() and 0xFF) shl 8) or
+                      ((p[off + 2].toInt() and 0xFF) shl 16) or
+                      ((p[off + 3].toInt() and 0xFF) shl 24)
+            off += 4
+            if (off + len > p.size) return
+            val body = p.copyOfRange(off, off + len)
+            off += len
+
+            val m = synchronized(mailboxLock) {
+                mailboxes.values.firstOrNull { it.addrIn.contentEquals(addr) }
+            } ?: return@repeat
+
+            if (synchronized(mailboxLock) { id in seenLetters }) {
+                ackMailbox(socket, m, id)     // уже показано - пришло вторым ответом
+                return@repeat
+            }
+            val letter = Mailbox.open(m.room, m.kPm, body) ?: return@repeat
+            /* Письмо адресовано другой комнате, чем та, в которой мы сидим -
+             * в этом весь смысл ящика. Комната едет вместе с сообщением,
+             * чтобы интерфейс положил его в нужный чат. */
+            notifyMessageReceived(Message(m.room, letter.sender, letter.text,
+                                          System.currentTimeMillis()))
+            synchronized(mailboxLock) {
+                seenLetters.add(id)
+                if (seenLetters.size > 256) seenLetters.remove(seenLetters.first())
+            }
+            ackMailbox(socket, m, id)
+        }
+    }
+
+    /**
+     * Таймер опроса.
+     *
+     * Приёмный цикл стоит на чтении сокета, так что сам он о новой почте не
+     * узнает.
+     */
+    private fun startMailboxLoop(forSession: Long) {
+        mailboxJob?.cancel()
+        mailboxJob = CoroutineScope(Dispatchers.IO).launch {
+            while (forSession == sessionId && isConnected) {
+                try {
+                    socket?.let { pollMailboxes(it) }
+                } catch (e: Exception) {
+                    Log.w("FearClient", "[inbox] poll failed: ${e.message}")
+                }
+                kotlinx.coroutines.delay(mailboxPollDelay())
+            }
+        }
+    }
+
+    // --- Ротация ключа комнаты ---
+
+    /** Запомнить или обновить личный ключ участника и объявленное им имя. */
+    private fun rosterNoteIdentity(tag: String, pk: ByteArray, display: String?) {
+        if (BuildConfig.DEBUG) Log.d("FearClient", "[roster] identity of '$tag' recorded")
+        synchronized(rotationLock) {
+            /* Только личность: присутствие выставит rosterSetPresent, когда
+             * сервер скажет, и ровно тогда это будет сменой состава. */
+            val e = roster.getOrPut(tag) { RosterEntry(present = false) }
+            e.pk = pk.copyOf()
+            if (!display.isNullOrEmpty()) e.display = display
+        }
+    }
+
+    /**
+     * Отдать наверх список участников - именами, а не метками.
+     *
+     * Собирается из реестра, потому что в кадре от сервера метки, а имена
+     * приезжают отдельными анонсами и позже. Вызывается и на новый список, и
+     * на каждый анонс, который метку опознал.
+     */
+    private fun publishContacts() {
+        val names = synchronized(rotationLock) {
+            roster.entries.filter { it.value.present }
+                .map { it.value.display ?: ("?" + it.key.take(8)) }
+        }
+        lastContacts = names
+        handler.post { listener.onContactsUpdated(names) }
+    }
+
+    /**
+     * Отображаемое имя по метке сессии или её началу - для подписей в звонке,
+     * где от метки едут первые 16 знаков. См. CallNames.
+     */
+    fun displayNameForTag(tagOrPrefix: String): String? {
+        if (tagOrPrefix.isEmpty()) return null
+        return synchronized(rotationLock) {
+            roster.entries.firstOrNull { (tag, e) -> e.present && tag.startsWith(tagOrPrefix) }
+                ?.value?.display
+        }
+    }
+
+    /** Отметить состав, который назвал сервер. Возвращает true, если он изменился. */
+    private fun rosterSetPresent(tags: List<String>): Boolean {
+        var changed = false
+        for ((tag, e) in roster) {
+            val here = tags.contains(tag)
+            if (e.present != here) {
+                e.present = here
+                changed = true
+                /*
+                 * Ушёл - забываем, кем он был.
+                 *
+                 * Метка освобождается вместе с соединением, и следующее
+                 * подключение может её занять: сервер сторожит только то,
+                 * чтобы две живые метки не совпали. Сохрани мы привязку,
+                 * сообщения нового владельца показались бы под именем
+                 * прежнего - без единой подделанной подписи, просто по
+                 * устаревшей записи. Вернувшийся обязан объявиться заново.
+                 */
+                if (!here) { e.display = null; e.pk = null }
+            }
+        }
+        for (tag in tags) {
+            if (roster.containsKey(tag)) continue
+            roster[tag] = RosterEntry(pk = null, present = true, wasPresent = false)
+            changed = true
+        }
+        return changed
+    }
+
+    /** Заморозить нынешний состав как «до» следующей смены. */
+    private fun rosterSnapshotPresent() {
+        for (e in roster.values) e.wasPresent = e.present
+    }
+
+    /** Все ли, кого назвал сервер, уже сказали, кто они. */
+    private fun rosterIdentitiesComplete(): Boolean =
+        roster.values.none { it.present && it.pk == null }
+
+    /**
+     * Кого можно выбирать: те, кто был здесь до смены состава и остался.
+     *
+     * Только что вошедшего выбирать нельзя, и причина арифметическая. Он
+     * держит нулевое поколение и не знает, что комната на четвёртом, так что
+     * «следующее» поколение у него - уже использованное: остальные отбросят
+     * его как повтор, а сам он поставит себе и оглохнет.
+     */
+    private fun rosterContinuing(): List<RoomKeys.Member> =
+        roster.values.filter { it.present && it.wasPresent }.map {
+            RoomKeys.Member(it.pk ?: ByteArray(Common.IDENTITY_PK_BYTES), it.pk != null)
+        }
+
+    /** Нулевое поколение: то, что дал обмен ключами комнаты. */
+    private fun initRoomKeys() {
+        val founding = roomKey
+        if (founding.isEmpty()) return
+        synchronized(rotationLock) {
+            roomKeys.init(ChatFrame.KEY_VERSION, founding)
+            roomKeysReady = true
+            roster.clear()
+            sawFirstUserList = false
+            haveBefore = false
+            rotationPending = false
+        }
+        identityManager?.getPublicKey()?.let { rosterNoteIdentity(sessionTag, it, clientName) }
+    }
+
+    /**
+     * Ротировать, если смена состава ждёт и комната успела сойтись.
+     *
+     * Ждём мы потому, что сервер объявляет смену состава раньше, чем её
+     * участники успели сказать, кто они: выборы, проведённые на разъехавшихся
+     * реестрах, избирают всех сразу. Ожидание не бесконечно - участник,
+     * который так и не назвался, иначе держал бы комнату вечно.
+     */
+    private fun rotationTick() {
+        val myPk = identityManager?.getPublicKey() ?: return
+        var doRotate = false
+        synchronized(rotationLock) {
+            if (!rotationPending || !roomKeysReady) return
+            val now = System.currentTimeMillis()
+            if (now < rotationSettleAt) return
+            if (!rosterIdentitiesComplete() && now < rotationDeadline) return
+            rotationPending = false
+            doRotate = RoomKeys.isRotator(rosterContinuing(), myPk)
+        }
+        if (doRotate) rotateNow()
+    }
+
+    /**
+     * Взять новое K_room и раздать его всем, кто в комнате.
+     *
+     * Конверт уходит служебным кадром, не запечатанным ключом комнаты: каждая
+     * запись в нём уже запечатана личным ключом получателя, читать там
+     * серверу нечего, а тому, кому конверт нужнее всех - только что
+     * вошедшему, - открывать внешний конверт нечем.
+     *
+     * Участник без личного ключа записи не получает: адресовать её некуда. Он
+     * читает под старым поколением, пока оно не истечёт, и на этом выбывает -
+     * это и значит быть в ротирующейся комнате без личности.
+     */
+    private fun rotateNow() {
+        val im = identityManager ?: return
+        val s = socket ?: return
+
+        val recipients: List<ByteArray>
+        val next: Int
+        synchronized(rotationLock) {
+            if (!roomKeysReady) return
+            recipients = roster.values.filter { it.present && it.pk != null }.map { it.pk!! }
+            next = roomKeys.currentVersion + 1
+        }
+        if (BuildConfig.DEBUG) Log.d("FearClient", "[rotation] roster: " +
+            roster.entries.joinToString {
+                "${it.key}(present=${it.value.present},id=${it.value.pk != null})" })
+        if (recipients.isEmpty()) return
+        /* Номер поколения - это то, чем ротация отличается от повтора, так
+         * что переполнение сделало бы старый конверт похожим на свежий.
+         * Шестьдесят пять тысяч смен состава в одной комнате - чужая беда, и
+         * честный ответ на неё - отказаться. */
+        if (next > 0xFFFF) {
+            Log.w("FearClient", "[rotation] generation counter exhausted; not rotating")
+            return
+        }
+
+        val kNew = ByteArray(Common.CRYPTO_AEAD_AES256GCM_KEYBYTES)
+        SecureRandom().nextBytes(kNew)
+
+        /* Метка, а не название: ровно её кладёт в привязку настольный
+         * клиент. Здесь стояло currentRoom, и записи, адресованные
+         * собеседнику на ПК, у него не открывались - без единой ошибки,
+         * просто «участник не появился». */
+        val bundle = im.buildRotationBundle(wireRoomStr(), next, kNew, recipients)
+        if (bundle == null) {
+            java.util.Arrays.fill(kNew, 0)
+            Log.w("FearClient", "[rotation] could not build a bundle")
+            return
+        }
+
+        try {
+            sendServiceFrame(s, Common.MSG_TYPE_ROTATION, bundle)
+        } catch (e: Exception) {
+            java.util.Arrays.fill(kNew, 0)
+            Log.w("FearClient", "[rotation] could not send the bundle: ${e.message}")
+            return
+        }
+
+        synchronized(rotationLock) {
+            roomKeys.install(next, kNew, System.currentTimeMillis() / 1000L)
+        }
+        java.util.Arrays.fill(kNew, 0)
+        Log.i("FearClient", "[rotation] room key is now generation $next, " +
+                            "sealed for ${recipients.size} member(s)")
+    }
+
+    /** Принять ротацию, которую прислал кто-то другой. */
+    private fun handleRotationBundle(senderName: String, payload: ByteArray) {
+        val im = identityManager ?: return
+        if (!im.hasIdentity()) return
+
+        val view = RotationBundle.parse(payload) ?: return
+
+        synchronized(rotationLock) {
+            if (!roomKeysReady) return
+            /* Только вперёд. Пришедшее с опозданием старое поколение - повтор. */
+            if (view.keyVersion <= roomKeys.currentVersion) return
+
+            /* Запечатавший должен быть тем, кого комната и выбрала: иначе
+             * ротировать мог бы любой в любой момент, а это отказ в
+             * обслуживании под видом обновления ключа. Но выборы требуют
+             * реестра, а у только что вошедшего его может ещё не быть -
+             * анонсы, из которых он строится, могли прозвучать до того, как
+             * мы начали слушать. Отказ тогда запер бы нас в комнате, в
+             * которую мы только что вошли, поэтому проверяем лишь когда
+             * действительно знаем, кто в ней. */
+            if (haveBefore && rosterIdentitiesComplete() &&
+                !RoomKeys.isRotator(rosterContinuing(), view.senderPk)) {
+                Log.w("FearClient", "[rotation] ignoring a bundle: not this room's rotator" +
+                                    (if (BuildConfig.DEBUG) " (from $senderName)" else ""))
+                return
+            }
+        }
+
+        val kNew = im.openRotationBundle(view, wireRoomStr())
+        if (kNew == null) {
+            /* Отправитель и комната - в рабочей сборке тоже: без них строка
+             * говорит лишь «что-то не открылось», а разбираться приходится
+             * именно на живом телефоне. */
+            Log.w("FearClient", "[rotation] could not open our entry from $senderName " +
+                                "(room=${wireRoomStr()}, ver=${view.keyVersion})")
+            return
+        }
+
+        val installed = synchronized(rotationLock) {
+            roomKeys.install(view.keyVersion, kNew, System.currentTimeMillis() / 1000L)
+        }
+        java.util.Arrays.fill(kNew, 0)
+        if (installed) {
+            Log.i("FearClient", "[rotation] room key is now generation ${view.keyVersion}" +
+                                (if (BuildConfig.DEBUG) ", from $senderName" else ""))
+        }
+    }
+
+    /**
+     * Таймер ротации.
+     *
+     * Приёмный цикл стоит на чтении сокета, так что взведённая ротация в
+     * молчащей комнате сама по себе не сработала бы.
+     */
+    private fun startRotationLoop(forSession: Long) {
+        rotationJob?.cancel()
+        rotationJob = CoroutineScope(Dispatchers.IO).launch {
+            while (forSession == sessionId && isConnected) {
+                kotlinx.coroutines.delay(250)
+                try {
+                    rotationTick()
+                } catch (e: Exception) {
+                    Log.w("FearClient", "[rotation] tick failed: ${e.message}")
+                }
+            }
+        }
+    }
+
     // --- Receive loop ---
 
-    private fun startReceiving() {
+    private fun startReceiving(forSession: Long = sessionId) {
         receiveJob = CoroutineScope(Dispatchers.IO).launch {
             val socket = socket ?: return@launch
 
-            while (isConnected && !socket.isClosed) {
+            while (isConnected && !socket.isClosed && forSession == sessionId) {
                 try {
                     if (!receiveMessage(socket)) break
                 } catch (e: Exception) {
-                    if (isConnected) notifyError("Receive error: ${e.message}")
+                    if (isConnected) notifyError("Receive error: ${e.message}", forSession)
                     break
                 }
             }
-            disconnect()
+            // Если этот receive-loop принадлежал устаревшей сессии (нас
+            // переподключили), не дёргаем UI — он уже видит новый socket.
+            if (forSession == sessionId) disconnect(forSession)
         }
     }
 
@@ -888,7 +2102,7 @@ class FearClient(
             if (!Common.recvAll(socket, ciphertext, clen.toInt())) return false
 
             // Skip messages from other rooms
-            if (room != currentRoom) return true
+            if (room != wireRoom) return true
 
             // Check if this is a service message (all-zero nonce)
             val isServiceMessage = nonce.all { it == 0.toByte() }
@@ -899,10 +2113,24 @@ class FearClient(
                 return true
             }
 
+            // Ответ ящика приходит на то соединение, которое спрашивало, и
+            // несёт письма для других комнат - поэтому комнату не сверяем.
+            if (isServiceMessage && msgType == Common.MSG_TYPE_INBOX_RESULT) {
+                handleInboxResult(socket, ciphertext)
+                return true
+            }
+
+            // Конверт ротации: служебный кадр, не запечатанный ключом
+            // комнаты - см. rotateNow().
+            if (isServiceMessage && msgType == Common.MSG_TYPE_ROTATION) {
+                if (senderName != sessionTag) handleRotationBundle(senderName, ciphertext)
+                return true
+            }
+
             // Handle KEY_REQUEST (service message, not encrypted)
             if (isServiceMessage && msgType == Common.MSG_TYPE_KEY_REQUEST) {
                 if (ciphertext.size == Common.CRYPTO_BOX_PUBLICKEYBYTES &&
-                    roomKey.isNotEmpty() && senderName != clientName) {
+                    roomKey.isNotEmpty() && senderName != sessionTag) {
                     sendKeyResponse(socket, senderName, ciphertext)
                 }
                 return true
@@ -913,22 +2141,29 @@ class FearClient(
                 return true
             }
 
+            // Phase B-8: a stray ROOM_INFO_RESULT can arrive if probe timed
+            // out and we already moved on; just drop it. PING is server-bound
+            // only, so we wouldn't expect to receive one — drop too if seen.
+            if (isServiceMessage &&
+                (msgType == Common.MSG_TYPE_ROOM_INFO_RESULT ||
+                 msgType == Common.MSG_TYPE_PING)) {
+                return true
+            }
+
             // Skip own messages
             if (senderName == clientName) return true
 
-            // Build AD for decryption
-            val ad = ByteArray(2 + roomLen + 2 + nameLen)
-            var offset = 0
-            Common.writeUInt16(ad, offset, roomLen)
-            offset += 2
-            System.arraycopy(roomBuf, 0, ad, offset, roomLen)
-            offset += roomLen
-            Common.writeUInt16(ad, offset, nameLen)
-            offset += 2
-            System.arraycopy(nameBuf, 0, ad, offset, nameLen)
-
-            // Decrypt
-            val plaintext = Crypto.decrypt(ciphertext, ad, nonce, roomKey)
+            // Sealed: [key_version(2)][epoch(4)][AEAD]
+            /* Анонс личности запечатан ключом основания - см. foundingKey().
+             * Только он: пустить туда же чат значило бы оставить каждое
+             * сообщение читаемым всякому, у кого этот ключ когда-либо был, а
+             * ровно от этого ротация и существует. */
+            val ring = if (msgType == Common.MSG_TYPE_IDENTITY_ANNOUNCE)
+                           foundingKey()?.let { listOf(it) }
+                       else chatRing()
+            val plaintext = if (ring == null) null else ChatFrame.open(
+                ring, roomBuf.copyOf(roomLen), nameBuf.copyOf(nameLen),
+                ciphertext, nonce)
             if (plaintext == null) {
                 return true
             }
@@ -937,12 +2172,47 @@ class FearClient(
             when (msgType) {
                 Common.MSG_TYPE_TEXT -> {
                     val content = String(plaintext, Charsets.UTF_8)
-                    val message = Message(room, senderName, content, System.currentTimeMillis())
+                    /* Пустое сообщение никто не пишет намеренно - так
+                     * регистрировались на сервере сборки постарше, и в чате
+                     * от них оставался пустой пузырь. */
+                    if (content.isBlank()) return true
+                    /* currentRoom, а не room из заголовка: там метка комнаты на
+                     * проводе (хеш), а интерфейс раскладывает сообщения по
+                     * названиям. Чужая комната сюда не попадёт - ретранслятор
+                     * шлёт соединению только кадры его же комнаты. */
+                    val message = Message(currentRoom, senderLabel(senderName), content,
+                                         System.currentTimeMillis())
                     notifyMessageReceived(message)
                 }
 
+                Common.MSG_TYPE_CALL_INVITE -> {
+                    // Authenticated already: this arrived inside the room
+                    // AEAD, so only a member could have produced it. What is
+                    // still untrusted is the content, which parse() checks -
+                    // in particular the host, which would otherwise reach a
+                    // connect call straight from another party.
+                    val r = CallInvite.parse(plaintext)
+                    if (r.status == CallInvite.Status.OK && r.invite != null) {
+                        // Kept so that answering, or starting a call from this
+                        // side a moment later, runs under the id that was
+                        // announced instead of a second one nobody else has.
+                        // Our own invite comes back from the server too, and
+                        // that echo carries no new information.
+                        if (senderName != sessionTag) {
+                            lastInvite = r.invite
+                            lastInviteRoom = room
+                            lastInviteAt = System.currentTimeMillis()
+                        }
+                        handler.post {
+                            listener.onCallInviteReceived(senderLabel(senderName), r.invite)
+                        }
+                    } else {
+                        Log.w("FearClient", "dropped a call invite from $senderName: ${r.status}")
+                    }
+                }
+
                 Common.MSG_TYPE_FILE_START, Common.MSG_TYPE_FILE_CHUNK, Common.MSG_TYPE_FILE_END -> {
-                    handleFileMessage(msgType, plaintext, room, senderName)
+                    handleFileMessage(msgType, plaintext, room, senderLabel(senderName))
                 }
 
                 Common.MSG_TYPE_SIGNED_TEXT -> {
@@ -956,15 +2226,30 @@ class FearClient(
 
                         val im = identityManager
                         val prefix: String
-                        if (im != null) {
+                        /* Хранилище доверенных ключей ведётся по имени, а имя
+                         * приезжает анонсом. Пока отправитель не объявился,
+                         * сверять нечего с чем: записать ключ под меткой
+                         * значило бы засорить хранилище мусором, который
+                         * назавтра ничего не значит. */
+                        val announced = synchronized(rotationLock) {
+                            roster[senderName]?.display
+                        }
+                        if (im != null && announced != null) {
                             val sigOk = im.verify(textBytes, sig, pk)
                             if (sigOk) {
-                                val status = im.checkPeerKey(senderName, pk)
+                                val status = im.checkPeerKey(announced, pk)
+                                /* В реестр, а не только в хранилище доверенных
+                                 * ключей: ротации нужно знать, кто здесь
+                                 * сейчас, а хранилище лежит на диске и говорит,
+                                 * кого мы вообще когда-либо видели.
+                                 * Сменившийся ключ не записываем - это как раз
+                                 * тот случай, когда мы не знаем, кто это. */
+                                if (status != "changed") rosterNoteIdentity(senderName, pk, null)
                                 prefix = when (status) {
                                     "changed" -> {
                                         val fp = im.fingerprint(pk)
-                                        val warn = Message(room, "system",
-                                            "WARNING: Key CHANGED for $senderName! " +
+                                        val warn = Message(currentRoom, "system",
+                                            "WARNING: Key CHANGED for $announced! " +
                                             "Fingerprint: $fp. Possible MITM attack!",
                                             System.currentTimeMillis())
                                         notifyMessageReceived(warn)
@@ -977,11 +2262,13 @@ class FearClient(
                                 prefix = "[!] "  // Signature verification failed
                             }
                         } else {
-                            Log.w("FearClient", "SIGNED_TEXT: identityManager is null")
+                            /* Либо личности нет у нас, либо отправитель ещё не
+                             * объявился. Метка доверия тут была бы обещанием,
+                             * которого мы не давали. */
                             prefix = "[?] "
                         }
 
-                        val message = Message(room, senderName, prefix + text,
+                        val message = Message(currentRoom, senderLabel(senderName), prefix + text,
                             System.currentTimeMillis(), Common.MSG_TYPE_SIGNED_TEXT)
                         notifyMessageReceived(message)
                     }
@@ -991,42 +2278,93 @@ class FearClient(
                     if (plaintext.size > Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
                         val stripped = plaintext.copyOfRange(
                             Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES, plaintext.size)
-                        handleFileMessage(Common.MSG_TYPE_FILE_START, stripped, room, senderName)
+                        handleFileMessage(Common.MSG_TYPE_FILE_START, stripped, room, senderLabel(senderName))
                     }
                 }
                 Common.MSG_TYPE_SIGNED_FILE_CHUNK -> {
                     if (plaintext.size > Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
                         val stripped = plaintext.copyOfRange(
                             Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES, plaintext.size)
-                        handleFileMessage(Common.MSG_TYPE_FILE_CHUNK, stripped, room, senderName)
+                        handleFileMessage(Common.MSG_TYPE_FILE_CHUNK, stripped, room, senderLabel(senderName))
                     }
                 }
                 Common.MSG_TYPE_SIGNED_FILE_END -> {
                     if (plaintext.size > Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES) {
                         val stripped = plaintext.copyOfRange(
                             Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES, plaintext.size)
-                        handleFileMessage(Common.MSG_TYPE_FILE_END, stripped, room, senderName)
+                        handleFileMessage(Common.MSG_TYPE_FILE_END, stripped, room, senderLabel(senderName))
                     }
                 }
 
                 Common.MSG_TYPE_IDENTITY_ANNOUNCE -> {
-                    // [pk(32)][sig_over_name(64)]
+                    /* Не под BuildConfig.DEBUG: в рабочей сборке эти строки
+                     * вырезаются, а разбираться приходится именно в ней - на
+                     * живом телефоне, а не на эмуляторе. */
+                    Log.i("FearClient",
+                        "[roster] announce from $senderName, ${plaintext.size} bytes")
+                    // [pk(32)][sig(64)][name_len(2)][name]
                     val sigPrefixLen = Common.IDENTITY_PK_BYTES + Common.IDENTITY_SIG_BYTES
-                    if (plaintext.size >= sigPrefixLen) {
+                    if (plaintext.size >= sigPrefixLen + 2) {
                         val pk = plaintext.copyOfRange(0, Common.IDENTITY_PK_BYTES)
                         val sig = plaintext.copyOfRange(Common.IDENTITY_PK_BYTES, sigPrefixLen)
-                        val nameBytes = senderName.toByteArray(Charsets.UTF_8)
+                        val dlen = Common.readUInt16(plaintext, sigPrefixLen)
                         val im = identityManager
-                        if (im != null) {
-                            val sigOk = im.verify(nameBytes, sig, pk)
+                        // Длина пришла по проводу, значит выбрана не нами.
+                        if (im == null || sigPrefixLen + 2 + dlen > plaintext.size || dlen <= 0) {
+                            Log.w("FearClient",
+                                "[roster] announce from $senderName unusable: " +
+                                    "dlen=$dlen size=${plaintext.size} im=${im != null}")
+                        }
+                        if (im != null && sigPrefixLen + 2 + dlen <= plaintext.size && dlen > 0) {
+                            val display = String(plaintext, sigPrefixLen + 2, dlen, Charsets.UTF_8)
+                            val signed = com.fear.crypto.SessionTag
+                                .announceSignedBytes(senderName, display)
+                            val sigOk = im.verify(signed, sig, pk)
                             val fp = im.fingerprint(pk)
+                            Log.i("FearClient",
+                                "[roster] announce '$display' from $senderName: " +
+                                    "sig=" + (if (sigOk) "ok" else "BAD") + " fp=$fp")
                             if (sigOk) {
-                                val status = im.checkPeerKey(senderName, pk)
+                                val status = im.checkPeerKey(display, pk)
+                                /* Именно здесь реестр и пополняется в обычной
+                                 * жизни: анонс - первое, что участник говорит,
+                                 * войдя в комнату, и до него ротации некому
+                                 * адресовать запись. */
+                                val wasUnnamed = synchronized(rotationLock) {
+                                    roster[senderName]?.display == null
+                                }
+                                if (status != "changed") rosterNoteIdentity(senderName, pk, display)
                                 if (status == "changed") {
-                                    val msg = Message(room, "system",
-                                        "WARNING: Key CHANGED for $senderName! Fingerprint: $fp. Possible MITM attack!",
+                                    val msg = Message(currentRoom, "system",
+                                        "WARNING: Key CHANGED for $display! Fingerprint: $fp. Possible MITM attack!",
                                         System.currentTimeMillis())
                                     notifyMessageReceived(msg)
+                                }
+                                /* Список участников строится из реестра, и до
+                                 * этого анонса участник стоял в нём огрызком
+                                 * метки. Пересобираем - иначе объявившийся
+                                 * после списка так и остался бы неизвестным. */
+                                if (wasUnnamed && status != "changed") {
+                                    publishContacts()
+                                    /*
+                                     * Назовись в ответ.
+                                     *
+                                     * Вошедший получает ключ комнаты не
+                                     * мгновенно, а анонс запечатан
+                                     * ключом-родоначальником: наш анонс,
+                                     * посланный на смену состава, приходит
+                                     * раньше ключа, и открыть его нечем.
+                                     * Второго повода объявиться нет - смена
+                                     * состава уже прошла, - и собеседник
+                                     * остаётся с огрызком метки вместо имени.
+                                     *
+                                     * Услышали незнакомую метку - значит её
+                                     * хозяин уже с ключом. Отвечаем ровно
+                                     * один раз на метку: wasUnnamed истинно
+                                     * только при первом опознании, поэтому
+                                     * перезвон невозможен.
+                                     */
+                                    socket?.let { sendIdentityAnnounce(it) }
                                 }
                             }
                         }
@@ -1056,7 +2394,23 @@ class FearClient(
                     val udpInfo = parseAudioUdpInfo(String(plaintext, Charsets.UTF_8))
                     if (udpInfo != null && udpInfo.user != clientName) {
                         val host = socket.inetAddress.hostAddress ?: return@receiveMessage true
+                        // The id we announced when we rang - the same value the
+                        // answering side took from that invite.
+                        val callId = currentCallId ?: invitedCallId()
+                        if (callId == null) {
+                            notifyError(ERR_NO_ROOM_FOR_ID)
+                            return@receiveMessage true
+                        }
                         val manager = getOrCreateAudioCallManager()
+                        // Only when it is not already set up for this call: a
+                        // second peer's UDP info arriving while the first is
+                        // talking would otherwise re-derive our keys and our
+                        // SID under everyone's feet.
+                        if (!callId.contentEquals(mediaCallId)) {
+                            manager.applyMicSettings(context)
+                manager.initialize(roomKey, callId, identityManager)
+                            mediaCallId = callId
+                        }
                         manager.startCall(udpInfo.user, host, udpInfo.udpPort, udpInfo.noncePrefix)
                     }
                 }
@@ -1076,7 +2430,9 @@ class FearClient(
     // --- USER_LIST parsing ---
 
     private fun handleUserList(payload: ByteArray) {
-        // Format: [2 count][for each: 2 name_len, name]
+        // Format: [2 count][for each: 2 tag_len, tag]
+        // В списке метки, а не имена: сервер имён не видит. Разворачиваем их
+        // ниже, из реестра, когда он уже учтёт этот самый список.
         if (payload.size < 2) return
 
         val count = Common.readUInt16(payload, 0)
@@ -1085,16 +2441,52 @@ class FearClient(
 
         for (i in 0 until count) {
             if (offset + 2 > payload.size) break
-            val nameLen = Common.readUInt16(payload, offset)
+            val tagLen = Common.readUInt16(payload, offset)
             offset += 2
-            if (offset + nameLen > payload.size) break
-            val name = String(payload, offset, nameLen, Charsets.UTF_8)
-            offset += nameLen
-            contacts.add(name)
+            if (offset + tagLen > payload.size) break
+            val tag = String(payload, offset, tagLen, Charsets.US_ASCII)
+            offset += tagLen
+            contacts.add(tag)
         }
 
-        lastContacts = contacts
-        handler.post { listener.onContactsUpdated(contacts) }
+        /* Смена состава - это и есть весь повод ротировать: кто-то вошёл, и
+         * ему нельзя читать сказанное раньше, или кто-то вышел, и ему нельзя
+         * читать то, что скажут дальше. */
+        var announce = false
+        synchronized(rotationLock) {
+            /* Снимок берётся до того, как применён новый список, и не
+             * берётся повторно, пока ротация уже взведена: череда входов -
+             * одна смена состава, от той комнаты, какой она была до них. */
+            if (sawFirstUserList && !rotationPending) {
+                rosterSnapshotPresent()
+                haveBefore = true
+            }
+
+            val changed = rosterSetPresent(contacts)
+            publishContacts()
+
+            if (!sawFirstUserList) {
+                /* Наш собственный вход. Ротирует тот, кто был здесь раньше;
+                 * мы берём этот список за отправную точку и оставляем «до»
+                 * пустым, потому что мы его не видели. Записав себя в «уже
+                 * бывших здесь», мы влезли бы в выборы, которые те, кто
+                 * действительно был здесь, ведут без нас, - а два ротатора
+                 * это и есть разъехавшаяся надвое комната. */
+                sawFirstUserList = true
+            } else if (changed && roomKeysReady &&
+                       identityManager?.hasIdentity() == true) {
+                val now = System.currentTimeMillis()
+                rotationSettleAt = now + rotationSettleMs
+                if (!rotationPending) rotationDeadline = now + rotationDeadlineMs
+                rotationPending = true
+                announce = true
+            }
+        }
+
+        /* Сказать заново, кто мы. Только что вошедший нашего анонса не
+         * слышал - он прозвучал до его прихода, - а ротации нужно адресовать
+         * ему запись по личному ключу. */
+        if (announce) socket?.let { sendIdentityAnnounce(it) }
     }
 
     // --- File transfer handling ---
@@ -1126,7 +2518,7 @@ class FearClient(
                 File(savePath).createNewFile()
                 notifyFileTransferProgress(basename, 0f)
 
-                val msg = Message(room, sender, "Sending file: $basename ($fileSize bytes)",
+                val msg = Message(currentRoom, sender, "Sending file: $basename ($fileSize bytes)",
                     System.currentTimeMillis())
                 notifyMessageReceived(msg)
             }
@@ -1227,11 +2619,13 @@ class FearClient(
 
     // --- Notification helpers ---
 
-    private fun notifyConnected() {
+    private fun notifyConnected(forSession: Long = sessionId) {
+        if (forSession != sessionId) return
         handler.post { listener.onConnected() }
     }
 
-    private fun notifyDisconnected() {
+    private fun notifyDisconnected(forSession: Long = sessionId) {
+        if (forSession != sessionId) return
         handler.post { listener.onDisconnected() }
     }
 
@@ -1266,7 +2660,8 @@ class FearClient(
         handler.post { listener.onFileTransferError(filename, error) }
     }
 
-    private fun notifyError(error: String) {
+    private fun notifyError(error: String, forSession: Long = sessionId) {
+        if (forSession != sessionId) return
         handler.post { listener.onError(error) }
     }
 }

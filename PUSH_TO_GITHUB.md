@@ -91,7 +91,7 @@ fear-mobile/
 ├── .gitignore                          # Git ignore rules
 ├── .idea/                              # Android Studio config (minimal)
 ├── BUILD.md                            # Detailed build instructions
-├── LICENSE                             # MIT License
+├── LICENSE                             # GPL-3.0-or-later
 ├── README.md                           # Project documentation
 ├── app/
 │   ├── src/

@@ -28,22 +28,32 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
-        android:allowBackup="true"
-        android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/backup_rules"
+        android:allowBackup="false"
+        tools:replace="android:allowBackup"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.FEAR"
         android:requestLegacyExternalStorage="true">
 
+        <!-- Compose-based UI (Telegram-style) is now the launcher entry. -->
         <activity
-            android:name=".MainActivity"
-            android:exported="true">
+            android:name=".ui.ComposeMainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.AppCompat.NoActionBar"
+            android:windowSoftInputMode="adjustResize"
+            android:label="F.E.A.R.">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Legacy XML-based UI kept as fallback. Reach with:
+             adb shell am start -n com.fear/.MainActivity -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="F.E.A.R. (legacy)" />
 
         <activity
             android:name=".VideoCallActivity"

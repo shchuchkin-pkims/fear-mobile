@@ -1,0 +1,45 @@
+name: Release notes
+
+# Every GitHub Release is named and described from doc/release-notes/<tag>.md
+# (first line - the title, then the description; the house style is in
+# doc/release-notes/README.md). Nobody types release text into the web page:
+#
+#   - pushing a tag v* creates its release with that title and text; the
+#     build workflows attach their archives to the same release;
+#   - pushing a change to a notes file brings the existing release in line
+#     with it - this is how an old description gets corrected;
+#   - workflow_dispatch re-checks every release by hand.
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main, dev]
+    paths:
+      - 'doc/release-notes/**'
+      - '.github/scripts/release-notes.py'
+      - '.github/workflows/release-notes.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    name: Publish release title and description
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags too: an annotated tag message is the fallback
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            python3 .github/scripts/release-notes.py publish "${{ github.ref_name }}"
+          else
+            python3 .github/scripts/release-notes.py sync
+          fi

@@ -89,6 +89,47 @@ object Common {
     const val MSG_TYPE_KEY_RESPONSE: Byte = 16
     const val MSG_TYPE_MEDIA_RELAY: Byte = 17
 
+    // Handle registry (Phase B-2). See server_db.h for payload spec.
+    const val MSG_TYPE_REGISTER_HANDLE: Byte = 20
+    const val MSG_TYPE_LOOKUP_HANDLE:   Byte = 21
+    const val MSG_TYPE_HANDLE_RESULT:   Byte = 22
+
+    // Per-user encrypted blob storage (Phase B-3). See server_db.h.
+    const val MSG_TYPE_BLOB_PUT:        Byte = 23
+    const val MSG_TYPE_BLOB_GET:        Byte = 24
+    const val MSG_TYPE_BLOB_RESULT:     Byte = 25
+
+    // Reverse handle lookup by pk (Phase B-7). Used after identity import
+    // to discover any handle previously claimed for this pk on the server.
+    const val MSG_TYPE_LOOKUP_HANDLE_BY_PK: Byte = 26
+
+    // Phase B-8: room probe + heartbeat.
+    // ROOM_INFO_REQUEST/RESULT lets AUTO connect skip the JOIN→timeout dance
+    // when the room is empty. PING is sent every ~60s while otherwise silent
+    // so the server's idle scan doesn't kick the connection.
+    const val MSG_TYPE_ROOM_INFO_REQUEST: Byte = 27
+    const val MSG_TYPE_ROOM_INFO_RESULT:  Byte = 28
+    const val MSG_TYPE_PING:              Byte = 29
+    /* M10: authorized blob reads - one-shot challenge signed by the owner */
+    const val MSG_TYPE_BLOB_GET_CHALLENGE:    Byte = 30
+    const val MSG_TYPE_BLOB_CHALLENGE_RESULT: Byte = 31
+    /* Phase C: a room member announces a call. Payload: CallInvite. */
+    const val MSG_TYPE_CALL_INVITE:           Byte = 32
+
+    /** Участник комнаты -> комнате: у K_room новое поколение.
+     *  Полезная нагрузка - конверт ротации (crypto/RotationBundle.kt): по
+     *  записи на участника, каждая запечатана его личным ключом. Поэтому
+     *  кадр служебный, не запечатанный ключом комнаты: тот, кому он нужнее
+     *  всех, только что вошёл и текущего K_room ещё не имеет. */
+    const val MSG_TYPE_ROTATION:              Byte = 33
+
+    /* Офлайн-ящик. Письмо адресовано слепым адресом - хешем от ключа пары, -
+     * поэтому ретранслятор не знает, ни кому оно, ни от кого. */
+    const val MSG_TYPE_INBOX_PUT:             Byte = 34
+    const val MSG_TYPE_INBOX_FETCH:           Byte = 35
+    const val MSG_TYPE_INBOX_RESULT:          Byte = 36
+    const val MSG_TYPE_INBOX_DELETE:          Byte = 37
+
     // crypto_box constants (X25519 + XSalsa20-Poly1305)
     const val CRYPTO_BOX_PUBLICKEYBYTES = 32
     const val CRYPTO_BOX_SECRETKEYBYTES = 32

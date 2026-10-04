@@ -23,6 +23,10 @@
     <color name="fear_bubble_self_bg">#D6E4F9</color>
     <color name="fear_bubble_self_stroke">#A3C1ED</color>
 
+    <!-- Разделитель с датой -->
+    <color name="fear_date_header_bg">#DDE3EC</color>
+    <color name="fear_date_header_text">#4B5563</color>
+
     <!-- Status bar -->
     <color name="fear_status_bar">#FFFFFF</color>
 

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The development build installs beside the release one, so it needs a
+     name you can tell apart on the launcher. -->
+<resources>
+    <string name="app_name">F.E.A.R. dev</string>
+</resources>

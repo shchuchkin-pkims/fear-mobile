@@ -33,4 +33,8 @@
     <!-- Misc -->
     <color name="fear_warning">#f39c12</color>
     <color name="fear_fingerprint">#aaaacc</color>
+    <!-- Разделитель с датой -->
+    <color name="fear_date_header_bg">#232344</color>
+    <color name="fear_date_header_text">#9999bb</color>
+
 </resources>

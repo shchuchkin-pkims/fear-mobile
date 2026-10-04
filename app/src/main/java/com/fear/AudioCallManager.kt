@@ -27,12 +27,15 @@ import java.util.concurrent.atomic.AtomicLong
 import com.fear.AudioConstants.AUDIO_PCM_BYTES_PER_FRAME
 import com.fear.AudioConstants.AUDIO_MAX_OPUS_BYTES
 import com.fear.AudioConstants.AUDIO_UDP_RECV_BUFSIZE
-import com.fear.AudioConstants.AUDIO_NONCE_PREFIX_LEN
-import com.fear.AudioConstants.AUDIO_AEAD_NONCE_LEN
-import com.fear.AudioConstants.AUDIO_AEAD_ABYTES
 import com.fear.AudioConstants.PKT_VER_AUDIO
 import com.fear.AudioConstants.PKT_VER_STATS
-import com.fear.AudioConstants.PKT_VER_HELLO
+import com.fear.crypto.Ed25519Ops
+import com.fear.crypto.MediaHello
+import com.fear.crypto.MediaKeys
+import com.fear.crypto.MediaPacket
+import com.fear.crypto.SenderTable
+import com.fear.crypto.SodiumEd25519
+import java.security.SecureRandom
 import android.os.SystemClock
 import com.fear.AudioConstants.AUDIO_SAMPLE_RATE
 import com.fear.AudioConstants.AUDIO_CHANNELS
@@ -59,17 +62,72 @@ class AudioCallManager(
     private var remoteAddress: InetAddress? = null
     private var remoteUdpPort: Int = 0
     private var audioRecord: AudioRecord? = null
+
+    /*
+     * Настройки микрофона.
+     *
+     * Чувствительность руками нужна потому, что микрофоны разные: у
+     * телефона в кармане чехла и у гарнитуры разница в добрый десяток
+     * децибел, а автоматика системы выравнивает это не всегда.
+     *
+     * Подавление шума здесь - штатное, системное (NoiseSuppressor). На
+     * телефоне оно лучше всего, что можно написать самому: часто сделано
+     * прямо в звуковом тракте устройства. Раньше включалось всегда; теперь
+     * его можно выключить - на некоторых аппаратах оно ощутимо режет тихую
+     * речь, и человеку виднее, что для него хуже.
+     */
+    private var micGainDb: Int = 0
+    private var noiseSuppressEnabled: Boolean = true
+    private var micGain: Float = 1.0f
     private var audioTrack: AudioTrack? = null
     private var recordJob: Job? = null
     private var playJob: Job? = null
     private var udpReceiveJob: Job? = null
 
     private val isRunning = AtomicBoolean(false)
+
+    /**
+     * Transmit counter for the audio counter domain. Audio packets and stats
+     * packets both draw from it, so they must also share one key - one
+     * counter under two keys is harmless, one key under two counters repeats
+     * a (key, nonce) pair.
+     */
     private val seqTx = AtomicLong(0)
+
+    /** K_call. Copied, never aliased: teardown wipes this array. */
     private var roomKey = ByteArray(0)
-    private var localNoncePrefix = ByteArray(0)
-    @Volatile private var remoteNoncePrefix = ByteArray(0)
-    private var remotePrefixReady = AtomicBoolean(false)
+
+    /** 16-byte call id. Mandatory - every media key is bound to it. */
+    private var callId: ByteArray? = null
+
+    /** Drawn once per call, before any thread starts, never re-drawn. */
+    private var senderSalt = ByteArray(0)
+
+    /** Our wire tag, derived from the salt we announce. */
+    private var ownSid = ByteArray(0)
+
+    /** Our send key for the audio counter domain (audio and stats). */
+    private var ownAudioKey: ByteArray? = null
+
+    /** HELLO2 MAC key, mk_hello_key(K_call, call_id). */
+    private var helloKey: ByteArray? = null
+
+    /** Per-sender keys and replay windows for everyone else in the call. */
+    private var senderTable: SenderTable.Table? = null
+
+    /** Guards senderTable: install runs on the receive thread, count on others. */
+    private val tableLock = Any()
+
+    /** Our Ed25519 public key when an identity is loaded, else 32 zero bytes. */
+    private var idbind: ByteArray = MediaKeys.UNSIGNED_IDBIND
+
+    private var identityManager: IdentityManager? = null
+
+    /** Peers we have already run through TOFU, keyed by their public key. */
+    private val seenPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** One line per call, not per packet, when a peer is too old to talk to. */
+    private val legacyPeerLogged = AtomicBoolean(false)
 
     private val handler = Handler(Looper.getMainLooper())
     private val audioBuffer = ByteArray(AUDIO_PCM_BYTES_PER_FRAME)
@@ -95,9 +153,49 @@ class AudioCallManager(
     private var tcpSocket: Socket? = null
     private val tcpSendLock = Any()
 
-    // Opus codec
+    // Opus codec. One encoder, because we have one voice. No single
+    // decoder: every rendered participant gets its own, in the pool below.
     private var opusEncoder: OpusCodec.Encoder? = null
-    private var opusDecoder: OpusCodec.Decoder? = null
+
+    /**
+     * One rendered participant: its decoder, its jitter buffer, and enough
+     * bookkeeping to decide who gives up a decoder when a new voice arrives.
+     */
+    private class MixSlot {
+        /** sender-table slot index, or -1 when this entry is free */
+        var slot: Int = -1
+        var decoder: OpusCodec.Decoder? = null
+        /** decoded PCM frames waiting for play-out, oldest first */
+        val ring: ArrayDeque<ShortArray> = ArrayDeque()
+        /** when we last decoded a frame from this participant */
+        var lastMs: Long = 0
+        /** the jitter buffer has reached the play-out depth */
+        var prefilled: Boolean = false
+        /** frames actually mixed, for the teardown report */
+        var frames: Long = 0
+    }
+
+    /**
+     * One decoder and one jitter buffer per rendered participant.
+     *
+     * A single decoder cannot serve several senders: Opus carries state across
+     * frames, so interleaving two streams through one decoder makes both
+     * unintelligible - and a single AudioTrack write path would have them
+     * overwrite each other rather than mix. That is why the crypto working for
+     * N participants is not the same as the call working for N: this is the
+     * other half, and it is the half that was missing here.
+     */
+    private val mix = Array(MAX_MIX) { MixSlot() }
+
+    /** Guards mix[]: the receive path fills the rings, play-out drains them. */
+    private val mixLock = Any()
+
+    /**
+     * Packets successfully decrypted from each sender-table slot. Only the
+     * teardown report uses it, and that report is what tells "installed a
+     * peer" apart from "actually heard that peer".
+     */
+    private val rxCount = LongArray(SenderTable.MAX_SLOTS)
 
     // RTT measurement (ping/pong via stats packets)
     @Volatile private var lastPeerPingTs = 0
@@ -105,16 +203,87 @@ class AudioCallManager(
     @Volatile private var measuredRttMs = 0
     private var lastStatsSendTime = 0L
 
-    fun initialize(roomKey: ByteArray) {
-        this.roomKey = roomKey
-        this.localNoncePrefix = ByteArray(AUDIO_NONCE_PREFIX_LEN).apply {
-            Crypto.generateNonce().copyInto(this, 0, 0, AUDIO_NONCE_PREFIX_LEN)
+    /**
+     * Configure one call. Must be called before any thread starts.
+     *
+     * @param roomKey K_call, 32 bytes; copied here and wiped on teardown
+     * @param callId  the 16-byte call id from the call invite. Mandatory:
+     *                without it no media key can be derived and every start
+     *                path below refuses. Pass null only to keep a call id
+     *                that was supplied by an earlier call to this method.
+     * @param identityMgr signs our HELLO2 and binds our public key into our
+     *                keys; when absent the call runs unsigned (32 zero bytes)
+     */
+    fun initialize(roomKey: ByteArray,
+                   callId: ByteArray? = null,
+                   identityMgr: IdentityManager? = null) {
+        val keepId = callId?.copyOf() ?: this.callId?.copyOf()
+
+        // Whatever the previous call left behind goes before it is overwritten.
+        clearMediaKeys()
+
+        this.roomKey = roomKey.copyOf()
+        this.callId = keepId
+        if (identityMgr != null) this.identityManager = identityMgr
+
+        // Initialize Opus codec (destroy first: initialize may run twice for
+        // one manager, and the old native handles would leak). No decoder is
+        // built here - one is built per participant, the first time that
+        // participant is actually heard.
+        try { opusEncoder?.destroy() } catch (_: Exception) {}
+        opusEncoder = OpusCodec.createEncoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AC_OPUS_BITRATE)
+        mixTeardown()
+
+        deriveCallMaterial()
+    }
+
+    /** Bind this manager to a call id and derive our per-call material. */
+    fun setCallId(callId: ByteArray): Boolean {
+        this.callId = callId.copyOf()
+        return deriveCallMaterial()
+    }
+
+    /**
+     * Our SID and send key come from our own salt, so nothing here needs a
+     * peer, a role or a handshake - only K_call and the call id.
+     */
+    private fun deriveCallMaterial(): Boolean {
+        val cid = callId
+        if (roomKey.size != MediaKeys.KEY_BYTES) {
+            println("ACM_DEBUG: bad room key size ${roomKey.size}, media disabled")
+            return false
+        }
+        if (cid == null || cid.size != MediaKeys.CALLID_BYTES || cid.all { it == 0.toByte() }) {
+            println("ACM_DEBUG: no call id, media stays disabled")
+            return false
         }
 
-        // Initialize Opus codec
-        opusEncoder = OpusCodec.createEncoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AC_OPUS_BITRATE)
-        opusDecoder = OpusCodec.createDecoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
+        val im = identityManager
+        val pk = if (im != null && im.hasIdentity()) im.getPublicKey() else null
+        idbind = pk ?: MediaKeys.UNSIGNED_IDBIND
+
+        senderSalt = ByteArray(MediaKeys.SALT_BYTES).also { SecureRandom().nextBytes(it) }
+        ownSid = MediaKeys.senderId(roomKey, cid, senderSalt, idbind)
+        ownAudioKey = MediaKeys.deriveSender(
+            roomKey, MediaKeys.STREAM_AUDIO, KEY_VERSION, cid, senderSalt, idbind)
+        helloKey = MediaKeys.helloKey(roomKey, cid)
+        // ownSalt is handed over so the table refuses our own announcement
+        // echoed back at us, which would install our send keys as a peer.
+        synchronized(tableLock) { senderTable = SenderTable.Table(roomKey, cid, senderSalt) }
+
+        // Safe to restart at zero: the key is new because the salt is new.
+        seqTx.set(0)
+        java.util.Arrays.fill(rxCount, 0L)
+        legacyPeerLogged.set(false)
+        seenPeers.clear()
+        println("ACM_DEBUG: media keys ready, sid=${ownSid.joinToString("") { "%02x".format(it) }}")
+        return true
     }
+
+    /** True once a call id and K_call have produced our keys. */
+    private fun mediaReady(): Boolean =
+        ownAudioKey != null && helloKey != null && senderTable != null &&
+            ownSid.size == MediaKeys.SID_BYTES
 
     private fun acquireWakeLocks() {
         try {
@@ -168,17 +337,20 @@ class AudioCallManager(
         return udpSocket?.localPort ?: 0
     }
 
-    fun getLocalNoncePrefix(): ByteArray {
-        return localNoncePrefix
-    }
+    /**
+     * Vestigial. Nonce prefixes are gone: the nonce is now SID || counter and
+     * the SID travels in every packet header, so there is nothing to announce
+     * out of band. Kept so the signalling code still compiles; callers should
+     * stop sending the field.
+     */
+    fun getLocalNoncePrefix(): ByteArray = ByteArray(0)
 
+    /** @param remoteNoncePrefix ignored; kept so the signalling code compiles */
     fun startCall(remoteUser: String, remoteHost: String, remoteUdpPort: Int, remoteNoncePrefix: ByteArray) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 this@AudioCallManager.remoteUdpPort = remoteUdpPort
                 this@AudioCallManager.remoteAddress = InetAddress.getByName(remoteHost)
-                this@AudioCallManager.remoteNoncePrefix = remoteNoncePrefix
-                this@AudioCallManager.remotePrefixReady.set(true)
                 
                 startAudioCall(true, remoteUser)
                 
@@ -188,13 +360,12 @@ class AudioCallManager(
         }
     }
 
+    /** @param remoteNoncePrefix ignored; kept so the signalling code compiles */
     fun acceptCall(remoteUser: String, remoteHost: String, remoteUdpPort: Int, remoteNoncePrefix: ByteArray) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 this@AudioCallManager.remoteUdpPort = remoteUdpPort
                 this@AudioCallManager.remoteAddress = InetAddress.getByName(remoteHost)
-                this@AudioCallManager.remoteNoncePrefix = remoteNoncePrefix
-                this@AudioCallManager.remotePrefixReady.set(true)
                 
                 startAudioCall(false, remoteUser)
                 
@@ -230,14 +401,21 @@ class AudioCallManager(
                 }
 
                 println("ACM_DEBUG: Checking if need to reinitialize...")
-                println("ACM_DEBUG: Encryption key (first 8 bytes): ${encryptionKey.take(8).joinToString(" ") { "%02x".format(it) }}")
+                // Never log key material: minify is disabled, so println/Log survive
+                // into release builds and land in logcat/bugreports.
+                println("ACM_DEBUG: Encryption key set (${encryptionKey.size} bytes)")
                 // Update room key if different OR if codecs not initialized
-                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
-                    println("ACM_DEBUG: Initializing with new key... (encoder=${opusEncoder != null}, decoder=${opusDecoder != null})")
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null) {
+                    println("ACM_DEBUG: Initializing with new key... (encoder=${opusEncoder != null})")
                     initialize(encryptionKey)
-                    println("ACM_DEBUG: Initialization complete (encoder=${opusEncoder != null}, decoder=${opusDecoder != null})")
+                    println("ACM_DEBUG: Initialization complete (encoder=${opusEncoder != null})")
                 } else {
                     println("ACM_DEBUG: Already initialized, skipping")
+                }
+
+                if (!mediaReady()) {
+                    notifyError(CALL_ID_REQUIRED)
+                    return@launch
                 }
 
                 println("ACM_DEBUG: Setting remote parameters...")
@@ -292,9 +470,7 @@ class AudioCallManager(
                     isCallActive = true,
                     remoteUser = "$serverIp:$serverPort",
                     isInitiator = true,
-                    udpPort = udpSocket?.localPort ?: 0,
-                    localNoncePrefix = localNoncePrefix,
-                    remoteNoncePrefix = ByteArray(0) // Will be received via HELLO
+                    udpPort = udpSocket?.localPort ?: 0
                 )
 
                 isRunning.set(true)
@@ -313,26 +489,15 @@ class AudioCallManager(
                 startAudioRecording()
                 println("ACM_DEBUG: Audio recording started")
 
-                // Don't start playback loop - processAudioPacket will write directly to AudioTrack
-                // startAudioPlayback()
-                println("ACM_DEBUG: Audio playback ready (direct mode)")
+                // Mandatory now. The receive path only fills per-participant
+                // jitter buffers; this loop is what mixes them into one stream
+                // and what paces the output device.
+                startAudioPlayback()
+                println("ACM_DEBUG: Audio playback (mixer) started")
 
-                // Send HELLO packet to establish nonce prefix exchange
-                sendHelloPacket()
-                println("ACM_DEBUG: HELLO packet sent")
-
-                // Send periodic HELLO packets until we receive remote prefix
-                CoroutineScope(Dispatchers.IO).launch {
-                    var attempts = 0
-                    while (!remotePrefixReady.get() && isRunning.get() && attempts < 100) {
-                        sendHelloPacket()
-                        delay(50)
-                        attempts++
-                        if (attempts % 20 == 0) {
-                            sendHelloPacket()
-                        }
-                    }
-                }
+                // Announce ourselves. Nothing waits on an answer any more:
+                // our keys come from our own salt, so we can already encrypt.
+                startHelloAnnounce()
 
                 notifyCallStarted("$serverIp:$serverPort", true)
 
@@ -360,8 +525,13 @@ class AudioCallManager(
                     return@launch
                 }
 
-                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null) {
                     initialize(encryptionKey)
+                }
+
+                if (!mediaReady()) {
+                    notifyError(CALL_ID_REQUIRED)
+                    return@launch
                 }
 
                 // Listen mode: don't set remote address yet
@@ -390,9 +560,7 @@ class AudioCallManager(
                     isCallActive = true,
                     remoteUser = "Listening on :$bindPort",
                     isInitiator = false,
-                    udpPort = udpSocket?.localPort ?: 0,
-                    localNoncePrefix = localNoncePrefix,
-                    remoteNoncePrefix = ByteArray(0)
+                    udpPort = udpSocket?.localPort ?: 0
                 )
 
                 isRunning.set(true)
@@ -401,6 +569,7 @@ class AudioCallManager(
 
                 startUdpReceiving()
                 startAudioRecording()
+                startAudioPlayback()
 
                 notifyCallStarted("Listening on :$bindPort", false)
 
@@ -447,6 +616,22 @@ class AudioCallManager(
         return try {
             tcpSocket = Socket(host, port).apply {
                 tcpNoDelay = true  // Disable Nagle's algorithm for low-latency media
+                /*
+                 * Маленький буфер отправки - и это не экономия памяти.
+                 *
+                 * Кодировщик выдаёт кадры равномерно, канал - как получится.
+                 * С большим буфером кадры при заторе не теряются, а копятся:
+                 * на живом звонке набралось больше полумегабайта, и
+                 * собеседник смотрел видео четырёхсекундной давности.
+                 *
+                 * Спросить у Java, сколько байт ещё не ушло, нельзя - значит
+                 * ограничиваем саму ёмкость. Тогда запись упирается в
+                 * заполненный буфер, кодировщик притормаживает и пропускает
+                 * кадры сам: свежая картинка с пропусками вместо верной, но
+                 * опоздавшей. 64 КБ - это доли секунды при любом разумном
+                 * потоке.
+                 */
+                sendBufferSize = 64 * 1024
             }
             println("ACM_DEBUG: TCP relay connected to $host:$port")
             true
@@ -573,8 +758,13 @@ class AudioCallManager(
                     return@launch
                 }
 
-                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null || opusDecoder == null) {
+                if (!roomKey.contentEquals(encryptionKey) || opusEncoder == null) {
                     initialize(encryptionKey)
+                }
+
+                if (!mediaReady()) {
+                    notifyError(CALL_ID_REQUIRED)
+                    return@launch
                 }
 
                 relayMode = true
@@ -604,9 +794,7 @@ class AudioCallManager(
                     isInCall = true, isCallActive = true,
                     remoteUser = "Relay $serverIp:$serverPort",
                     isInitiator = true,
-                    udpPort = 0,
-                    localNoncePrefix = localNoncePrefix,
-                    remoteNoncePrefix = ByteArray(0)
+                    udpPort = 0
                 )
 
                 isRunning.set(true)
@@ -615,17 +803,8 @@ class AudioCallManager(
 
                 startUdpReceiving()
                 startAudioRecording()
-                sendHelloPacket()
-
-                // Periodic HELLO until handshake
-                CoroutineScope(Dispatchers.IO).launch {
-                    var attempts = 0
-                    while (!remotePrefixReady.get() && isRunning.get() && attempts < 100) {
-                        sendHelloPacket()
-                        delay(50)
-                        attempts++
-                    }
-                }
+                startAudioPlayback()
+                startHelloAnnounce()
 
                 notifyCallStarted("Relay $serverIp:$serverPort", true)
 
@@ -640,6 +819,11 @@ class AudioCallManager(
 
     private fun startAudioCall(isInitiator: Boolean, remoteUser: String) {
         if (isRunning.get()) return
+
+        if (!mediaReady()) {
+            notifyError(CALL_ID_REQUIRED)
+            return
+        }
 
         try {
             // Initialize UDP socket
@@ -657,9 +841,7 @@ class AudioCallManager(
                 isCallActive = true,
                 remoteUser = remoteUser,
                 isInitiator = isInitiator,
-                udpPort = udpSocket?.localPort ?: 0,
-                localNoncePrefix = localNoncePrefix,
-                remoteNoncePrefix = remoteNoncePrefix
+                udpPort = udpSocket?.localPort ?: 0
             )
 
             isRunning.set(true)
@@ -673,13 +855,11 @@ class AudioCallManager(
             // Start threads
             startUdpReceiving()
             startAudioRecording()
-            // Don't start playback loop - processAudioPacket will write directly to AudioTrack
-            // startAudioPlayback()
+            startAudioPlayback()
 
-            // Send HELLO packet if initiator
-            if (isInitiator) {
-                sendHelloPacket()
-            }
+            // Both sides announce now: there is no caller/callee bit in the
+            // key derivation any more, so there is none in the handshake.
+            startHelloAnnounce()
 
             notifyCallStarted(remoteUser, isInitiator)
             
@@ -773,7 +953,7 @@ class AudioCallManager(
         tcpSocket = null
 
         println("ACM_DEBUG: Cleaning up Opus codecs...")
-        // Clean up Opus encoder/decoder
+        // Clean up Opus encoder
         try {
             opusEncoder?.destroy()
             opusEncoder = null
@@ -781,12 +961,15 @@ class AudioCallManager(
             println("ACM_DEBUG: Error destroying opusEncoder: ${e.message}")
         }
 
-        try {
-            opusDecoder?.destroy()
-            opusDecoder = null
-        } catch (e: Exception) {
-            println("ACM_DEBUG: Error destroying opusDecoder: ${e.message}")
-        }
+        // One line per participant we installed: how many of their packets
+        // decrypted, and how many frames of theirs actually reached the
+        // speaker. A peer that decrypted but never mixed is exactly the defect
+        // this pool exists to remove, and it is invisible from a decrypt count
+        // alone. Printed before clearMediaKeys() drops the sender table.
+        reportMedia()
+
+        // Then release every per-participant decoder and jitter buffer.
+        mixTeardown()
 
         // Stop foreground service
         try {
@@ -799,12 +982,14 @@ class AudioCallManager(
         releaseWakeLocks()
 
         // Reset state
-        remotePrefixReady.set(false)
         isListening.set(false)
         relayMode = false
         relayRoom = ""
         relayName = ""
         audioCallState = AudioCallState()
+
+        // Last, once every thread that could touch a key is gone.
+        clearMediaKeys()
 
         println("ACM_DEBUG: stopAudioCall completed")
         notifyCallEnded()
@@ -872,8 +1057,8 @@ class AudioCallManager(
             }
             if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
                 val ns = android.media.audiofx.NoiseSuppressor.create(sessionId)
-                ns?.enabled = true
-                println("ACM_DEBUG: NoiseSuppressor enabled")
+                ns?.enabled = noiseSuppressEnabled
+                println("ACM_DEBUG: NoiseSuppressor enabled=$noiseSuppressEnabled")
             }
 
             println("ACM_DEBUG: Creating AudioTrack...")
@@ -966,23 +1151,8 @@ class AudioCallManager(
                         if (received.isNotEmpty() && isRunning.get()) {
                             try {
                                 processAudioPacket(received, received.size)
-                            } catch (e: Throwable) {}
-                        }
-
-                        // Drain TCP buffer: process all immediately available packets
-                        // to prevent latency accumulation in TCP relay mode
-                        val sock = tcpSocket
-                        if (sock != null) {
-                            val input = sock.getInputStream()
-                            var drained = 0
-                            while (drained < 200 && input.available() > 0 && isRunning.get()) {
-                                val more = tcpRelayRecvMedia() ?: break
-                                if (more.isNotEmpty()) {
-                                    try {
-                                        processAudioPacket(more, more.size)
-                                    } catch (e: Throwable) {}
-                                }
-                                drained++
+                            } catch (e: Throwable) {
+                                // Silently ignore packet processing errors
                             }
                         }
                         continue
@@ -1056,6 +1226,42 @@ class AudioCallManager(
         }
     }
 
+    /**
+     * Взять настройки микрофона из общих настроек приложения.
+     *
+     * Читаются перед каждым звонком, а не запоминаются при запуске: человек
+     * может подвинуть ползунок между звонками, и следующий должен пойти уже
+     * с новым значением.
+     */
+    fun applyMicSettings(ctx: android.content.Context) {
+        val p = ctx.getSharedPreferences("fear_prefs", android.content.Context.MODE_PRIVATE)
+        micGainDb = p.getInt("audio_mic_gain_db", 0).coerceIn(-24, 24)
+        noiseSuppressEnabled = p.getBoolean("audio_noise_suppress", true)
+        micGain = Math.pow(10.0, micGainDb / 20.0).toFloat()
+    }
+
+    /**
+     * Усиление на месте, с насыщением.
+     *
+     * Насыщение, а не перенос через край: переполнение Short звучит как
+     * треск, который громче любого шума, ради которого сюда лезли.
+     */
+    private fun applyGain(buf: ByteArray, len: Int) {
+        if (micGain == 1.0f) return
+        var i = 0
+        while (i + 1 < len) {
+            val lo = buf[i].toInt() and 0xFF
+            val hi = buf[i + 1].toInt()
+            var v = ((hi shl 8) or lo) * micGain
+            if (v > 32767f) v = 32767f
+            if (v < -32768f) v = -32768f
+            val o = v.toInt()
+            buf[i] = (o and 0xFF).toByte()
+            buf[i + 1] = ((o shr 8) and 0xFF).toByte()
+            i += 2
+        }
+    }
+
     private fun startAudioRecording() {
         println("ACM_DEBUG: startAudioRecording called")
         recordJob = CoroutineScope(Dispatchers.IO).launch {
@@ -1073,6 +1279,9 @@ class AudioCallManager(
                 try {
                     val bytesRead = recorder.read(audioBuffer, 0, audioBuffer.size)
                     if (bytesRead > 0) {
+                        /* Между микрофоном и кодировщиком: кодировщику
+                         * достаётся уже то, что услышит собеседник. */
+                        applyGain(audioBuffer, bytesRead)
                         frameCount++
                         if (frameCount % 50 == 0) {
                             println("ACM_DEBUG: Recording frame $frameCount, bytes: $bytesRead")
@@ -1094,65 +1303,111 @@ class AudioCallManager(
         }
     }
 
+    /**
+     * Play-out: mix every rendered participant into one stream.
+     *
+     * This runs on its own coroutine rather than inside the receive loop,
+     * because with several senders the receive loop fires several times per
+     * frame period and would drive the device far faster than real time.
+     * AudioTrack in MODE_STREAM blocks until its buffer has room, so writing
+     * one frame per iteration is what paces this loop - including the silent
+     * frames, which keep the device fed while nobody is speaking. It is the
+     * same role Pa_WriteStream plays in the desktop build.
+     *
+     * A two-party call is simply N=1: one entry in the pool, one frame summed
+     * per iteration, the same bytes reaching AudioTrack as before.
+     */
     private fun startAudioPlayback() {
         println("ACM_DEBUG: startAudioPlayback called")
         playJob = CoroutineScope(Dispatchers.IO).launch {
-            val track = audioTrack
-            if (track == null) {
-                println("ACM_DEBUG: audioTrack is null in startAudioPlayback!")
-                return@launch
-            }
+            println("ACM_DEBUG: startAudioPlayback - entering mix loop")
 
-            println("ACM_DEBUG: startAudioPlayback - entering loop")
-
-            // For now, just play silence
-            // In full implementation, this would play from a decoded audio buffer
-            val silence = ByteArray(AUDIO_PCM_BYTES_PER_FRAME) { 0 }
+            // 32-bit accumulator: summing eight full-scale 16-bit frames
+            // cannot overflow it, so clipping is decided once, at the end.
+            val acc = IntArray(AUDIO_FRAME_SAMPLES)
+            val out = ByteArray(AUDIO_PCM_BYTES_PER_FRAME)
+            var frameNo = 0L
+            var idleFrames = 0L
 
             while (isRunning.get()) {
                 try {
-                    // Synchronize entire write operation to prevent track from being released
+                    java.util.Arrays.fill(acc, 0)
+                    var voices = 0
+
+                    synchronized(mixLock) {
+                        for (m in mix) {
+                            if (m.slot < 0) continue
+
+                            // Build a little depth before starting a voice, and
+                            // go back to waiting if it runs dry: playing every
+                            // frame the instant it arrives turns ordinary
+                            // network jitter into chopped audio.
+                            if (!m.prefilled) {
+                                if (m.ring.size < PLAYOUT_PREFILL_FRAMES) continue
+                                m.prefilled = true
+                            }
+                            val frame = m.ring.removeFirstOrNull()
+                            if (frame == null) {
+                                m.prefilled = false
+                                continue
+                            }
+                            for (k in 0 until AUDIO_FRAME_SAMPLES) acc[k] += frame[k]
+                            m.frames++
+                            voices++
+                        }
+                    }
+
+                    // Saturate rather than wrap. Wrapping turns two loud
+                    // speakers into a full-scale square wave, which is
+                    // unpleasant in a way that clipping is not.
+                    for (k in 0 until AUDIO_FRAME_SAMPLES) {
+                        var v = acc[k]
+                        if (v > MAX_SAMPLE) v = MAX_SAMPLE
+                        else if (v < MIN_SAMPLE) v = MIN_SAMPLE
+                        out[k * 2] = (v and 0xFF).toByte()
+                        out[k * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                    }
+
+                    // Synchronized for the whole write: this is what keeps the
+                    // track from being released underneath us.
                     val written = try {
                         synchronized(this@AudioCallManager) {
-                            val currentTrack = audioTrack
-
-                            if (currentTrack == null) {
-                                println("ACM_DEBUG: audioTrack became null, stopping playback")
-                                return@synchronized -2  // Signal to break
+                            val track = audioTrack
+                            when {
+                                track == null -> NO_TRACK
+                                track.state != AudioTrack.STATE_INITIALIZED -> NO_TRACK
+                                track.playState != AudioTrack.PLAYSTATE_PLAYING -> NO_TRACK
+                                else -> track.write(out, 0, out.size)
                             }
-
-                            // Check state before write
-                            if (currentTrack.state != AudioTrack.STATE_INITIALIZED) {
-                                println("ACM_DEBUG: audioTrack not initialized, stopping playback")
-                                return@synchronized -2  // Signal to break
-                            }
-
-                            if (currentTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                                println("ACM_DEBUG: audioTrack not playing, stopping playback")
-                                return@synchronized -2  // Signal to break
-                            }
-
-                            // Write while still holding the lock
-                            currentTrack.write(silence, 0, silence.size)
                         }
                     } catch (e: IllegalStateException) {
                         println("ACM_DEBUG: IllegalStateException during write: ${e.message}")
-                        -1
+                        NO_TRACK
                     } catch (e: NullPointerException) {
                         println("ACM_DEBUG: NullPointerException during write: ${e.message}")
-                        -1
+                        NO_TRACK
                     }
 
-                    if (written == -2 || written < 0) {
-                        if (written == -2) {
-                            // Track is gone or invalid, stop playback
-                            break
+                    if (written == NO_TRACK) {
+                        // No usable output device. The frames above were still
+                        // popped, so the jitter buffers cannot grow without
+                        // bound; pace by hand since nothing else does.
+                        idleFrames++
+                        if (idleFrames % 250L == 1L) {
+                            println("ACM_DEBUG: playout has no usable AudioTrack (frame $frameNo)")
                         }
+                        delay(AUDIO_FRAME_MS.toLong())
+                        continue
+                    }
+                    if (written < 0) {
                         println("ACM_DEBUG: track.write returned error: $written")
                         break
                     }
 
-                    delay(AUDIO_FRAME_MS.toLong())
+                    frameNo++
+                    if (voices > 0 && frameNo % 250L == 0L) {
+                        println("ACM_DEBUG: playout frame $frameNo, $voices voice(s) mixed")
+                    }
                 } catch (e: Exception) {
                     println("ACM_DEBUG: Playback exception: ${e.message}")
                     e.printStackTrace()
@@ -1162,7 +1417,7 @@ class AudioCallManager(
                     }
                 }
             }
-            println("ACM_DEBUG: startAudioPlayback - exiting loop")
+            println("ACM_DEBUG: startAudioPlayback - exiting mix loop")
         }
     }
 
@@ -1170,14 +1425,6 @@ class AudioCallManager(
 
     private fun processAudioData(audioData: ByteArray, length: Int) {
         audioFrameCount++
-
-        if (!remotePrefixReady.get()) {
-            // Skip sending audio until we have remote prefix
-            if (audioFrameCount % 100 == 0) {
-                println("ACM_DEBUG: processAudioData - waiting for remote prefix (frame $audioFrameCount)")
-            }
-            return
-        }
 
         if (audioFrameCount % 100 == 0) {
             println("ACM_DEBUG: processAudioData - processing frame $audioFrameCount, length=$length")
@@ -1223,9 +1470,16 @@ class AudioCallManager(
                 println("ACM_DEBUG: Encoded ${encodedData.size} bytes")
             }
 
-            // Encrypt with AES-GCM
+            // Encrypt under our own send key. Audio and stats share seqTx,
+            // so they share this key: see the note on seqTx.
+            val key = ownAudioKey
+            if (key == null) {
+                println("ACM_DEBUG: processAudioData - no send key, skipping")
+                return
+            }
             val seq = seqTx.getAndIncrement()
-            val encryptedPacket = encryptAudioPacket(encodedData, seq)
+            val encryptedPacket = MediaPacket.encrypt(
+                PKT_VER_AUDIO.toInt(), ownSid, seq, key, encodedData)
 
             if (encryptedPacket == null) {
                 println("ACM_DEBUG: processAudioData - encryption failed, skipping")
@@ -1262,164 +1516,54 @@ class AudioCallManager(
         if (!isRunning.get()) return
 
         try {
-            // Log first byte to see what we're receiving
-            if (length > 0) {
-                val firstByte = packetData[0]
-                if (firstByte == PKT_VER_AUDIO) {
-                    // Audio packet - log always for debugging
-                    Log.d("ACM_DEBUG", "Received AUDIO packet, length=$length")
-                } else if (firstByte != PKT_VER_HELLO) {
-                    Log.d("ACM_DEBUG", "Received packet with unknown version: 0x${firstByte.toString(16)}, length=$length")
+            if (length < 1) return
+
+            // HELLO2, or a pre-group HELLO we can only complain about.
+            if (packetData[0] == MediaHello.TYPE || packetData[0] == MediaHello.LEGACY_TYPE) {
+                handleHello2(packetData, length)
+                return
+            }
+
+            val table = senderTable ?: return
+
+            // The SID chooses the key. Nothing read here is trusted yet - the
+            // header is authenticated only by a successful decrypt, and peek()
+            // is where a runt packet is turned away.
+            val parsed = MediaPacket.peek(packetData, length) ?: return
+            val sid = parsed.sid
+            val counter = parsed.counter
+
+            // Counter domain, not media type: audio and stats leave on one
+            // counter, so they arrive under one key.
+            val stream = MediaKeys.STREAM_AUDIO
+
+            // A 3-byte tag collides for real, so there may be two candidates.
+            val candidates = synchronized(tableLock) { table.findBySid(sid) }
+            for (idx in candidates) {
+                val key = synchronized(tableLock) { table.key(idx, stream) } ?: continue
+                val plain = MediaPacket.decrypt(packetData, length, key) ?: continue
+
+                // Authenticated only now, so only now may the window move: a
+                // forged counter that advanced it would silence the real sender.
+                val verdict = synchronized(tableLock) { table.acceptSeq(idx, stream, counter) }
+                if (verdict != SenderTable.Verdict.FRESH) {
+                    println("ACM_DEBUG: dropped packet from slot $idx, counter=$counter ($verdict)")
+                    return
                 }
-            }
+                if (idx >= 0 && idx < rxCount.size) rxCount[idx]++
 
-            // Check if this is a HELLO packet
-            if (length >= 1 + AUDIO_NONCE_PREFIX_LEN && packetData[0] == PKT_VER_HELLO) {
-                Log.d("ACM_DEBUG", "Received HELLO packet, length=$length")
-                try {
-                    // Extract remote nonce prefix
-                    val receivedPrefix = ByteArray(AUDIO_NONCE_PREFIX_LEN)
-                    System.arraycopy(packetData, 1, receivedPrefix, 0, AUDIO_NONCE_PREFIX_LEN)
-
-                    println("ACM_DEBUG: Extracted remote nonce prefix: ${receivedPrefix.joinToString(" ") { "%02x".format(it) }}")
-
-                    // IMPORTANT: In multi-party calls, we need to accept HELLO from any participant
-                    // Simply use the most recent HELLO packet's nonce prefix
-                    // This allows the app to work in group calls where multiple peers send HELLO
-                    val isNewPrefix = !receivedPrefix.contentEquals(remoteNoncePrefix)
-
-                    if (remoteNoncePrefix.isEmpty()) {
-                        println("ACM_DEBUG: Remote nonce prefix set (FIRST TIME), remotePrefixReady=true")
-                    } else if (isNewPrefix) {
-                        println("ACM_DEBUG: Switching to new remote peer: ${receivedPrefix.joinToString(" ") { "%02x".format(it) }}")
-                    }
-
-                    // Always update remote nonce prefix to support multi-party calls
-                    remoteNoncePrefix = receivedPrefix
-                    remotePrefixReady.set(true)
-
-                    // Send our HELLO back if we haven't sent it yet or in response
-                    if (!audioCallState.isInitiator) {
-                        println("ACM_DEBUG: Sending HELLO response")
-                        sendHelloPacket()
-                    }
-                } catch (e: Exception) {
-                    println("ACM_DEBUG: HELLO processing error: ${e.message}")
-                    e.printStackTrace()
+                // The type byte is covered by the tag, so routing on it cannot
+                // be steered by flipping a cleartext byte in flight.
+                when (parsed.type) {
+                    // Which sender this is decides which decoder it reaches:
+                    // idx is the sender-table slot the key came from.
+                    PKT_VER_AUDIO.toInt() -> decodeForMix(idx, plain)
+                    PKT_VER_STATS.toInt() -> handleStatsPayload(plain)
+                    else -> {}
                 }
                 return
             }
-
-            // Check for stats packet (RTT measurement)
-            if (length >= 1 && packetData[0] == PKT_VER_STATS) {
-                handleStatsPacket(packetData, length)
-                return
-            }
-
-            // Check if we have decoder
-            val decoder = opusDecoder
-            if (decoder == null) {
-                println("ACM_DEBUG: No decoder available, skipping audio packet")
-                return
-            }
-
-            // Check if we're still running before continuing
-            if (!isRunning.get()) {
-                println("ACM_DEBUG: Not running, skipping audio packet")
-                return
-            }
-
-            println("ACM_DEBUG: Attempting to decrypt audio packet...")
-            // Decrypt packet - can return null if wrong key or corrupted
-            val decryptResult = try {
-                decryptAudioPacket(packetData, length)
-            } catch (e: Exception) {
-                println("ACM_DEBUG: Decryption exception: ${e.message}")
-                e.printStackTrace()
-                null
-            }
-
-            if (decryptResult == null) {
-                println("ACM_DEBUG: Decryption failed, skipping packet")
-                return
-            }
-
-            val (encodedData, seq) = decryptResult
-
-            // Log decryption success always
-            println("ACM_DEBUG: Decrypted audio packet, seq=$seq, size=${encodedData.size}")
-
-            // Check if we're still running before decoding
-            if (!isRunning.get()) {
-                println("ACM_DEBUG: Not running after decrypt, skipping")
-                return
-            }
-
-            println("ACM_DEBUG: Attempting to decode ${encodedData.size} bytes...")
-            // Decode with Opus - this is native code and can crash
-            val pcmSamples = try {
-                decoder.decode(encodedData, AUDIO_FRAME_SAMPLES)
-            } catch (e: Exception) {
-                // Opus decode failed - corrupted data or wrong format
-                println("ACM_DEBUG: Opus decode failed: ${e.message}")
-                e.printStackTrace()
-                return
-            }
-
-            // Check if decode was successful (decoder returns empty array on error)
-            if (pcmSamples.isEmpty()) {
-                println("ACM_DEBUG: Opus decoder returned empty array")
-                return
-            }
-
-            println("ACM_DEBUG: Decoded ${pcmSamples.size} samples successfully")
-
-            // Check if we're still running before playing
-            if (!isRunning.get()) return
-
-            // Convert shorts to bytes for AudioTrack
-            val audioData = try {
-                ByteArray(pcmSamples.size * 2).also { data ->
-                    for (i in pcmSamples.indices) {
-                        val sample = pcmSamples[i].toInt()
-                        data[i * 2] = (sample and 0xFF).toByte()
-                        data[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
-                    }
-                }
-            } catch (e: Exception) {
-                return
-            }
-
-            // Play audio - use synchronized access for entire write operation
-            // This prevents the track from being released while we're writing to it
-            if (isRunning.get()) {
-                try {
-                    synchronized(this@AudioCallManager) {
-                        val track = audioTrack
-                        if (track != null &&
-                            track.state == AudioTrack.STATE_INITIALIZED &&
-                            track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                            // Non-blocking write in relay mode to prevent stalling receive loop
-                            val written = if (relayMode) {
-                                track.write(audioData, 0, audioData.size, AudioTrack.WRITE_NON_BLOCKING)
-                            } else {
-                                track.write(audioData, 0, audioData.size)
-                            }
-                            if (seq % 50 == 0L) {
-                                println("ACM_DEBUG: Wrote $written bytes to AudioTrack (requested ${audioData.size})")
-                            }
-                        } else {
-                            println("ACM_DEBUG: AudioTrack not ready - state=${track?.state}, playState=${track?.playState}")
-                        }
-                    }
-                } catch (e: IllegalStateException) {
-                    println("ACM_DEBUG: AudioTrack write IllegalStateException: ${e.message}")
-                } catch (e: NullPointerException) {
-                    println("ACM_DEBUG: AudioTrack write NullPointerException: ${e.message}")
-                } catch (e: Exception) {
-                    println("ACM_DEBUG: AudioTrack write Exception: ${e.message}")
-                }
-            }
+            // Nobody installed opened it: an unknown sender, or noise.
 
         } catch (e: Throwable) {
             // Catch everything including native crashes
@@ -1427,129 +1571,175 @@ class AudioCallManager(
         }
     }
 
-    private fun encryptAudioPacket(audioData: ByteArray, seq: Long): ByteArray? {
-        try {
-            // Check if we have local nonce prefix
-            if (localNoncePrefix.size < AUDIO_NONCE_PREFIX_LEN) {
-                println("ACM_DEBUG: encryptAudioPacket - localNoncePrefix not ready or too small (${localNoncePrefix.size})")
-                return null
-            }
+    /**
+     * The decoder and jitter buffer for one sender, creating or reassigning an
+     * entry if this is a voice we are not currently rendering.
+     *
+     * Reassignment builds a fresh decoder instead of reusing the old one: Opus
+     * state left by the previous speaker would be decoded as noise at the head
+     * of the new stream. OpusCodec.Decoder.reset() is an empty method over the
+     * native decoder, so replacing the object is the only reset reachable from
+     * here, and it is the equivalent of OPUS_RESET_STATE on the desktop.
+     *
+     * Caller must hold mixLock.
+     *
+     * @return null only if a decoder cannot be created at all
+     */
+    private fun mixAcquire(tableSlot: Int): MixSlot? {
+        for (m in mix) {
+            if (m.slot == tableSlot) return m
+        }
 
-            val nonce = ByteArray(AUDIO_AEAD_NONCE_LEN).apply {
-                // Build nonce: prefix + sequence number
-                System.arraycopy(localNoncePrefix, 0, this, 0, AUDIO_NONCE_PREFIX_LEN)
-                // Add sequence number (big endian)
-                for (i in 0 until 8) {
-                    this[AUDIO_NONCE_PREFIX_LEN + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
-                }
+        val chosen: MixSlot = mix.firstOrNull { it.slot < 0 } ?: run {
+            // Everything is busy: the voice heard longest ago steps aside. Its
+            // key and replay window stay in the sender table, so it comes back
+            // the moment it speaks again.
+            var lru = mix[0]
+            for (m in mix) {
+                if (m.lastMs < lru.lastMs) lru = m
             }
+            println("ACM_DEBUG: mix pool full, table slot ${lru.slot} yields its decoder to $tableSlot")
+            lru
+        }
 
-            // Encrypt with AES-GCM
-            val ciphertext = Crypto.encrypt(audioData, byteArrayOf(), nonce, roomKey)
-            if (ciphertext == null) {
-                println("ACM_DEBUG: encryptAudioPacket - encryption failed")
-                return null
-            }
+        // Whatever is queued belongs to the participant being displaced.
+        chosen.ring.clear()
+        chosen.decoder?.let {
+            try { it.destroy() } catch (_: Exception) {}
+        }
+        chosen.decoder = null
 
-            // Build packet: [1 version][8 seq][ciphertext]
-            val packet = ByteArray(1 + 8 + ciphertext.size)
-            packet[0] = PKT_VER_AUDIO
-            for (i in 0 until 8) {
-                packet[1 + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
-            }
-            System.arraycopy(ciphertext, 0, packet, 9, ciphertext.size)
-
-            return packet
+        val dec = try {
+            OpusCodec.createDecoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
         } catch (e: Exception) {
-            println("ACM_DEBUG: encryptAudioPacket - exception: ${e.message}")
-            e.printStackTrace()
+            println("ACM_DEBUG: no decoder for table slot $tableSlot: ${e.message}")
+            null
+        }
+        if (dec == null) {
+            chosen.slot = -1
             return null
+        }
+
+        chosen.decoder = dec
+        chosen.slot = tableSlot
+        chosen.prefilled = false
+        chosen.frames = 0
+        // Stamped now, so a voice that has just arrived is not the victim of
+        // the very next arrival before it has been heard at all.
+        chosen.lastMs = SystemClock.elapsedRealtime()
+        println("ACM_DEBUG: rendering table slot $tableSlot (${mix.count { it.slot >= 0 }}/$MAX_MIX voices)")
+        return chosen
+    }
+
+    /**
+     * Decode one authenticated audio payload into its own sender's jitter
+     * buffer.
+     *
+     * Nothing is written to AudioTrack here. With several senders this runs
+     * several times per frame period, so writing from here would push the
+     * device far faster than real time and let participants overwrite one
+     * another - which is the bug this pool replaces, not the fix.
+     */
+    private fun decodeForMix(tableSlot: Int, encodedData: ByteArray) {
+        if (!isRunning.get()) return
+
+        synchronized(mixLock) {
+            // Re-read under the lock. isRunning is cleared before mixTeardown
+            // takes this lock, so a false here means teardown has not started
+            // yet and will still collect whatever mixAcquire builds below;
+            // without the re-read a packet in flight can create a decoder
+            // after teardown and leak it for the life of the process.
+            if (!isRunning.get()) return
+            val m = mixAcquire(tableSlot) ?: return
+            val decoder = m.decoder ?: return
+
+            val pcm = try {
+                decoder.decode(encodedData, AUDIO_FRAME_SAMPLES)
+            } catch (e: Exception) {
+                println("ACM_DEBUG: Opus decode failed for table slot $tableSlot: ${e.message}")
+                return
+            }
+            if (pcm.size < AUDIO_FRAME_SAMPLES) return
+
+            m.ring.addLast(pcm)
+            m.lastMs = SystemClock.elapsedRealtime()
+
+            // Per-sender latency control: one peer arriving in bursts must not
+            // add delay for the others, and must not grow without bound.
+            while (m.ring.size > MAX_PLAYOUT_FRAMES) m.ring.removeFirst()
         }
     }
 
-    private fun decryptAudioPacket(packetData: ByteArray, length: Int): Pair<ByteArray, Long>? {
-        if (length < 1 + 8 + AUDIO_AEAD_ABYTES) return null
-        if (packetData[0] != PKT_VER_AUDIO) return null
-
-        // Check if we have remote nonce prefix
-        val prefixSize = remoteNoncePrefix.size
-        val prefixReady = remotePrefixReady.get()
-        if (prefixSize < AUDIO_NONCE_PREFIX_LEN) {
-            if (System.currentTimeMillis() % 1000 < 50) {
-                println("ACM_DEBUG: decryptAudioPacket - size=$prefixSize, ready=$prefixReady, prefix=${remoteNoncePrefix.joinToString(" ") { "%02x".format(it) }}")
-            }
-            return null
-        }
-
-        // Extract sequence number
-        var seq: Long = 0
-        for (i in 0 until 8) {
-            seq = (seq shl 8) or (packetData[1 + i].toLong() and 0xFF)
-        }
-
-        // Log occasionally
-        if (seq % 100 == 0L) {
-            println("ACM_DEBUG: decryptAudioPacket - attempting decrypt, seq=$seq, length=$length")
-        }
-
-        // Build nonce
-        val nonce = try {
-            ByteArray(AUDIO_AEAD_NONCE_LEN).apply {
-                System.arraycopy(remoteNoncePrefix, 0, this, 0, AUDIO_NONCE_PREFIX_LEN)
-                for (i in 0 until 8) {
-                    this[AUDIO_NONCE_PREFIX_LEN + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
+    /** Release every per-participant decoder and jitter buffer. */
+    private fun mixTeardown() {
+        synchronized(mixLock) {
+            for (m in mix) {
+                m.decoder?.let {
+                    try {
+                        it.destroy()
+                    } catch (e: Exception) {
+                        println("ACM_DEBUG: Error destroying decoder: ${e.message}")
+                    }
                 }
+                m.decoder = null
+                m.ring.clear()
+                m.slot = -1
+                m.prefilled = false
+                m.lastMs = 0
+                m.frames = 0
             }
-        } catch (e: Exception) {
-            println("ACM_DEBUG: decryptAudioPacket - failed to build nonce: ${e.message}")
-            return null
         }
-
-        // Extract ciphertext
-        val ciphertext = packetData.copyOfRange(9, length)
-
-        // Decrypt
-        val plaintext = Crypto.decrypt(ciphertext, byteArrayOf(), nonce, roomKey)
-        if (plaintext == null) {
-            if (seq % 100 == 0L) {
-                println("ACM_DEBUG: decryptAudioPacket - decryption failed, seq=$seq")
-            }
-            return null
-        }
-
-        return Pair(plaintext, seq)
     }
 
-    private fun handleStatsPacket(packetData: ByteArray, length: Int) {
-        if (length < 1 + 8 + AUDIO_AEAD_ABYTES) return
-        if (!remotePrefixReady.get()) return
-        if (remoteNoncePrefix.size < AUDIO_NONCE_PREFIX_LEN) return
-
-        // Extract sequence number
-        var seq: Long = 0
-        for (i in 0 until 8) {
-            seq = (seq shl 8) or (packetData[1 + i].toLong() and 0xFF)
-        }
-
-        // Build nonce
-        val nonce = ByteArray(AUDIO_AEAD_NONCE_LEN).apply {
-            System.arraycopy(remoteNoncePrefix, 0, this, 0, AUDIO_NONCE_PREFIX_LEN)
-            for (i in 0 until 8) {
-                this[AUDIO_NONCE_PREFIX_LEN + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
+    /**
+     * Per-participant teardown report: decrypted vs actually mixed. Must run
+     * before mixTeardown() (which zeroes the frame counts) and before
+     * clearMediaKeys() (which drops the sender table).
+     */
+    private fun reportMedia() {
+        // The two locks are taken one after the other, never nested: no other
+        // path here takes mixLock and tableLock at the same time, and this one
+        // must not be the first to create an order between them.
+        val mixedBySlot = HashMap<Int, Long>()
+        synchronized(mixLock) {
+            for (m in mix) {
+                if (m.slot >= 0) mixedBySlot[m.slot] = m.frames
             }
         }
+        synchronized(tableLock) {
+            val table = senderTable ?: return
+            for (i in 0 until SenderTable.MAX_SLOTS) {
+                val slot = table.slotAt(i) ?: continue
+                val sid = slot.sid.joinToString("") { "%02x".format(it) }
+                println("ACM_DEBUG: [MEDIA] peer $sid decrypted ${rxCount[i]} mixed ${mixedBySlot[i] ?: 0L}")
+            }
+        }
+    }
 
-        val ciphertext = packetData.copyOfRange(9, length)
-        val decrypted = Crypto.decrypt(ciphertext, byteArrayOf(), nonce, roomKey) ?: return
+    // The framing - [type(1)][SID(3)][counter(5)] then AES-256-GCM with those
+    // nine bytes as AAD - lives in com.fear.crypto.MediaPacket. It used to be
+    // hand-copied into this file and into VideoCallManager, which is how two
+    // ports of one wire format drift apart; MediaPacket is pinned by the same
+    // frozen vectors as the C side.
 
+    private fun handleStatsPayload(decrypted: ByteArray) {
         if (decrypted.size >= 8) {
             val bb = ByteBuffer.wrap(decrypted).order(ByteOrder.LITTLE_ENDIAN)
             val pingTs = bb.int   // peer's timestamp
             val pongTs = bb.int   // echo of our last timestamp
 
+            // The echo is addressed to nobody: a participant echoes whichever
+            // peer it heard from last and everyone receives it, so in a group
+            // call most echoes carry a timestamp from a third machine's clock.
+            // Subtracting that from ours gives the gap between two uptimes -
+            // on a live three-way call it read as 248084855 ms and pinned the
+            // whole call at the lowest quality. Foreign values land anywhere
+            // in the 32-bit millisecond range, so only a plausible one can be
+            // ours. It is a real round trip to whichever peer echoed us last.
             if (pongTs != 0) {
                 val now32 = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
-                measuredRttMs = now32 - pongTs
+                val rtt = now32 - pongTs
+                if (rtt in 0..RTT_SANE_MAX_MS) measuredRttMs = rtt
                 handler.post { listener.onStatsUpdated(measuredRttMs) }
             }
             lastPeerPingTs = pingTs
@@ -1558,8 +1748,8 @@ class AudioCallManager(
     }
 
     private fun sendStatsPacket() {
-        if (!remotePrefixReady.get()) return
-        if (localNoncePrefix.size < AUDIO_NONCE_PREFIX_LEN) return
+        // Stats share the audio counter domain, hence the audio key.
+        val key = ownAudioKey ?: return
 
         val now = SystemClock.elapsedRealtime()
         val now32 = (now and 0xFFFFFFFFL).toInt()
@@ -1576,33 +1766,188 @@ class AudioCallManager(
         }.array()
 
         val seq = seqTx.getAndIncrement()
-        val nonce = ByteArray(AUDIO_AEAD_NONCE_LEN).apply {
-            System.arraycopy(localNoncePrefix, 0, this, 0, AUDIO_NONCE_PREFIX_LEN)
-            for (i in 0 until 8) {
-                this[AUDIO_NONCE_PREFIX_LEN + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
-            }
-        }
-
-        val encrypted = Crypto.encrypt(payload, byteArrayOf(), nonce, roomKey) ?: return
-
-        val packet = ByteArray(1 + 8 + encrypted.size)
-        packet[0] = PKT_VER_STATS
-        for (i in 0 until 8) {
-            packet[1 + i] = ((seq shr (8 * (7 - i))) and 0xFF).toByte()
-        }
-        System.arraycopy(encrypted, 0, packet, 9, encrypted.size)
-
+        val packet = MediaPacket.encrypt(
+            PKT_VER_STATS.toInt(), ownSid, seq, key, payload) ?: return
         sendPacket(packet)
     }
 
     fun getMeasuredRttMs(): Int = measuredRttMs
 
+    /**
+     * HELLO2, type 0x7E. Flags say what this binary sends (audio only here)
+     * plus IDENTITY when we have one. No video geometry: that field set is
+     * meaningful only with MH_FLAG_VIDEO.
+     */
     private fun sendHelloPacket() {
-        val packet = ByteArray(1 + AUDIO_NONCE_PREFIX_LEN)
-        packet[0] = PKT_VER_HELLO
-        System.arraycopy(localNoncePrefix, 0, packet, 1, AUDIO_NONCE_PREFIX_LEN)
+        val hk = helloKey ?: return
+        val cid = callId ?: return
+        if (senderSalt.size != MediaKeys.SALT_BYTES) return
+
+        val im = identityManager
+        val pk = if (im != null && im.hasIdentity()) im.getPublicKey() else null
+        var flags = MediaHello.FLAG_AUDIO
+        if (pk != null) flags = flags or MediaHello.FLAG_IDENTITY
+
+        // IdentityManager never hands out identity_sk, so the array below is
+        // a placeholder: build() reads only bytes 32..63 from it, and those
+        // are the public key. The signature itself comes from IdentityManager.
+        val skPlaceholder = if (pk != null) ByteArray(64).also { pk.copyInto(it, 32) } else null
+
+        val packet = try {
+            MediaHello.build(
+                MediaHello.Hello(
+                    flags = flags,
+                    keyVersion = KEY_VERSION,
+                    callId = cid,
+                    senderSalt = senderSalt,
+                    // The name we registered on the relay with, so the far
+                    // end can caption us with something a person recognises
+                    // instead of six hex digits of our SID.
+                    name = relayName,
+                ),
+                hk,
+                skPlaceholder,
+                signer = identityOps(),
+            )
+        } catch (e: Exception) {
+            println("ACM_DEBUG: HELLO2 build failed: ${e.message}")
+            return
+        }
 
         sendPacket(packet)
+    }
+
+    /**
+     * Announce ourselves for the whole call: quickly while nobody has
+     * answered, slowly once somebody has.
+     *
+     * Stopping at the first peer left a later arrival dependent on the single
+     * reply handleHello2 sends them, which has no retransmission behind it.
+     * Two-party audio survived that only because the desktop beacons; the
+     * video path, where nothing did, failed outright on a real three-device
+     * call. Both sides beacon now.
+     */
+    private fun startHelloAnnounce() {
+        sendHelloPacket()
+        CoroutineScope(Dispatchers.IO).launch {
+            while (isRunning.get()) {
+                sendHelloPacket()
+                delay(if (peerCount() == 0) HELLO_RETRY_MS else HELLO_KEEPALIVE_MS)
+            }
+        }
+    }
+
+    private fun peerCount(): Int = synchronized(tableLock) { senderTable?.count() ?: 0 }
+
+    /**
+     * Signing and verification for HELLO2. Delegated to IdentityManager when
+     * there is one, so identity_sk never leaves it.
+     */
+    private fun identityOps(): Ed25519Ops {
+        val im = identityManager ?: return SodiumEd25519
+        return object : Ed25519Ops {
+            override fun sign(msg: ByteArray, sk: ByteArray): ByteArray =
+                im.sign(msg) ?: ByteArray(0)
+
+            override fun verify(msg: ByteArray, sig: ByteArray, pk: ByteArray): Boolean =
+                im.verify(msg, sig, pk)
+        }
+    }
+
+    /**
+     * A verified HELLO2 installs its sender. The table decides what is new:
+     * an identical announcement is a no-op by construction, so a repeated
+     * HELLO cannot reset a replay window or swap a key out from under us.
+     */
+    private fun handleHello2(data: ByteArray, length: Int) {
+        val hk = helloKey ?: return
+        val cid = callId ?: return
+        val table = senderTable ?: return
+
+        val res = MediaHello.parse(data, length, hk, signer = identityOps())
+        if (res.status != MediaHello.Status.OK) {
+            if (res.status == MediaHello.Status.ERR_LEGACY_PEER &&
+                legacyPeerLogged.compareAndSet(false, true)) {
+                // Once per call: an old peer will keep sending these.
+                notifyError("Peer runs a pre-group F.E.A.R. build and must be updated")
+            }
+            // Never answer a HELLO that failed to parse: replying would tell
+            // an off-path prober which guesses are worth repeating.
+            return
+        }
+
+        val hello = res.hello ?: return
+        // The MAC key is derived from our own call id, so a foreign call id
+        // cannot reach this point. Checked anyway - it is one comparison.
+        if (!hello.callId.contentEquals(cid)) return
+
+        val peerIdbind = hello.pk ?: MediaKeys.UNSIGNED_IDBIND
+        val status: SenderTable.Status
+        val isNew: Boolean
+        synchronized(tableLock) {
+            val before = table.count()
+            status = table.install(hello.senderSalt, peerIdbind, hello.keyVersion).first
+            isNew = status == SenderTable.Status.OK && table.count() > before
+        }
+
+        if (status != SenderTable.Status.OK) {
+            println("ACM_DEBUG: HELLO2 not installed: $status")
+            return
+        }
+
+        val pk = hello.pk
+        if (pk != null) notePeerIdentity(pk)
+
+        if (isNew) {
+            // Exactly one reply, so the new peer learns us. A repeat installs
+            // nothing and gets no answer, which is what stops two peers from
+            // echoing HELLOs at each other forever.
+            println("ACM_DEBUG: new sender installed (${peerCount()} peers), replying with one HELLO2")
+            sendHelloPacket()
+        }
+    }
+
+    /**
+     * TOFU keyed by the peer's public key. Keying it by a display name (or by
+     * a fixed string like "peer") would let one participant's record cover
+     * another's as soon as a call has more than two people in it.
+     */
+    private fun notePeerIdentity(pk: ByteArray) {
+        val im = identityManager ?: return
+        val label = im.fpshort(pk)
+        if (!seenPeers.add(label)) return
+        println("ACM_DEBUG: peer identity ${im.fingerprint(pk)} is ${im.checkPeerKey(label, pk)}")
+    }
+
+    /**
+     * Wipe every key, salt and the master key. sodium_memzero has no Kotlin
+     * equivalent; Arrays.fill is the best a JVM offers, and it is still
+     * strictly better than the old code, which never wiped anything.
+     */
+    private fun clearMediaKeys() {
+        synchronized(tableLock) {
+            senderTable?.let { t ->
+                for (i in 0 until SenderTable.MAX_SLOTS) {
+                    val slot = t.slotAt(i) ?: continue
+                    for (k in slot.keys) java.util.Arrays.fill(k, 0)
+                }
+            }
+            senderTable = null
+        }
+        ownAudioKey?.let { java.util.Arrays.fill(it, 0) }
+        ownAudioKey = null
+        helloKey?.let { java.util.Arrays.fill(it, 0) }
+        helloKey = null
+        java.util.Arrays.fill(senderSalt, 0)
+        senderSalt = ByteArray(0)
+        java.util.Arrays.fill(roomKey, 0)
+        roomKey = ByteArray(0)
+        ownSid = ByteArray(0)
+        idbind = MediaKeys.UNSIGNED_IDBIND
+        // Cleared too: the next call needs its own id, and silently reusing
+        // this one would weaken the cross-call replay barrier it exists for.
+        callId = null
+        seenPeers.clear()
     }
 
     private fun sendUdpPacket(packet: ByteArray) {
@@ -1636,5 +1981,48 @@ class AudioCallManager(
         handler.post {
             listener.onCallError(error)
         }
+    }
+
+    private companion object {
+        /** Above this it is somebody else's clock, not a round trip. */
+        const val RTT_SANE_MAX_MS = 5000
+        /** Beacon period while nobody has answered. */
+        const val HELLO_RETRY_MS = 250L
+        /** Beacon period once somebody has, matching audio_call's keepalive. */
+        const val HELLO_KEEPALIVE_MS = 5000L
+        /** Nothing produces a nonzero key version yet. */
+        const val KEY_VERSION = 0
+
+        /**
+         * How many participants are rendered at once.
+         *
+         * The sender table holds 32 senders because the transport does, but
+         * decoding and mixing 32 streams is not something a phone will do, and
+         * a room where eight people talk at once is already unusable for human
+         * reasons. Senders past this limit stay authenticated and stay tracked
+         * - they are simply not rendered, and the participant heard longest ago
+         * gives up its decoder when somebody new speaks.
+         */
+        const val MAX_MIX = 8
+
+        /** Frames a participant must have queued before it starts playing. */
+        const val PLAYOUT_PREFILL_FRAMES = 6
+
+        /** Per-participant jitter-buffer cap, in 20 ms frames. */
+        const val MAX_PLAYOUT_FRAMES = 20
+
+        /** Mixing clips here rather than wrapping. */
+        const val MAX_SAMPLE = 32767      // Short.MAX_VALUE
+        const val MIN_SAMPLE = -32768     // Short.MIN_VALUE
+
+        /**
+         * track.write() stand-in for "no usable AudioTrack this iteration".
+         * Distinct from every AudioTrack.ERROR_* code, which are -1 to -6.
+         */
+        const val NO_TRACK = -1000
+
+        const val CALL_ID_REQUIRED =
+            "Cannot start the call: no call id. Pass the 16-byte call_id from " +
+            "the call invite to initialize() or setCallId()."
     }
 }

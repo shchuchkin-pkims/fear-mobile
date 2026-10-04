@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Bundle
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -30,13 +31,52 @@ class Vp8Encoder(
     private val bufferInfo = MediaCodec.BufferInfo()
     private var frameCount = 0L
 
-    private fun makeFormat(mime: String): MediaFormat {
+    private fun makeFormat(mime: String, info: MediaCodecInfo? = null): MediaFormat {
         return MediaFormat.createVideoFormat(mime, width, height).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1000)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            /*
+             * CBR, если кодек его умеет. По умолчанию программный VP8 работает
+             * в VBR и на живом звонке перебирал заданный поток примерно на
+             * пятую часть - а сверх нормы он перебирает как раз на сложных
+             * сценах, когда сеть и так на пределе. CBR держит поток ровнее,
+             * и BitrateGovernor управляет тем, что действительно уходит.
+             */
+            if (supportsCbr(info, mime)) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            }
+        }
+    }
+
+    private fun supportsCbr(info: MediaCodecInfo?, mime: String): Boolean = try {
+        info?.getCapabilitiesForType(mime)?.encoderCapabilities
+            ?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) == true
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Цель, с которой кодировщик работает сейчас. */
+    @Volatile var currentBitrateKbps: Int = bitrateKbps
+        private set
+
+    /**
+     * Сменить битрейт на ходу, не перезапуская кодировщик: перезапуск стоил бы
+     * ключевого кадра и паузы, а менять цель приходится как раз тогда, когда
+     * сеть и так не успевает.
+     */
+    fun setBitrateKbps(kbps: Int) {
+        val c = codec ?: return
+        try {
+            c.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, kbps * 1000)
+            })
+            currentBitrateKbps = kbps
+        } catch (e: IllegalStateException) {
+            // Кодировщик уже остановлен: звонок заканчивается, менять нечего.
         }
     }
 
@@ -51,13 +91,15 @@ class Vp8Encoder(
             throw IllegalStateException("VP8 encoder not available")
         }
 
-        Log.d(TAG, "VP8 encoder started: ${codec?.name} ${width}x${height}@${fps}")
+        val cbr = codec?.let { supportsCbr(it.codecInfo, it.codecInfo.supportedTypes.firstOrNull() ?: MIME_VP8) } == true
+        Log.i(TAG, "VP8 encoder started: ${codec?.name} ${width}x${height}@${fps} " +
+                   "$bitrateKbps kbps ${if (cbr) "CBR" else "default rate mode"}")
     }
 
     private fun tryCreateEncoder(mime: String): MediaCodec? {
         return try {
             MediaCodec.createEncoderByType(mime).also {
-                it.configure(makeFormat(mime), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                it.configure(makeFormat(mime, it.codecInfo), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 it.start()
                 Log.d(TAG, "Created encoder by type: $mime -> ${it.name}")
             }
@@ -73,7 +115,7 @@ class Vp8Encoder(
             for (name in SW_ENCODER_NAMES) {
                 try {
                     return MediaCodec.createByCodecName(name).also {
-                        it.configure(makeFormat(mime), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                        it.configure(makeFormat(mime, it.codecInfo), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                         it.start()
                         Log.d(TAG, "Created encoder by name: $name (mime=$mime)")
                     }
@@ -240,15 +282,14 @@ class Vp8Decoder {
 
     private var codec: MediaCodec? = null
     private val bufferInfo = MediaCodec.BufferInfo()
-    private var decoderSurface: Surface? = null
-    private var decoderWidth = 0
-    private var decoderHeight = 0
-    @Volatile private var needsKeyframe = false
 
-    fun start(surface: Surface, width: Int, height: Int) {
-        decoderSurface = surface
-        decoderWidth = width
-        decoderHeight = height
+    /* The thread that decodes is not the thread that ends a call, and on a
+     * speaker handover the decoder is replaced while pictures keep arriving.
+     * Every entry point below therefore takes this, because a release landing
+     * between two of decode()s JNI calls throws IllegalStateException. */
+    private val lock = Any()
+
+    fun start(surface: Surface, width: Int, height: Int) = synchronized(lock) {
         codec = tryCreateDecoder(MIME_VP8, surface, width, height)
             ?: tryCreateDecoder(MIME_VP8_ALT, surface, width, height)
             ?: tryCreateByName(surface, width, height)
@@ -259,6 +300,26 @@ class Vp8Decoder {
         }
 
         Log.d(TAG, "VP8 decoder started: ${codec?.name}")
+    }
+
+    /**
+     * Point an already-running decoder at a different surface.
+     *
+     * This is what makes a speaker view cheap. Rebuilding the decoder to move
+     * a participant between the big view and the strip would throw away its
+     * reference frames, so that participant would show nothing until their
+     * next keyframe - seconds of black every time the speaker changes.
+     * setOutputSurface keeps the decoder and its history.
+     */
+    fun setSurface(surface: Surface): Boolean = synchronized(lock) {
+        val c = codec ?: return false
+        return try {
+            c.setOutputSurface(surface)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setOutputSurface failed: ${e.message}")
+            false
+        }
     }
 
     private fun tryCreateDecoder(mime: String, surface: Surface, width: Int, height: Int): MediaCodec? {
@@ -289,68 +350,55 @@ class Vp8Decoder {
         return null
     }
 
-    fun decode(data: ByteArray, presentationTimeUs: Long) {
-        val c = codec ?: return
+    /**
+     * Feed one frame and render whatever the codec hands back.
+     *
+     * Never throws. A frame that cannot be decoded is a frame not shown; it
+     * used to be the end of the call, because the receive loop treats any
+     * exception as a dead connection and tears everything down - taking the
+     * audio with it. That is not a thought experiment: a live three-way call
+     * died this way half a second after connecting, when one thread released
+     * the codec while another was between dequeueInputBuffer and
+     * dequeueOutputBuffer on it.
+     *
+     * @return false when the frame was dropped.
+     */
+    fun decode(data: ByteArray, presentationTimeUs: Long): Boolean {
+        synchronized(lock) {
+            val c = codec ?: return false
+            try {
+                val inputIndex = c.dequeueInputBuffer(10_000)
+                if (inputIndex >= 0) {
+                    val inputBuffer = c.getInputBuffer(inputIndex) ?: return false
+                    inputBuffer.clear()
+                    inputBuffer.put(data)
+                    c.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
+                }
 
-        // VP8 keyframe: bit 0 of first byte is 0
-        val isKeyframe = data.isNotEmpty() && (data[0].toInt() and 0x01) == 0
-
-        // After decoder recreation, skip P-frames until we get a keyframe
-        if (needsKeyframe) {
-            if (!isKeyframe) return
-            Log.d(TAG, "Got keyframe after decoder recreation, resuming")
-            needsKeyframe = false
-        }
-
-        try {
-            val inputIndex = c.dequeueInputBuffer(10_000)
-            if (inputIndex >= 0) {
-                val inputBuffer = c.getInputBuffer(inputIndex) ?: return
-                inputBuffer.clear()
-                inputBuffer.put(data)
-                c.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
+                var outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+                while (outputIndex >= 0) {
+                    c.releaseOutputBuffer(outputIndex, true)
+                    outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
+                }
+                return true
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "frame dropped: ${e.message}")
+                return false
             }
-
-            var outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
-            while (outputIndex >= 0) {
-                c.releaseOutputBuffer(outputIndex, true)
-                outputIndex = c.dequeueOutputBuffer(bufferInfo, 0)
-            }
-        } catch (e: IllegalStateException) {
-            Log.w(TAG, "Decoder error, recreating: ${e.message}")
-            recreateDecoder()
         }
-    }
-
-    private fun recreateDecoder() {
-        try { codec?.stop() } catch (_: Exception) {}
-        try { codec?.release() } catch (_: Exception) {}
-        codec = null
-        val surface = decoderSurface ?: return
-        codec = tryCreateDecoder(MIME_VP8, surface, decoderWidth, decoderHeight)
-            ?: tryCreateDecoder(MIME_VP8_ALT, surface, decoderWidth, decoderHeight)
-            ?: tryCreateByName(surface, decoderWidth, decoderHeight)
-        if (codec != null) {
-            Log.d(TAG, "Decoder recreated: ${codec?.name}, waiting for keyframe")
-            needsKeyframe = true
-        } else {
-            Log.e(TAG, "Failed to recreate decoder")
-        }
-    }
-
-    fun flush() {
-        try {
-            codec?.flush()
-            codec?.start()
-        } catch (_: Exception) {}
     }
 
     fun stop() {
-        try {
-            codec?.stop()
-            codec?.release()
-        } catch (_: Exception) {}
-        codec = null
+        synchronized(lock) {
+            val c = codec ?: return
+            // Cleared first, so a decode that is waiting on the lock finds
+            // nothing to work with rather than a handle about to be freed.
+            codec = null
+            try { c.stop() } catch (_: Exception) {}
+            // Released even when stop() failed, or the codec keeps the Surface
+            // and the decoder built to replace it cannot configure onto it.
+            try { c.release() } catch (_: Exception) {}
+        }
     }
 }
 
@@ -362,7 +410,27 @@ data class VideoQualityPreset(
 ) {
     companion object {
         val LOW = VideoQualityPreset(320, 240, 15, 200)
-        val MEDIUM = VideoQualityPreset(640, 480, 25, 800)
+        val MEDIUM = VideoQualityPreset(640, 480, 25, 500)
         val HIGH = VideoQualityPreset(1280, 720, 30, 1500)
+
+        /**
+         * Набор с поправками, которые человек выставил руками.
+         *
+         * Готовые три покрывают обычные случаи, но не мобильный интернет в
+         * дороге и не гигабитный вайфай дома. Разрешение при этом берётся
+         * из выбранного набора: его меняет и камера, и собеседник, а поток
+         * и частоту кадров человек чувствует напрямую - именно они решают,
+         * поспевает звонок или сыпется.
+         *
+         * Границы не вкусовые: ниже 128 кбит/с VP8 даёт кашу вместо лица, а
+         * ниже 10 кадров в секунду разговор перестаёт читаться по губам и
+         * начинает раздражать рывками.
+         */
+        fun fromPrefs(ctx: android.content.Context, base: VideoQualityPreset): VideoQualityPreset {
+            val p = ctx.getSharedPreferences("fear_prefs", android.content.Context.MODE_PRIVATE)
+            val kbps = p.getInt("video_bitrate_kbps", base.bitrateKbps).coerceIn(128, 4000)
+            val fps = p.getInt("video_fps", base.fps).coerceIn(10, 30)
+            return base.copy(fps = fps, bitrateKbps = kbps)
+        }
     }
 }
