@@ -71,6 +71,8 @@ class VideoCallManager(
         private const val SPEAKING_HOLD_MS = 900L
         /** How much louder a challenger must be to take the big view. */
         private const val SPEAKER_MARGIN = 1.6
+        /** Silence after which a participant has left: two keepalives missed. */
+        private const val PRESENCE_TIMEOUT_MS = 12_000L
 
         private const val TAG = "VCM"
 
@@ -194,6 +196,10 @@ class VideoCallManager(
     private val peerVideo = HashMap<Int, PeerVideo>()
     private val peerName = HashMap<Int, String>()
     private val peerSize = HashMap<Int, Pair<Int, Int>>()
+
+    /** When each sender was last heard from: a packet that decrypted, or a
+     *  verified HELLO2. Written by the receive thread, read by the play-out. */
+    private val lastHeard = java.util.concurrent.ConcurrentHashMap<Int, Long>()
 
     /*
      * The big view has a decoder of its own, fed the same frames as the
@@ -959,6 +965,44 @@ class VideoCallManager(
         publishParticipants()
     }
 
+    /**
+     * Whoever has gone silent for good leaves the call screen.
+     *
+     * Nobody says goodbye: a participant who hangs up simply stops sending.
+     * Their cell used to stay for the rest of the call with its last picture
+     * frozen in it, and the big view stayed on them if they had it. Everyone
+     * repeats HELLO2 every few seconds even with camera and microphone off,
+     * so silence this long means gone. Should they come back, their next
+     * packet puts them on the screen again.
+     */
+    private fun forgetSilentLocked() {
+        val now = System.currentTimeMillis()
+        for ((slot, heard) in lastHeard) {
+            if (now - heard <= PRESENCE_TIMEOUT_MS) continue
+            lastHeard.remove(slot)
+            peerVideo.remove(slot)?.let { pv ->
+                try { pv.decoder?.stop() } catch (_: Exception) {}
+            }
+            peerSize.remove(slot)
+            if (mainDecoderSlot == slot) dropMainDecoderLocked()
+            if (mainSlot == slot) mainSlot = -1
+            if (pinnedSlot == slot) pinnedSlot = -1
+            synchronized(mixLock) {
+                for (m in mix) {
+                    if (m.slot != slot) continue
+                    m.decoder?.let { try { it.destroy() } catch (_: Exception) {} }
+                    m.decoder = null
+                    m.ring.clear()
+                    m.slot = -1
+                    m.prefilled = false
+                    m.energy = 0.0
+                    m.voiceMs = 0
+                }
+            }
+            Log.i(TAG, "slot $slot (${peerName[slot] ?: "?"}) silent ${now - heard} ms - left the call")
+        }
+    }
+
     /** The big view is about to show somebody else; its decoder starts over. */
     private fun dropMainDecoderLocked() {
         try { mainDecoder?.stop() } catch (_: Exception) {}
@@ -1200,7 +1244,10 @@ class VideoCallManager(
                 // cheap enough to do on the thread that is already awake.
                 if (++speakerTick >= 10) {
                     speakerTick = 0
-                    synchronized(videoLock) { chooseMainLocked() }
+                    synchronized(videoLock) {
+                        forgetSilentLocked()
+                        chooseMainLocked()
+                    }
                     publishParticipants()
                 }
 
@@ -1375,6 +1422,7 @@ class VideoCallManager(
             }
             peerVideo.clear()
             peerSize.clear()
+            lastHeard.clear()
             dropMainDecoderLocked()
             thumbSurface.clear()
             mainSurface = null
@@ -1657,6 +1705,7 @@ class VideoCallManager(
             Log.w(TAG, "HELLO2 not installed: $status")
             return
         }
+        if (slotIdx >= 0) lastHeard[slotIdx] = System.currentTimeMillis()
 
         // What this participant calls themselves, for their caption. Taken
         // from every verified announcement, so somebody who rejoins under a
@@ -1745,6 +1794,7 @@ class VideoCallManager(
                 Log.d(TAG, "Dropped packet from slot $idx, counter=$counter ($verdict)")
                 return
             }
+            lastHeard[idx] = System.currentTimeMillis()
 
             // The type byte is covered by the tag, so routing on it cannot be
             // steered by flipping a cleartext byte in flight.
