@@ -228,6 +228,13 @@ class FearClient(
 
     private val mailboxes = LinkedHashMap<String, Mail>()
     private val mailboxLock = Any()
+
+    /* Уже показанные письма - по номеру от ретранслятора. Удалить письмо мы
+     * просим после показа, и если два запроса оказались в полёте разом,
+     * одно письмо пришло бы в обоих ответах (на ПК так одно сообщение
+     * показалось трижды). Номера - одного сервера: сбрасываются при
+     * подключении. */
+    private val seenLetters = LinkedHashSet<Long>()
     private var mailboxJob: Job? = null
 
     /**
@@ -382,6 +389,7 @@ class FearClient(
                 try { socket?.close() } catch (_: Exception) {}
                 socket = null
                 isConnected = false
+                synchronized(mailboxLock) { seenLetters.clear() }
 
                 currentRoom = room
                 /* Метка комнаты - сразу вместе с названием: под ней идут и
@@ -1723,12 +1731,20 @@ class FearClient(
                 mailboxes.values.firstOrNull { it.addrIn.contentEquals(addr) }
             } ?: return@repeat
 
+            if (synchronized(mailboxLock) { id in seenLetters }) {
+                ackMailbox(socket, m, id)     // уже показано - пришло вторым ответом
+                return@repeat
+            }
             val letter = Mailbox.open(m.room, m.kPm, body) ?: return@repeat
             /* Письмо адресовано другой комнате, чем та, в которой мы сидим -
              * в этом весь смысл ящика. Комната едет вместе с сообщением,
              * чтобы интерфейс положил его в нужный чат. */
             notifyMessageReceived(Message(m.room, letter.sender, letter.text,
                                           System.currentTimeMillis()))
+            synchronized(mailboxLock) {
+                seenLetters.add(id)
+                if (seenLetters.size > 256) seenLetters.remove(seenLetters.first())
+            }
             ackMailbox(socket, m, id)
         }
     }

@@ -83,6 +83,14 @@ class FearViewModel(app: Application) : AndroidViewModel(app) {
                 if (id != null) markRead(id)
             }
         }
+        /* Новый контакт - новый ящик, за которым надо следить. Ящики
+         * регистрировались только при подключении, и письма от только что
+         * добавленного человека не приходили до переподключения. */
+        viewModelScope.launch {
+            contactsFlow.map { list -> list.map { it.identityPkB64 }.sorted() }
+                .distinctUntilChanged()
+                .collect { if (_uiState.value.isConnected) registerMailboxes() }
+        }
     }
 
     /** Состояние регистрации текущей идентичности на выбранном сервере. */
